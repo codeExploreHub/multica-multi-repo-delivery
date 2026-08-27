@@ -17,6 +17,26 @@ class SecretSource(Protocol):
     def read(self, name: str) -> str: ...
 
 
+class DeferredSecretSource:
+    """Construct the concrete source only after apply authorization succeeds."""
+
+    def __init__(self, factory: Callable[[], SecretSource]) -> None:
+        self._factory = factory
+        self._source: SecretSource | None = None
+
+    def read(self, name: str) -> str:
+        if self._source is None:
+            source = self._factory()
+            if not hasattr(source, "read"):
+                raise CliError(
+                    "secret.invalid_source",
+                    "Secret source construction failed",
+                    ExitCode.HUMAN_BLOCK,
+                )
+            self._source = source
+        return self._source.read(name)
+
+
 def _declared_names(names: set[str] | frozenset[str]) -> frozenset[str]:
     declared = frozenset(names)
     if not all(_SECRET_NAME.fullmatch(name) for name in declared):

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import MappingProxyType
 import unittest
 
+from multica_delivery import __version__
 from multica_delivery.adapters.github_client import RepositoryInfo
 from multica_delivery.core.manifest import load_manifest
 from multica_delivery.core.model import FrameworkLock, PolicySpec
@@ -1124,8 +1125,8 @@ class ProvisionerTests(unittest.TestCase):
 
         result = self.apply(lock)
 
-        self.assertEqual(result.lock.skill_version, "1.0.0")
-        self.assertEqual(result.lock.engine_version, "1.0.0")
+        self.assertEqual(result.lock.skill_version, __version__)
+        self.assertEqual(result.lock.engine_version, __version__)
         self.assertEqual(result.lock.supported_multica_cli, ">=0.4,<0.5")
         self.assertEqual(len(result.lock.manifest_digest), 64)
         self.assertEqual(result.lock.resource_ids["external"]["keep"], "external-id")
@@ -1305,8 +1306,8 @@ class ProvisionerTests(unittest.TestCase):
 
     def test_lock_id_pointing_at_a_different_target_is_fatal_before_mutation(self):
         lock = FrameworkLock(
-            "1.0.0",
-            "1.0.0",
+            __version__,
+            __version__,
             1,
             1,
             ">=0.4,<0.5",

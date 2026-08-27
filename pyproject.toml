@@ -20,6 +20,9 @@ classifiers = [
 [project.optional-dependencies]
 dev = ["build>=1.2,<2"]
 
+[project.scripts]
+multica-delivery = "multica_delivery.cli.main:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

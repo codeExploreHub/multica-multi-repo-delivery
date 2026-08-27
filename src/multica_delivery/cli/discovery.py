@@ -43,6 +43,34 @@ class Finding:
             "value": _json_value(self.value),
         }
 
+    @classmethod
+    def from_value(cls, value: object) -> "Finding":
+        if not isinstance(value, dict) or set(value) != {"classification", "source", "value"}:
+            raise CliError(
+                "discovery.invalid_document",
+                "Discovery finding fields are invalid",
+                ExitCode.VALIDATION,
+            )
+        try:
+            classification = Classification(value["classification"])
+        except (TypeError, ValueError):
+            raise CliError(
+                "discovery.invalid_document",
+                "Discovery finding classification is invalid",
+                ExitCode.VALIDATION,
+            ) from None
+        source = value["source"]
+        if source is not None and not isinstance(source, str):
+            raise CliError(
+                "discovery.invalid_document",
+                "Discovery finding source is invalid",
+                ExitCode.VALIDATION,
+            )
+        raw = value["value"]
+        if isinstance(raw, list):
+            raw = tuple(raw)
+        return cls(raw, classification, source)
+
 
 def _unknown() -> Finding:
     return Finding(None, Classification.UNKNOWN, None)
@@ -78,6 +106,51 @@ class RepositoryDiscovery:
             "skills": self.skills.to_value(),
             "agents_instructions": self.agents_instructions.to_value(),
         }
+
+    @classmethod
+    def from_value(cls, value: object) -> "RepositoryDiscovery":
+        expected = {
+            "root",
+            "kind",
+            "name",
+            "remote",
+            "commands",
+            "ports",
+            "dependencies",
+            "project",
+            "skills",
+            "agents_instructions",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise CliError(
+                "discovery.invalid_document",
+                "Discovery repository fields are invalid",
+                ExitCode.VALIDATION,
+            )
+        commands = value["commands"]
+        ports = value["ports"]
+        if not isinstance(commands, dict) or not isinstance(ports, dict):
+            raise CliError(
+                "discovery.invalid_document",
+                "Discovery command and port findings are invalid",
+                ExitCode.VALIDATION,
+            )
+        return cls(
+            root=Finding.from_value(value["root"]),
+            kind=Finding.from_value(value["kind"]),
+            name=Finding.from_value(value["name"]),
+            remote=Finding.from_value(value["remote"]),
+            commands=MappingProxyType(
+                {str(key): Finding.from_value(item) for key, item in commands.items()}
+            ),
+            ports=MappingProxyType(
+                {str(key): Finding.from_value(item) for key, item in ports.items()}
+            ),
+            dependencies=Finding.from_value(value["dependencies"]),
+            project=Finding.from_value(value["project"]),
+            skills=Finding.from_value(value["skills"]),
+            agents_instructions=Finding.from_value(value["agents_instructions"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -370,3 +443,38 @@ def discover_repositories(
 ) -> DiscoveryDocument:
     roots = _validated_roots(paths, reader)
     return DiscoveryDocument(tuple(_discover_repository(root, reader) for root in roots))
+
+
+def discovery_from_value(value: object) -> DiscoveryDocument:
+    expected = {
+        "schema_version",
+        "repositories",
+        "runtime_id",
+        "daemon_id",
+        "discovery_digest",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CliError(
+            "discovery.invalid_document",
+            "Discovery document fields are invalid",
+            ExitCode.VALIDATION,
+        )
+    repositories = value["repositories"]
+    if value["schema_version"] != 1 or not isinstance(repositories, list):
+        raise CliError(
+            "discovery.invalid_document",
+            "Discovery document schema is invalid",
+            ExitCode.VALIDATION,
+        )
+    document = DiscoveryDocument(
+        tuple(RepositoryDiscovery.from_value(item) for item in repositories),
+        runtime_id=Finding.from_value(value["runtime_id"]),
+        daemon_id=Finding.from_value(value["daemon_id"]),
+    )
+    if value["discovery_digest"] != document.discovery_digest:
+        raise CliError(
+            "discovery.digest_mismatch",
+            "Discovery document digest does not authenticate its findings",
+            ExitCode.DRIFT,
+        )
+    return document

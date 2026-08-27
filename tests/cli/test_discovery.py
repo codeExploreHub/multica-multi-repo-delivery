@@ -8,6 +8,7 @@ import unittest
 from multica_delivery.cli.discovery import (
     Classification,
     LocalRepositoryReader,
+    discovery_from_value,
     discover_repositories,
 )
 from multica_delivery.cli.errors import CliError, ExitCode
@@ -182,6 +183,20 @@ class DiscoveryTests(unittest.TestCase):
             self.assertRegex(envelope.result["discovery_digest"], r"^[0-9a-f]{64}$")
             self.assertEqual(reader.write_calls, [])
             self.assertEqual(reader.command_calls, [])
+
+    def test_discovery_json_round_trip_authenticates_digest(self):
+        with TemporaryDirectory() as directory:
+            frontend = self._copy_repository(Path(directory).resolve(), "frontend")
+            document = discover_repositories([frontend], RecordingReader())
+
+            loaded = discovery_from_value(document.to_value())
+            tampered = document.to_value()
+            tampered["repositories"][0]["project"]["value"] = "unexpected"
+
+            self.assertEqual(loaded, document)
+            with self.assertRaises(CliError) as caught:
+                discovery_from_value(tampered)
+            self.assertEqual(caught.exception.code, "discovery.digest_mismatch")
 
 
 if __name__ == "__main__":

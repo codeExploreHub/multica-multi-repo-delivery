@@ -9,6 +9,8 @@ from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 from urllib.parse import urlparse
 
+from multica_delivery import __version__
+
 from ..adapters.github_client import RepositoryInfo
 from .manifest import manifest_digest
 from .model import (
@@ -35,8 +37,8 @@ from ..adapters.redaction import (
 )
 
 
-SKILL_VERSION = "1.0.0"
-ENGINE_VERSION = "1.0.0"
+SKILL_VERSION = __version__
+ENGINE_VERSION = __version__
 WORKFLOW_METADATA_VERSION = 1
 SUPPORTED_MULTICA_CLI = ">=0.4,<0.5"
 WORKTREE_CAPABILITY = "local-worktree-v1"

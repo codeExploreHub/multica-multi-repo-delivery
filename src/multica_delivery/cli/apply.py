@@ -83,12 +83,14 @@ class ApplyService:
         clock: Clock,
         *,
         confirmation_reader: ConfirmationReader | None = None,
+        migration_executor: object | None = None,
     ) -> None:
         self.planning = planning
         self.provisioner = provisioner
         self.plan_store = plan_store
         self.clock = clock
         self.confirmation_reader = confirmation_reader
+        self.migration_executor = migration_executor
 
     @staticmethod
     def _validate_confirmation(value: str | None, expected: str) -> None:
@@ -116,10 +118,10 @@ class ApplyService:
                 ExitCode.CONFIRMATION,
             ) from None
         body = approved.body
-        if body.mode != "onboard":
+        if body.mode not in {"onboard", "upgrade"}:
             raise CliError(
                 "apply.unsupported_mode",
-                "This apply path requires an onboarding plan",
+                "This apply path does not support the plan mode",
                 ExitCode.HUMAN_BLOCK,
             )
         if _compatibility_line(body.cli_version) != _compatibility_line(__version__):
@@ -161,7 +163,16 @@ class ApplyService:
                 ExitCode.VALIDATION,
             )
 
-        observed = self.planning.observe(control_path)
+        if body.mode == "upgrade":
+            if self.migration_executor is None:
+                raise CliError(
+                    "apply.migration_unavailable",
+                    "Upgrade apply requires the exact migration executor",
+                    ExitCode.HUMAN_BLOCK,
+                )
+            observed = self.migration_executor.observe(control_path)
+        else:
+            observed = self.planning.observe(control_path)
         if (
             observed.instance_key != body.instance_key
             or observed.manifest_digest != body.manifest_digest
@@ -200,6 +211,11 @@ class ApplyService:
                 "Local delivery-control files changed after planning",
                 ExitCode.DRIFT,
             )
+
+        if body.mode == "upgrade":
+            migrated_lock = self.migration_executor.apply(body, lock_file)
+            atomic_replace_private(lock_file, self.migration_executor.serialize(migrated_lock))
+            return ApplyResult(body.actions, body.state_fingerprint)
 
         expected_actions = tuple(
             ReconcileAction(action.kind, action.key, action.changed_fields)

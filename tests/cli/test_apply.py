@@ -15,7 +15,7 @@ from multica_delivery.cli.plan import (
     PlanStore,
     PlanningService,
 )
-from multica_delivery.cli.secrets import EnvironmentSecretSource
+from multica_delivery.cli.secrets import DeferredSecretSource, EnvironmentSecretSource
 from multica_delivery.cli.commands.apply import run_apply
 from multica_delivery.core.manifest import load_lock, load_manifest
 from multica_delivery.core.provision import Provisioner
@@ -323,6 +323,19 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(source.read("DATABASE_URL"), "db-secret")
         with self.assertRaises(CliError):
             source.read("FOREIGN_SECRET")
+
+    def test_concrete_secret_source_construction_is_deferred_until_first_read(self):
+        constructions: list[str] = []
+
+        def factory():
+            constructions.append("constructed")
+            return EnvironmentSecretSource({"DATABASE_URL"}, {"DATABASE_URL": "db-secret"})
+
+        source = DeferredSecretSource(factory)
+        self.assertEqual(constructions, [])
+
+        self.assertEqual(source.read("DATABASE_URL"), "db-secret")
+        self.assertEqual(constructions, ["constructed"])
 
     def test_apply_command_returns_safe_envelope(self):
         with TemporaryDirectory() as directory:
