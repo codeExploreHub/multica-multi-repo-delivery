@@ -1,16 +1,23 @@
 # Multica Multi-Repository Delivery
 
-Manifest-driven Multica delivery teams for one or more repositories.
+`multica-multi-repo-delivery` is a standalone CLI and Agent Skill for onboarding and operating one or more local repositories as one manifest-scoped Multica delivery team. It supports macOS and Linux with Python 3.11–3.13.
 
-This repository is under local development. Install it from a local checkout:
+Install the CLI from a local checkout:
 
 ```bash
 pipx install .
+multica-delivery --version
 ```
 
 For editable development:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install -e .
+python3 -m pip install -e '.[dev]'
 ```
+
+The seven commands are `discover`, `init`, `validate`, `plan`, `apply`, `doctor`, and `upgrade`. Start with the [operator guide](docs/operator-guide.md); use the [manifest reference](docs/manifest-reference.md) for configuration and the [release checklist](docs/release-checklist.md) before any public action.
+
+To install the Skill from this checkout, copy `skills/multica-multi-repo-delivery` into the Skill directory configured by your agent runtime. The CLI wheel also installs the same files under `share/multica-multi-repo-delivery/skills/`.
+
+The package never creates GitHub repositories, commits, pushes, merges, deploys, deletes, or rolls back. `apply` reconciles only the exact Multica actions in a fresh, fully confirmed plan.

@@ -1,0 +1,116 @@
+# Sanitized compatibility fixture derived from Eventra commit f62310731394ec27034645787d87749b1eb95d38.
+schema_version: 1
+instance:
+  key: eventra
+  display_name: Eventra
+  runtime_id: 11111111-1111-4111-8111-111111111111
+  daemon_id: 22222222-2222-4222-8222-222222222222
+  control_project: Eventra Delivery Control
+control:
+  github: example/eventra-delivery-control
+  local_path: /opt/eventra-workspace/Eventra-Delivery-Control
+skill_registry:
+  using-superpowers:
+    url: https://github.com/obra/superpowers/tree/main/skills/using-superpowers
+    approved: true
+  brainstorming:
+    url: https://github.com/obra/superpowers/tree/main/skills/brainstorming
+    approved: true
+  writing-plans:
+    url: https://github.com/obra/superpowers/tree/main/skills/writing-plans
+    approved: true
+  executing-plans:
+    url: https://github.com/obra/superpowers/tree/main/skills/executing-plans
+    approved: true
+  test-driven-development:
+    url: https://github.com/obra/superpowers/tree/main/skills/test-driven-development
+    approved: true
+  systematic-debugging:
+    url: https://github.com/obra/superpowers/tree/main/skills/systematic-debugging
+    approved: true
+  requesting-code-review:
+    url: https://github.com/obra/superpowers/tree/main/skills/requesting-code-review
+    approved: true
+  receiving-code-review:
+    url: https://github.com/obra/superpowers/tree/main/skills/receiving-code-review
+    approved: true
+  verification-before-completion:
+    url: https://github.com/obra/superpowers/tree/main/skills/verification-before-completion
+    approved: true
+  vercel-react-best-practices:
+    url: https://github.com/vercel-labs/agent-skills/tree/main/skills/react-best-practices
+    approved: true
+  rest-api-conventions:
+    url: https://github.com/rrezartprebreza/spring-boot-skills/tree/main/skills/spring-boot-3/rest-api-conventions
+    approved: true
+  testing-pyramid:
+    url: https://github.com/rrezartprebreza/spring-boot-skills/tree/main/skills/spring-boot-3/testing-pyramid
+    approved: true
+  spring-security-jwt:
+    url: https://github.com/rrezartprebreza/spring-boot-skills/tree/main/skills/spring-boot-3/spring-security-jwt
+    approved: true
+  playwright-cli:
+    url: https://github.com/microsoft/playwright-cli/tree/main/skills/playwright-cli
+    approved: true
+role_skills:
+  delivery-lead: [using-superpowers, brainstorming, writing-plans, verification-before-completion]
+  independent-reviewer: [using-superpowers, systematic-debugging, verification-before-completion]
+  integration-qa: [using-superpowers, systematic-debugging, verification-before-completion, playwright-cli]
+  workflow-watcher: [using-superpowers, systematic-debugging, verification-before-completion]
+policies:
+  environment: development
+  automatic_merge: true
+  deployment: forbidden
+  max_repair_attempts: 2
+  watcher_cron: "*/30 * * * *"
+  watcher_timezone: Asia/Shanghai
+repositories:
+  frontend:
+    github: example/Eventra
+    local_path: /opt/eventra-workspace/Eventra
+    default_branch: master
+    project: Eventra Local Development
+    description: Owns the browser user interface and local backend integration.
+    depends_on: [backend]
+    commands:
+      focused_test: [npm, run, test:footer-meta]
+      test: [npm, run, test:local-contract]
+      build: [npm, run, build]
+      start: [npm, run, dev:local]
+      smoke: [npm, run, smoke:local]
+    services:
+      - name: frontend
+        port: 3000
+        health_url: http://localhost:3000
+    skills: [using-superpowers, executing-plans, test-driven-development, systematic-debugging, requesting-code-review, receiving-code-review, verification-before-completion, vercel-react-best-practices]
+  backend:
+    github: example/Eventra-Backend
+    local_path: /opt/eventra-workspace/Eventra-Backend
+    default_branch: master
+    project: Eventra Backend Local Development
+    description: Owns the Spring Boot HTTP API and persistence behavior.
+    commands:
+      focused_test: [scripts/test-local.sh, -Dtest=MetaControllerTests]
+      test: [scripts/test-local.sh]
+      build: [./mvnw, -s, .mvn/settings-public.xml, -DskipTests, package]
+      start: [scripts/run-local.sh]
+      smoke: [scripts/smoke-local.sh]
+    services:
+      - name: backend
+        port: 8080
+        health_url: http://localhost:8080/actuator/health
+    skills: [using-superpowers, executing-plans, test-driven-development, systematic-debugging, requesting-code-review, receiving-code-review, verification-before-completion, rest-api-conventions, testing-pyramid, spring-security-jwt]
+    secret_env:
+      JWT_SECRET:
+        recipients: [engineer, integration-qa]
+      MAIL_USERNAME:
+        recipients: [engineer, integration-qa]
+      MAIL_PASSWORD:
+        recipients: [engineer, integration-qa]
+integration_suites:
+  frontend-backend:
+    repositories: [backend, frontend]
+    start_order: [backend, frontend]
+    command_repository: frontend
+    command: [npm, run, smoke:local]
+merge_order: [backend, frontend]
