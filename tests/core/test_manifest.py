@@ -194,6 +194,12 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "schema_version"):
             load_manifest_text(text)
 
+    def test_rejects_invalid_secret_environment_name(self):
+        text = FIXTURE.read_text().replace("DATABASE_URL:", "bad-name:")
+
+        with self.assertRaisesRegex(ManifestError, "secret_env key"):
+            load_manifest_text(text)
+
     def test_rejects_boolean_lock_version_fields(self):
         lock = """\
 skill_version: 1.0.0
@@ -212,6 +218,23 @@ resource_ids: {}
                     path.write_text(invalid, encoding="utf-8")
                     with self.assertRaisesRegex(ManifestError, field):
                         load_lock(path)
+
+    def test_rejects_partially_initialized_lock(self):
+        lock = """\
+skill_version: ''
+engine_version: 0.1.0
+manifest_schema_version: 1
+workflow_metadata_version: 1
+supported_multica_cli: '>=0.1,<0.2'
+manifest_digest: abcdef
+resource_ids: {}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "framework.lock"
+            path.write_text(lock, encoding="utf-8")
+
+            with self.assertRaisesRegex(ManifestError, "partially initialized"):
+                load_lock(path)
 
     def test_loads_complete_explicit_fixed_role_skill_bindings(self):
         manifest = load_manifest_text(

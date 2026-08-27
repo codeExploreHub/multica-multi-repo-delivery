@@ -49,6 +49,7 @@ _UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
 
 _GITHUB_SLUG = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,38})/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 _REQUIRED_COMMANDS = frozenset({"focused_test", "test", "build", "start", "smoke"})
+_SECRET_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _SECRET_RECIPIENTS = frozenset({"engineer", "delivery-lead", "independent-reviewer", "integration-qa", "workflow-watcher"})
 _FIXED_ROLE_KEYS = frozenset(
     {"delivery-lead", "independent-reviewer", "integration-qa", "workflow-watcher"}
@@ -299,6 +300,8 @@ def load_manifest_text(text: str) -> DeliveryManifest:
         secrets: dict[str, SecretEnvSpec] = {}
         for secret_name, secret in _mapping(data.get("secret_env", {}), f"repositories.{name}.secret_env").items():
             secret_key = _string(secret_name, "secret_env key")
+            if _SECRET_ENV_NAME.fullmatch(secret_key) is None:
+                raise ManifestError("secret_env key must use uppercase identifier syntax")
             secret_data = _mapping(secret, f"repositories.{name}.secret_env.{secret_key}")
             _expect_keys(secret_data, f"repositories.{name}.secret_env.{secret_key}", {"recipients"})
             recipients = tuple(_string(value, "secret recipient") for value in _sequence(secret_data["recipients"], "secret recipients"))
@@ -393,12 +396,26 @@ def load_lock(path: Path) -> FrameworkLock:
             _string(key, "resource key"): _string(value, "resource id")
             for key, value in _mapping(values, f"resource_ids.{kind}").items()
         })
+    string_fields = {
+        field: lock[field]
+        for field in (
+            "skill_version",
+            "engine_version",
+            "supported_multica_cli",
+            "manifest_digest",
+        )
+    }
+    if any(type(value) is not str for value in string_fields.values()):
+        raise ManifestError("framework.lock version and digest fields must be strings")
+    uninitialized = not resource_ids and all(value == "" for value in string_fields.values())
+    if not uninitialized and any(value == "" for value in string_fields.values()):
+        raise ManifestError("framework.lock must not be partially initialized")
     return FrameworkLock(
-        _string(lock["skill_version"], "framework.lock.skill_version"),
-        _string(lock["engine_version"], "framework.lock.engine_version"),
+        string_fields["skill_version"],
+        string_fields["engine_version"],
         _integer(lock["manifest_schema_version"], "framework.lock.manifest_schema_version"),
         _integer(lock["workflow_metadata_version"], "framework.lock.workflow_metadata_version"),
-        _string(lock["supported_multica_cli"], "framework.lock.supported_multica_cli"),
-        _string(lock["manifest_digest"], "framework.lock.manifest_digest"),
+        string_fields["supported_multica_cli"],
+        string_fields["manifest_digest"],
         _frozen(resource_ids),
     )
