@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
+import hashlib
+import json
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 from urllib.parse import urlparse
@@ -148,6 +150,7 @@ class ReconcileResult:
     actions: tuple[ReconcileAction, ...]
     desired_agent_keys: tuple[str, ...]
     lock: FrameworkLock
+    state_fingerprint: str
 
     @property
     def mutation_count(self) -> int:
@@ -207,6 +210,36 @@ class _Snapshot:
     trigger: TriggerState | None
 
 
+def _snapshot_value(value: object) -> object:
+    if is_dataclass(value):
+        return {
+            field.name: _snapshot_value(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise ProvisionError("authoritative snapshot contains a malformed key")
+        return {
+            key: _snapshot_value(value[key])
+            for key in sorted(value)
+        }
+    if isinstance(value, tuple):
+        return [_snapshot_value(item) for item in value]
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    raise ProvisionError("authoritative snapshot contains a malformed value")
+
+
+def _snapshot_fingerprint(snapshot: _Snapshot) -> str:
+    payload = json.dumps(
+        _snapshot_value(snapshot),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _frozen(values: Mapping[str, object]) -> Mapping[str, object]:
     return MappingProxyType(dict(values))
 
@@ -245,11 +278,16 @@ class Provisioner:
         self._validate_external_scope(manifest)
         snapshot = self._snapshot(manifest, desired, lock)
         actions = self._plan(manifest, lock, desired, snapshot)
+        state_fingerprint = _snapshot_fingerprint(snapshot)
         agent_keys = tuple(agent.key for agent in desired.agents)
         if not apply:
-            return ReconcileResult(actions, agent_keys, lock)
+            stable_snapshot = self._snapshot(manifest, desired, lock)
+            stable_fingerprint = _snapshot_fingerprint(stable_snapshot)
+            if stable_fingerprint != state_fingerprint:
+                raise ProvisionError("authoritative state changed during planning")
+            return ReconcileResult(actions, agent_keys, lock, state_fingerprint)
         if not actions:
-            return ReconcileResult((), agent_keys, lock)
+            return ReconcileResult((), agent_keys, lock, state_fingerprint)
 
         try:
             self._apply_skills(manifest, desired, lock)
@@ -274,7 +312,12 @@ class Provisioner:
         remaining = self._plan(manifest, updated_lock, desired, final_snapshot)
         if remaining:
             raise ProvisionError("authoritative post-write state did not converge")
-        return ReconcileResult(actions, agent_keys, updated_lock)
+        return ReconcileResult(
+            actions,
+            agent_keys,
+            updated_lock,
+            _snapshot_fingerprint(final_snapshot),
+        )
 
     @staticmethod
     def _validate_local_inputs(

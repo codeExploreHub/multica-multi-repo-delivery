@@ -516,6 +516,41 @@ class ProvisionerTests(unittest.TestCase):
         self.assertFalse(self.multica.was_mutated)
         self.assertEqual(result.lock, FrameworkLock.empty())
 
+    def test_dry_run_returns_stable_typed_snapshot_fingerprint(self):
+        result = self.provisioner.reconcile(
+            self.manifest,
+            FrameworkLock.empty(),
+            apply=False,
+            secret_lookup=no_secrets,
+        )
+
+        self.assertRegex(result.state_fingerprint, r"^[0-9a-f]{64}$")
+
+    def test_dry_run_rejects_state_that_changes_between_stable_reads(self):
+        class ChangingMultica(StatefulMultica):
+            skill_reads = 0
+
+            def list_skills(self):
+                self.skill_reads += 1
+                if self.skill_reads == 2:
+                    self.skills["foreign-skill"] = SkillState(
+                        "foreign-skill",
+                        "foreign-skill",
+                        "https://github.com/example/public/tree/main/skill",
+                    )
+                return super().list_skills()
+
+        multica = ChangingMultica(self.manifest)
+        provisioner = Provisioner(multica, FakeGitHub(self.manifest))
+
+        with self.assertRaisesRegex(ProvisionError, "changed during planning"):
+            provisioner.reconcile(
+                self.manifest,
+                FrameworkLock.empty(),
+                apply=False,
+                secret_lookup=no_secrets,
+            )
+
     def test_apply_requires_an_exact_bool_before_every_effect(self):
         class NoEffects:
             def __getattr__(self, name):
