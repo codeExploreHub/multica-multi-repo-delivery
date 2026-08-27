@@ -32,5 +32,19 @@ where = ["src"]
 [tool.setuptools.package-data]
 multica_delivery = ["templates/*"]
 
+[tool.setuptools.data-files]
+"share/multica-multi-repo-delivery/skills/multica-multi-repo-delivery" = [
+  "skills/multica-multi-repo-delivery/SKILL.md",
+]
+"share/multica-multi-repo-delivery/skills/multica-multi-repo-delivery/agents" = [
+  "skills/multica-multi-repo-delivery/agents/openai.yaml",
+]
+"share/multica-multi-repo-delivery/skills/multica-multi-repo-delivery/references" = [
+  "skills/multica-multi-repo-delivery/references/lifecycle.md",
+  "skills/multica-multi-repo-delivery/references/manifest-schema.md",
+  "skills/multica-multi-repo-delivery/references/safety-boundaries.md",
+  "skills/multica-multi-repo-delivery/references/troubleshooting.md",
+]
+
 [tool.setuptools.dynamic]
 version = { attr = "multica_delivery.__version__" }

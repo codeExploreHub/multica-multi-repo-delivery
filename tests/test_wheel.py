@@ -43,9 +43,14 @@ class WheelTests(unittest.TestCase):
                 [
                     str(python),
                     "-c",
+                    "import sys; from pathlib import Path; "
                     "from multica_delivery.cli.templates import template_path; "
                     "from multica_delivery.cli.output import Envelope; "
                     "assert template_path('framework.lock').is_file(); "
+                    "skill = Path(sys.prefix) / 'share/multica-multi-repo-delivery/skills/multica-multi-repo-delivery'; "
+                    "assert (skill / 'SKILL.md').is_file(); "
+                    "assert (skill / 'agents/openai.yaml').is_file(); "
+                    "assert (skill / 'references/lifecycle.md').is_file(); "
                     "assert Envelope('test','ok').to_value()['schema_version'] == 1",
                 ],
                 check=True,

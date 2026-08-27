@@ -1,0 +1,4 @@
+interface:
+  display_name: "Multica Multi-Repo Delivery"
+  short_description: "Onboard and operate manifest-scoped Multica delivery teams"
+  default_prompt: "Onboard these repositories with a read-only discovery and stop before any external mutation."

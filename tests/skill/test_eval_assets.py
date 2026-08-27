@@ -50,6 +50,18 @@ class SkillEvaluationAssetTests(unittest.TestCase):
         self.assertIn("baseline_target_failure: true", baseline)
         self.assertNotIn("skills/multica-multi-repo-delivery", baseline)
 
+    def test_forward_records_verbatim_results_and_passing_variance_gate(self):
+        forward = (ROOT / "skill-evals" / "forward.md").read_text(encoding="utf-8")
+        self.assertIn("forward_target_pass: true", forward)
+        self.assertIn("No-guidance control: 0/5 exact valid commands", forward)
+        self.assertIn("Final Skill variant: 5/5 exact valid commands", forward)
+        for identifier in EXPECTED:
+            self.assertIn(f"## {identifier}", forward)
+            self.assertRegex(
+                forward,
+                rf"(?s)## {re.escape(identifier)}.*?### Verbatim passing response\n````text\n.+?\n````",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
