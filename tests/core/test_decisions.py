@@ -1,0 +1,728 @@
+from dataclasses import replace
+from pathlib import Path
+from types import MappingProxyType
+import unittest
+
+from multica_delivery.core.decisions import (
+    DecisionKind,
+    DispatchKind,
+    GateEvidence,
+    ParentSnapshot,
+    PullRequestEvidence,
+    RepositoryEvidence,
+    SmokeRead,
+    decide_parent_action,
+)
+from multica_delivery.core.manifest import load_manifest
+from multica_delivery.core.model import PolicySpec
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "three-repository-delivery.yaml"
+SHA = {
+    "api": "a" * 40,
+    "notifications": "b" * 40,
+    "web": "c" * 40,
+}
+SMOKE_OBSERVATION = {
+    "first": "smoke:" + "1" * 64,
+    "second": "smoke:" + "2" * 64,
+}
+
+
+def implementation_for(repository: str, *, sha: str | None = None, result: str = "pass") -> RepositoryEvidence:
+    return RepositoryEvidence(candidate_sha=sha or SHA[repository], result=result)
+
+
+def gate_for(repository: str, *, sha: str | None = None, result: str = "pass") -> RepositoryEvidence:
+    return RepositoryEvidence(candidate_sha=sha or SHA[repository], result=result)
+
+
+def pr_for(repository: str, *, head_sha: str | None = None, **overrides: object) -> PullRequestEvidence:
+    values = {
+        "head_sha": head_sha or SHA[repository],
+        "state": "open",
+        "mergeable": True,
+        "checks_pass": True,
+        "merged_sha": None,
+    }
+    values.update(overrides)
+    return PullRequestEvidence(**values)
+
+
+def passing_snapshot(
+    *,
+    affected: tuple[str, ...] = ("api", "web"),
+    shas: dict[str, str] | None = None,
+    attempt: int = 0,
+) -> ParentSnapshot:
+    candidates = dict(shas or {repository: SHA[repository] for repository in affected})
+    applicable_suites = {
+        "web-api": GateEvidence(candidate_shas=candidates, result="pass")
+    } if {"api", "web"} <= set(affected) else {}
+    return ParentSnapshot(
+        affected_repositories=affected,
+        candidate_shas=candidates,
+        children={
+            repository: RepositoryEvidence(candidates[repository], "pass")
+            for repository in affected
+        },
+        pull_requests={
+            repository: PullRequestEvidence(candidates[repository], "open", True, True)
+            for repository in affected
+        },
+        reviews={
+            repository: RepositoryEvidence(candidates[repository], "pass")
+            for repository in affected
+        },
+        qa={
+            repository: RepositoryEvidence(candidates[repository], "pass")
+            for repository in affected
+        },
+        integration_qa=applicable_suites,
+        attempt=attempt,
+    )
+
+
+def passing_smoke_read(
+    *,
+    observation_id: str,
+    affected: tuple[str, ...] = ("api", "web"),
+    shas: dict[str, str] | None = None,
+    authoritative: bool = True,
+) -> SmokeRead:
+    candidates = dict(shas or {repository: SHA[repository] for repository in affected})
+    suites = {"web-api": "pass"} if {"api", "web"} <= set(affected) else {}
+    return SmokeRead(
+        observation_id=observation_id,
+        merged_shas=candidates,
+        checkout_shas=candidates,
+        repository_results={repository: "pass" for repository in affected},
+        integration_results=suites,
+        authoritative=authoritative,
+    )
+
+
+def merged_snapshot(
+    *,
+    affected: tuple[str, ...] = ("api", "web"),
+    smoke_reads: tuple[SmokeRead, ...] = (),
+    attempt: int = 0,
+) -> ParentSnapshot:
+    base = passing_snapshot(affected=affected, attempt=attempt)
+    return replace(
+        base,
+        merge_state="merged",
+        merged_shas={repository: SHA[repository] for repository in affected},
+        pull_requests={
+            repository: pr_for(
+                repository,
+                state="merged",
+                merged_sha=SHA[repository],
+            )
+            for repository in affected
+        },
+        smoke_reads=smoke_reads,
+    )
+
+
+class ParentDecisionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        loaded = load_manifest(FIXTURE)
+        self.manifest = replace(loaded, merge_order=("api", "notifications", "web"))
+
+    def test_smoke_observation_identity_is_required(self):
+        with self.assertRaises(TypeError):
+            SmokeRead(
+                merged_shas={"api": SHA["api"]},
+                repository_results={"api": "pass"},
+                integration_results={},
+                authoritative=True,
+            )
+
+    def test_smoke_observation_identity_is_strict(self):
+        invalid_identities = (
+            "",
+            "smoke:" + "1" * 63,
+            "resume:" + "1" * 64,
+            "smoke:" + "g" * 64,
+            7,
+        )
+        for observation_id in invalid_identities:
+            with self.subTest(observation_id=observation_id):
+                with self.assertRaisesRegex(ValueError, "observation identity is malformed"):
+                    SmokeRead(
+                        observation_id=observation_id,
+                        merged_shas={"api": SHA["api"]},
+                        repository_results={"api": "pass"},
+                        integration_results={},
+                        authoritative=True,
+                    )
+
+    def test_merge_only_after_all_exact_sha_gates_pass(self):
+        decision = decide_parent_action(
+            self.manifest,
+            passing_snapshot(
+                affected=("api", "notifications", "web"),
+                shas=SHA,
+            ),
+        )
+        self.assertEqual(decision.kind, DecisionKind.MERGE)
+        self.assertEqual(decision.repositories, ("api", "notifications", "web"))
+
+    def test_stale_review_sha_repairs_instead_of_merging(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(snapshot, reviews={**snapshot.reviews, "web": gate_for("web", sha="d" * 40)})
+        decision = decide_parent_action(self.manifest, snapshot)
+        self.assertEqual(decision.kind, DecisionKind.REPAIR)
+        self.assertEqual(decision.reason, "web review evidence does not match candidate SHA")
+        self.assertEqual(decision.next_attempt, 1)
+
+    def test_failed_qa_uses_one_shared_next_attempt(self):
+        snapshot = passing_snapshot(attempt=1)
+        snapshot = replace(snapshot, qa={**snapshot.qa, "api": gate_for("api", result="fail")})
+        decision = decide_parent_action(self.manifest, snapshot)
+        self.assertEqual(decision.kind, DecisionKind.REPAIR)
+        self.assertEqual(decision.repositories, ("api",))
+        self.assertEqual(decision.next_attempt, 2)
+
+    def test_third_failure_blocks_parent(self):
+        snapshot = passing_snapshot(attempt=2)
+        snapshot = replace(snapshot, reviews={**snapshot.reviews, "web": gate_for("web", result="fail")})
+        decision = decide_parent_action(self.manifest, snapshot)
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+        self.assertIsNone(decision.next_attempt)
+
+    def test_production_never_returns_merge(self):
+        production = replace(
+            self.manifest,
+            policy=replace(
+                self.manifest.policy,
+                environment="production",
+                automatic_merge=False,
+            ),
+        )
+        self.assertEqual(
+            decide_parent_action(production, passing_snapshot()).kind,
+            DecisionKind.WAIT,
+        )
+
+    def test_disabled_automatic_merge_waits(self):
+        manual = replace(
+            self.manifest,
+            policy=replace(self.manifest.policy, automatic_merge=False),
+        )
+        self.assertEqual(decide_parent_action(manual, passing_snapshot()).kind, DecisionKind.WAIT)
+
+    def test_policy_cannot_expand_repair_or_deployment_authority(self):
+        with self.assertRaisesRegex(ValueError, "max_repair_attempts"):
+            replace(self.manifest.policy, max_repair_attempts=3)
+        with self.assertRaisesRegex(ValueError, "deployment"):
+            replace(self.manifest.policy, deployment="automatic")
+
+    def test_direct_policy_construction_rejects_aliases_unknowns_and_unsafe_merge(self):
+        valid = dict(
+            deployment="forbidden",
+            max_repair_attempts=2,
+            watcher_cron="*/30 * * * *",
+            watcher_timezone="Asia/Shanghai",
+        )
+        for environment in ("prod", "dev", "staging", "Development"):
+            with self.subTest(environment=environment):
+                with self.assertRaisesRegex(ValueError, "environment"):
+                    PolicySpec(environment, False, **valid)
+        with self.assertRaisesRegex(ValueError, "automatic_merge"):
+            PolicySpec("production", True, **valid)
+
+    def test_any_merged_subset_blocks_atomic_delivery(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            merge_state="partial",
+            merged_shas={"api": SHA["api"]},
+            pull_requests={
+                "api": pr_for("api", state="merged", merged_sha=SHA["api"]),
+                "web": pr_for("web"),
+            },
+        )
+        decision = decide_parent_action(self.manifest, snapshot)
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+
+    def test_merged_subset_blocks_even_when_merge_state_was_not_updated(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            pull_requests={
+                "api": pr_for("api", state="merged", merged_sha=SHA["api"]),
+                "web": pr_for("web"),
+            },
+        )
+        self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.BLOCK)
+
+    def test_second_stall_does_not_recover_again(self):
+        pending = ParentSnapshot(
+            affected_repositories=("api",),
+            candidate_shas={},
+            children={"api": RepositoryEvidence("", "pending")},
+            stalled=True,
+            stalled_repository="api",
+            recovery_count=1,
+        )
+        decision = decide_parent_action(self.manifest, pending)
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+
+    def test_first_stall_reruns_only_the_recorded_existing_child(self):
+        pending = ParentSnapshot(
+            affected_repositories=("api",),
+            candidate_shas={},
+            children={"api": RepositoryEvidence("", "pending")},
+            stalled=True,
+            stalled_repository="api",
+        )
+        decision = decide_parent_action(self.manifest, pending)
+        self.assertEqual(decision.kind, DecisionKind.DISPATCH)
+        self.assertEqual(decision.dispatch_kind, DispatchKind.RECOVERY)
+        self.assertEqual(decision.repositories, ("api",))
+
+    def test_stalled_recovery_without_a_repository_blocks_instead_of_dispatching_empty(self):
+        pending = ParentSnapshot(
+            affected_repositories=("api",),
+            candidate_shas={},
+            children={"api": RepositoryEvidence("", "pending")},
+            stalled=True,
+        )
+        decision = decide_parent_action(self.manifest, pending)
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+        self.assertEqual(decision.repositories, ())
+
+    def test_stalled_recovery_with_a_foreign_repository_blocks(self):
+        pending = ParentSnapshot(
+            affected_repositories=("api",),
+            candidate_shas={},
+            children={"api": RepositoryEvidence("", "pending")},
+            stalled=True,
+            stalled_repository="billing",
+        )
+        self.assertEqual(decide_parent_action(self.manifest, pending).kind, DecisionKind.BLOCK)
+
+    def test_missing_children_dispatch_only_dependency_ready_wave(self):
+        snapshot = ParentSnapshot(
+            affected_repositories=("api", "notifications", "web"),
+            candidate_shas={},
+        )
+        decision = decide_parent_action(self.manifest, snapshot)
+        self.assertEqual(decision.kind, DecisionKind.DISPATCH)
+        self.assertEqual(decision.dispatch_kind, DispatchKind.IMPLEMENTATION)
+        self.assertEqual(decision.repositories, ("api",))
+
+    def test_dependent_children_wait_for_exact_dependency_implementation(self):
+        snapshot = ParentSnapshot(
+            affected_repositories=("api", "web"),
+            candidate_shas={"api": SHA["api"]},
+            children={"api": implementation_for("api", result="pending")},
+        )
+        self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.WAIT)
+
+    def test_passing_dependency_dispatches_next_wave(self):
+        snapshot = ParentSnapshot(
+            affected_repositories=("api", "notifications", "web"),
+            candidate_shas={"api": SHA["api"]},
+            children={"api": implementation_for("api")},
+        )
+        decision = decide_parent_action(self.manifest, snapshot)
+        self.assertEqual(decision.kind, DecisionKind.DISPATCH)
+        self.assertEqual(decision.repositories, ("notifications", "web"))
+
+    def test_frozen_dependency_contract_allows_parallel_dispatch(self):
+        snapshot = ParentSnapshot(
+            affected_repositories=("api", "web"),
+            candidate_shas={},
+            satisfied_dependencies=frozenset({("web", "api")}),
+        )
+        self.assertEqual(
+            decide_parent_action(self.manifest, snapshot).repositories,
+            ("api", "web"),
+        )
+
+    def test_missing_pull_request_waits_without_waiving_gates(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(snapshot, pull_requests={"api": snapshot.pull_requests["api"]})
+        self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.WAIT)
+
+    def test_missing_required_check_read_waits(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            pull_requests={**snapshot.pull_requests, "web": pr_for("web", checks_pass=None)},
+        )
+        self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.WAIT)
+
+    def test_non_boolean_pr_gate_values_are_malformed(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            pull_requests={**snapshot.pull_requests, "web": pr_for("web", checks_pass=1)},
+        )
+        self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.BLOCK)
+
+    def test_changed_pr_head_blocks_before_any_merge(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            pull_requests={**snapshot.pull_requests, "web": pr_for("web", head_sha="d" * 40)},
+        )
+        decision = decide_parent_action(self.manifest, snapshot)
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+        self.assertEqual(decision.repositories, ())
+
+    def test_malformed_confirmed_merge_order_blocks_instead_of_raising(self):
+        malformed = replace(
+            self.manifest,
+            merge_order=("web", "api", "notifications"),
+        )
+        try:
+            decision = decide_parent_action(
+                malformed,
+                passing_snapshot(affected=("api", "notifications", "web"), shas=SHA),
+            )
+        except Exception as error:  # pragma: no cover - assertion reports escaped boundary failure
+            self.fail(f"decision boundary raised {type(error).__name__}: {error}")
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+
+    def test_all_current_gate_and_preflight_failures_share_one_repair(self):
+        snapshot = passing_snapshot(affected=("api", "notifications", "web"), shas=SHA)
+        snapshot = replace(
+            snapshot,
+            qa={**snapshot.qa, "notifications": gate_for("notifications", sha="d" * 40)},
+            integration_qa={
+                "web-api": GateEvidence(candidate_shas=SHA, result="fail"),
+            },
+            pull_requests={
+                **snapshot.pull_requests,
+                "web": pr_for("web", mergeable=None, checks_pass=False),
+            },
+        )
+        decision = decide_parent_action(self.manifest, snapshot)
+        self.assertEqual(decision.kind, DecisionKind.REPAIR)
+        self.assertEqual(decision.repositories, ("api", "notifications", "web"))
+        self.assertEqual(decision.next_attempt, 1)
+
+    def test_missing_review_and_qa_dispatches_exact_gate_work(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(snapshot, reviews={}, qa={}, integration_qa={})
+        decision = decide_parent_action(self.manifest, snapshot)
+        self.assertEqual(decision.kind, DecisionKind.DISPATCH)
+        self.assertEqual(decision.dispatch_kind, DispatchKind.GATES)
+        self.assertEqual(decision.repositories, ("api", "web"))
+
+    def test_merged_pull_requests_with_missing_premerge_gates_block_for_human(self):
+        snapshot = merged_snapshot()
+        snapshot = replace(snapshot, reviews={}, qa={}, integration_qa={})
+
+        decision = decide_parent_action(self.manifest, snapshot)
+
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+        self.assertEqual(decision.repositories, ())
+        self.assertIn("pre-merge", decision.reason)
+
+    def test_merged_pull_requests_with_pending_premerge_gate_block_for_human(self):
+        snapshot = merged_snapshot()
+        snapshot = replace(
+            snapshot,
+            reviews={
+                **snapshot.reviews,
+                "web": gate_for("web", result="pending"),
+            },
+        )
+
+        decision = decide_parent_action(self.manifest, snapshot)
+
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+        self.assertIn("pre-merge", decision.reason)
+
+    def test_all_merged_missing_evidence_classes_block_without_dispatch(self):
+        snapshot = merged_snapshot()
+        missing_evidence = {
+            "implementation": replace(snapshot, children={}),
+            "review": replace(snapshot, reviews={}),
+            "repository QA": replace(snapshot, qa={}),
+            "integration QA": replace(snapshot, integration_qa={}),
+        }
+
+        for evidence_class, corrupted in missing_evidence.items():
+            with self.subTest(evidence_class=evidence_class):
+                decision = decide_parent_action(self.manifest, corrupted)
+
+                self.assertEqual(decision.kind, DecisionKind.BLOCK)
+                self.assertEqual(decision.repositories, ())
+                self.assertIn("human action", decision.reason)
+
+    def test_all_merged_corruption_blocks_even_when_automatic_merge_is_forbidden(self):
+        production = replace(
+            self.manifest,
+            policy=replace(
+                self.manifest.policy,
+                environment="production",
+                automatic_merge=False,
+            ),
+        )
+        corrupted = replace(merged_snapshot(), children={})
+
+        decision = decide_parent_action(production, corrupted)
+
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+        self.assertEqual(decision.repositories, ())
+        self.assertIn("human action", decision.reason)
+
+    def test_all_merged_nonpassing_or_stale_evidence_blocks_without_repair(self):
+        snapshot = merged_snapshot()
+        stale_sha = "d" * 40
+        corruptions = {
+            "implementation pending": replace(
+                snapshot,
+                children={**snapshot.children, "web": RepositoryEvidence("", "pending")},
+            ),
+            "implementation failed": replace(
+                snapshot,
+                children={**snapshot.children, "web": gate_for("web", result="fail")},
+            ),
+            "implementation blocked": replace(
+                snapshot,
+                children={**snapshot.children, "web": gate_for("web", result="blocked")},
+            ),
+            "implementation stale": replace(
+                snapshot,
+                children={**snapshot.children, "web": gate_for("web", sha=stale_sha)},
+            ),
+            "review pending": replace(
+                snapshot,
+                reviews={**snapshot.reviews, "web": RepositoryEvidence("", "pending")},
+            ),
+            "review failed": replace(
+                snapshot,
+                reviews={**snapshot.reviews, "web": gate_for("web", result="fail")},
+            ),
+            "review stale": replace(
+                snapshot,
+                reviews={**snapshot.reviews, "web": gate_for("web", sha=stale_sha)},
+            ),
+            "repository QA pending": replace(
+                snapshot,
+                qa={**snapshot.qa, "web": RepositoryEvidence("", "pending")},
+            ),
+            "repository QA failed": replace(
+                snapshot,
+                qa={**snapshot.qa, "web": gate_for("web", result="fail")},
+            ),
+            "repository QA stale": replace(
+                snapshot,
+                qa={**snapshot.qa, "web": gate_for("web", sha=stale_sha)},
+            ),
+            "integration QA pending": replace(
+                snapshot,
+                integration_qa={
+                    "web-api": GateEvidence(
+                        candidate_shas=snapshot.candidate_shas,
+                        result="pending",
+                    )
+                },
+            ),
+            "integration QA failed": replace(
+                snapshot,
+                integration_qa={
+                    "web-api": GateEvidence(
+                        candidate_shas=snapshot.candidate_shas,
+                        result="fail",
+                    )
+                },
+            ),
+            "integration QA stale": replace(
+                snapshot,
+                integration_qa={
+                    "web-api": GateEvidence(
+                        candidate_shas={"api": SHA["api"], "web": stale_sha},
+                        result="pass",
+                    )
+                },
+            ),
+        }
+
+        for corruption, corrupted in corruptions.items():
+            with self.subTest(corruption=corruption):
+                decision = decide_parent_action(self.manifest, corrupted)
+
+                self.assertEqual(decision.kind, DecisionKind.BLOCK)
+                self.assertEqual(decision.repositories, ())
+                self.assertIn("human action", decision.reason)
+
+    def test_stale_integration_qa_sha_map_repairs(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            integration_qa={
+                "web-api": GateEvidence(
+                    candidate_shas={"api": SHA["api"], "web": "d" * 40},
+                    result="pass",
+                )
+            },
+        )
+        self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.REPAIR)
+
+    def test_non_applicable_integration_qa_evidence_is_malformed(self):
+        snapshot = passing_snapshot(affected=("api",))
+        snapshot = replace(
+            snapshot,
+            integration_qa={
+                "web-api": GateEvidence(candidate_shas={"api": SHA["api"]}, result="pass")
+            },
+        )
+        self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.BLOCK)
+
+    def test_merged_exact_shas_require_two_stable_smoke_reads(self):
+        first = passing_smoke_read(observation_id=SMOKE_OBSERVATION["first"])
+        second = passing_smoke_read(observation_id=SMOKE_OBSERVATION["second"])
+        once = merged_snapshot(smoke_reads=(first,))
+        twice = merged_snapshot(smoke_reads=(first, second))
+        self.assertEqual(decide_parent_action(self.manifest, once).kind, DecisionKind.SMOKE)
+        self.assertEqual(decide_parent_action(self.manifest, twice).kind, DecisionKind.COMPLETE)
+
+    def test_duplicate_smoke_observation_identity_is_fail_closed(self):
+        observation = passing_smoke_read(observation_id=SMOKE_OBSERVATION["first"])
+
+        decision = decide_parent_action(
+            self.manifest,
+            merged_snapshot(smoke_reads=(observation, observation)),
+        )
+
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+
+    def test_authoritative_merge_commit_shas_may_differ_from_reviewed_heads(self):
+        base = passing_snapshot()
+        merged = {"api": "1" * 40, "web": "2" * 40}
+        snapshot = replace(
+            base,
+            merge_state="merged",
+            merged_shas=merged,
+            pull_requests={
+                repository: replace(
+                    evidence,
+                    state="merged",
+                    merged_sha=merged[repository],
+                )
+                for repository, evidence in base.pull_requests.items()
+            },
+        )
+
+        decision = decide_parent_action(self.manifest, snapshot)
+
+        self.assertEqual(decision.kind, DecisionKind.SMOKE)
+        self.assertEqual(decision.repositories, ("api", "web"))
+
+    def test_merged_pr_without_passing_checks_never_completes_after_smoke(self):
+        first = passing_smoke_read(observation_id=SMOKE_OBSERVATION["first"])
+        second = passing_smoke_read(observation_id=SMOKE_OBSERVATION["second"])
+        snapshot = merged_snapshot(smoke_reads=(first, second))
+        snapshot = replace(
+            snapshot,
+            pull_requests={
+                **snapshot.pull_requests,
+                "web": pr_for(
+                    "web",
+                    state="merged",
+                    checks_pass=False,
+                    merged_sha=SHA["web"],
+                ),
+            },
+        )
+        self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.BLOCK)
+
+    def test_non_authoritative_smoke_read_cannot_complete(self):
+        first = passing_smoke_read(
+            observation_id=SMOKE_OBSERVATION["first"],
+            authoritative=False,
+        )
+        second = passing_smoke_read(
+            observation_id=SMOKE_OBSERVATION["second"],
+            authoritative=False,
+        )
+        decision = decide_parent_action(
+            self.manifest,
+            merged_snapshot(smoke_reads=(first, second)),
+        )
+        self.assertEqual(decision.kind, DecisionKind.SMOKE)
+
+    def test_partial_non_authoritative_checkout_blocks_named_repository(self):
+        partial = SmokeRead(
+            observation_id=SMOKE_OBSERVATION["first"],
+            merged_shas={"api": SHA["api"], "web": SHA["web"]},
+            checkout_shas={"api": SHA["api"]},
+            repository_results={"api": "pending", "web": "blocked"},
+            integration_results={"web-api": "pending"},
+            authoritative=False,
+        )
+
+        decision = decide_parent_action(
+            self.manifest,
+            merged_snapshot(smoke_reads=(partial,)),
+        )
+
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+        self.assertIn("web", decision.reason)
+        self.assertIn("human", decision.reason)
+
+    def test_stale_post_merge_smoke_blocks_for_human_without_repair(self):
+        stale = passing_smoke_read(observation_id=SMOKE_OBSERVATION["first"])
+        repeated = replace(stale, observation_id=SMOKE_OBSERVATION["second"])
+        replacement = merged_snapshot()
+        replacement = replace(
+            replacement,
+            candidate_shas={"api": SHA["api"], "web": "d" * 40},
+            merged_shas={"api": SHA["api"], "web": "d" * 40},
+            pull_requests={
+                "api": pr_for("api", state="merged", merged_sha=SHA["api"]),
+                "web": pr_for("web", head_sha="d" * 40, state="merged", merged_sha="d" * 40),
+            },
+            reviews={**replacement.reviews, "web": gate_for("web", sha="d" * 40)},
+            qa={**replacement.qa, "web": gate_for("web", sha="d" * 40)},
+            integration_qa={
+                "web-api": GateEvidence(
+                    candidate_shas={"api": SHA["api"], "web": "d" * 40},
+                    result="pass",
+                )
+            },
+            smoke_reads=(stale, repeated),
+        )
+        decision = decide_parent_action(self.manifest, replacement)
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+        self.assertEqual(decision.repositories, ())
+
+    def test_failed_post_merge_smoke_blocks_for_human_without_repair(self):
+        failed = replace(
+            passing_smoke_read(observation_id=SMOKE_OBSERVATION["first"]),
+            repository_results={"api": "pass", "web": "fail"},
+        )
+        decision = decide_parent_action(
+            self.manifest,
+            merged_snapshot(smoke_reads=(failed,), attempt=0),
+        )
+
+        self.assertEqual(decision.kind, DecisionKind.BLOCK)
+        self.assertIsNone(decision.next_attempt)
+        self.assertEqual(decision.repositories, ())
+        self.assertIn("human", decision.reason)
+
+    def test_snapshot_copies_input_mappings_to_preserve_immutability(self):
+        candidates = {"api": SHA["api"]}
+        snapshot = ParentSnapshot(affected_repositories=("api",), candidate_shas=candidates)
+        candidates["api"] = "f" * 40
+        self.assertEqual(snapshot.candidate_shas["api"], SHA["api"])
+        self.assertIsInstance(snapshot.candidate_shas, MappingProxyType)
+
+    def test_unknown_or_dependency_incomplete_scope_blocks(self):
+        unknown = ParentSnapshot(affected_repositories=("billing",))
+        incomplete = ParentSnapshot(affected_repositories=("web",))
+        self.assertEqual(decide_parent_action(self.manifest, unknown).kind, DecisionKind.BLOCK)
+        self.assertEqual(decide_parent_action(self.manifest, incomplete).kind, DecisionKind.BLOCK)
+
+
+if __name__ == "__main__":
+    unittest.main()
