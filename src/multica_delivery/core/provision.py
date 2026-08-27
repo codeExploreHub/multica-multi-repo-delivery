@@ -270,9 +270,21 @@ class Provisioner:
         *,
         apply: bool,
         secret_lookup: Callable[[str], str],
+        expected_state_fingerprint: str | None = None,
+        expected_actions: tuple[ReconcileAction, ...] | None = None,
     ) -> ReconcileResult:
         if type(apply) is not bool:
             raise TypeError("apply must be an exact bool")
+        if (expected_state_fingerprint is None) != (expected_actions is None):
+            raise ProvisionError("planned preconditions must be supplied together")
+        if expected_state_fingerprint is not None and (
+            type(expected_state_fingerprint) is not str
+            or len(expected_state_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in expected_state_fingerprint)
+            or type(expected_actions) is not tuple
+            or not all(isinstance(action, ReconcileAction) for action in expected_actions)
+        ):
+            raise ProvisionError("planned preconditions are malformed")
         self._validate_local_inputs(manifest, lock)
         desired = self._desired_state(manifest)
         self._validate_external_scope(manifest)
@@ -280,6 +292,11 @@ class Provisioner:
         actions = self._plan(manifest, lock, desired, snapshot)
         state_fingerprint = _snapshot_fingerprint(snapshot)
         agent_keys = tuple(agent.key for agent in desired.agents)
+        if apply and expected_state_fingerprint is not None and (
+            state_fingerprint != expected_state_fingerprint
+            or actions != expected_actions
+        ):
+            raise ProvisionError("planned preconditions changed before mutation")
         if not apply:
             stable_snapshot = self._snapshot(manifest, desired, lock)
             stable_fingerprint = _snapshot_fingerprint(stable_snapshot)

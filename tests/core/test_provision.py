@@ -551,6 +551,32 @@ class ProvisionerTests(unittest.TestCase):
                 secret_lookup=no_secrets,
             )
 
+    def test_apply_rejects_wrong_planned_preconditions_before_mutation(self):
+        planned = self.provisioner.reconcile(
+            self.manifest,
+            FrameworkLock.empty(),
+            apply=False,
+            secret_lookup=no_secrets,
+        )
+
+        cases = (
+            ("0" * 64, planned.actions),
+            (planned.state_fingerprint, planned.actions[:-1]),
+        )
+        for fingerprint, actions in cases:
+            with self.subTest(fingerprint=fingerprint, actions=actions):
+                self.multica.mutations.clear()
+                with self.assertRaisesRegex(ProvisionError, "preconditions changed"):
+                    self.provisioner.reconcile(
+                        self.manifest,
+                        FrameworkLock.empty(),
+                        apply=True,
+                        secret_lookup=self.secrets,
+                        expected_state_fingerprint=fingerprint,
+                        expected_actions=actions,
+                    )
+                self.assertEqual(self.multica.mutations, [])
+
     def test_apply_requires_an_exact_bool_before_every_effect(self):
         class NoEffects:
             def __getattr__(self, name):
