@@ -130,8 +130,15 @@ def _local_path(value: Any, field: str) -> Path:
 def _public_skill_url(value: Any, field: str) -> str:
     url = _string(value, field)
     parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.netloc != "github.com" or len([part for part in parsed.path.split("/") if part]) < 2:
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or len([part for part in parsed.path.split("/") if part]) < 2
+    ):
         raise ManifestError(f"{field} must be a public https://github.com URL")
+    skill_repository_slug(url)
     return url
 
 

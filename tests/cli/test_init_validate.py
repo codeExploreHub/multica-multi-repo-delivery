@@ -326,6 +326,41 @@ values:
             self.assertFalse(failed.valid)
             self.assertIn("tool.gh_missing", [finding.code for finding in failed.findings])
 
+    def test_validation_rejects_skill_url_query_and_fragment(self):
+        for suffix in ("?ref=private", "#fragment"):
+            with self.subTest(suffix=suffix), TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                discovery = self._copy_repositories(root, ("frontend",))
+                target = root / "delivery-control"
+                initialize_scaffold(
+                    discovery,
+                    self._load_confirmation(
+                        self._confirmation_document(discovery, target)
+                    ),
+                    target,
+                )
+                manifest_path = target / "delivery.yaml"
+                manifest_path.write_text(
+                    manifest_path.read_text(encoding="utf-8").replace(
+                        "/skills/using-superpowers",
+                        f"/skills/using-superpowers{suffix}",
+                        1,
+                    ),
+                    encoding="utf-8",
+                )
+
+                report = validate_control_directory(
+                    target,
+                    version_reader=VersionReader(
+                        {"multica": "multica 0.4.33", "gh": "gh version 2.80.0"}
+                    ),
+                    platform_name="linux",
+                    python_version=(3, 13),
+                )
+
+                self.assertFalse(report.valid)
+                self.assertIn("manifest.invalid", {item.code for item in report.findings})
+
     def test_init_and_validate_commands_return_envelopes(self):
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()

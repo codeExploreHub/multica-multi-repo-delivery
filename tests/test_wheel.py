@@ -353,6 +353,7 @@ class WheelTests(unittest.TestCase):
 
             multica_record = json.loads(multica_state.read_text())
             github_record = json.loads(github_state.read_text())
+            self.assertEqual(multica_record["mutation_count"], mutation_count)
             self.assertEqual(multica_record["rejected_argv"], [])
             self.assertEqual(github_record["prohibited_events"], [])
             self.assertFalse(any("deploy" in event for event in multica_record["events"]))
