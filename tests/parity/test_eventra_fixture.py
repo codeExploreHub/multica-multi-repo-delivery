@@ -1,13 +1,17 @@
 from pathlib import Path
+import json
 import unittest
 
 import yaml
 
 from multica_delivery.core.manifest import load_manifest, manifest_digest
+from multica_delivery.core.metadata import ParentMetadata, encode_parent_metadata
+from multica_delivery.core.decisions import ParentSnapshot, decide_parent_action
 from multica_delivery.core.provision import effective_skill_bindings
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "eventra-delivery.yaml"
+EXPECTED = Path(__file__).parent / "fixtures" / "eventra-expected.json"
 ROLES = {"delivery-lead", "independent-reviewer", "integration-qa", "workflow-watcher"}
 
 
@@ -17,12 +21,69 @@ class EventraParityFixtureTests(unittest.TestCase):
         cls.text = FIXTURE.read_text(encoding="utf-8")
         cls.raw = yaml.safe_load(cls.text)
         cls.manifest = load_manifest(FIXTURE)
+        cls.expected = json.loads(EXPECTED.read_text(encoding="utf-8"))
 
     def test_source_commit_and_digest_are_pinned(self):
-        self.assertIn("f62310731394ec27034645787d87749b1eb95d38", self.text)
+        self.assertIn(self.expected["source_commit"], self.text)
         self.assertEqual(
             manifest_digest(self.manifest),
-            "43a0cd01a4fd605c45be137d884c780f6448cd7508b00284c0b536e68d7e7218",
+            self.expected["manifest"]["digest"],
+        )
+
+    def test_manifest_projection_matches_immutable_source_baseline(self):
+        manifest = self.manifest
+        actual = {
+            "digest": manifest_digest(manifest),
+            "repositories": list(manifest.repositories),
+            "merge_order": list(manifest.merge_order),
+            "integration_start_order": list(manifest.integration_suites[0].start_order),
+        }
+        self.assertEqual(actual, self.expected["manifest"])
+
+    def test_provision_bindings_match_immutable_source_baseline(self):
+        actual = {
+            key: list(value)
+            for key, value in sorted(effective_skill_bindings(self.manifest).items())
+        }
+        self.assertEqual(
+            actual,
+            self.expected["provision"]["effective_skill_bindings"],
+        )
+
+    def test_metadata_and_initial_decision_match_immutable_source_baseline(self):
+        metadata = ParentMetadata(
+            instance_key=self.manifest.instance.key,
+            affected_repositories=("frontend", "backend"),
+            repository_dag={"frontend": ("backend",), "backend": ()},
+            candidate_shas={},
+            contract_hashes={},
+            stage_ordinal=0,
+            merge_plan=(),
+            merge_state="pending",
+            attempt=0,
+            last_action="dispatch",
+        )
+        self.assertEqual(
+            encode_parent_metadata(metadata),
+            self.expected["metadata"]["parent"],
+        )
+
+        decision = decide_parent_action(
+            self.manifest,
+            ParentSnapshot(affected_repositories=("frontend", "backend")),
+        )
+        actual_decision = {
+            "kind": decision.kind.value,
+            "reason": decision.reason,
+            "repositories": list(decision.repositories),
+            "next_attempt": decision.next_attempt,
+            "dispatch_kind": (
+                decision.dispatch_kind.value if decision.dispatch_kind else None
+            ),
+        }
+        self.assertEqual(
+            actual_decision,
+            self.expected["decisions"]["initial_cross_stack"],
         )
 
     def test_topology_commands_and_policy_match_eventra_contract(self):

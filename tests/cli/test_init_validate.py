@@ -3,6 +3,7 @@ import shutil
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -243,6 +244,30 @@ values:
                 self.assertEqual(caught.exception.code, "init.target_exists")
                 self.assertEqual(existing.read_bytes(), b"operator-owned")
                 self.assertEqual(tuple(target.iterdir()), (existing,))
+
+    def test_concurrently_created_empty_target_is_never_replaced(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            discovery = self._copy_repositories(root, ("frontend",))
+            target = root / "delivery-control"
+            confirmation = self._load_confirmation(
+                self._confirmation_document(discovery, target)
+            )
+            real_mkdir = Path.mkdir
+
+            def concurrent_mkdir(path, *args, **kwargs):
+                if Path(path) == target:
+                    real_mkdir(target)
+                    raise FileExistsError(target)
+                return real_mkdir(path, *args, **kwargs)
+
+            with patch.object(Path, "mkdir", autospec=True, side_effect=concurrent_mkdir):
+                with self.assertRaises(CliError) as caught:
+                    initialize_scaffold(discovery, confirmation, target)
+
+            self.assertEqual(caught.exception.code, "init.concurrent_target")
+            self.assertTrue(target.is_dir())
+            self.assertEqual(tuple(target.iterdir()), ())
 
     def test_renders_valid_one_two_and_three_repository_manifests(self):
         topologies = (

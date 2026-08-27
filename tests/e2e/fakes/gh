@@ -26,13 +26,16 @@ def emit(value, code=0):
 state["read_calls"].append(ARGS)
 save()
 
+if ARGS == ["--version"]:
+    print("gh version 2.80.0")
+    raise SystemExit(0)
 if ARGS == ["auth", "status", "--json", "active,login"]:
     emit({"active": True, "login": "fixture-user"})
 if len(ARGS) == 2 and ARGS[0] == "api" and ARGS[1].startswith("repos/"):
     repository = ARGS[1].removeprefix("repos/")
     if "/pulls" not in repository:
         record = state["repositories"][repository]
-        emit({"full_name": repository, "visibility": "private", "default_branch": record["default_branch"]})
+        emit({"full_name": repository, "visibility": record.get("visibility", "private"), "default_branch": record["default_branch"]})
 if len(ARGS) == 2 and ARGS[0] == "api" and ARGS[1].endswith("/pulls?state=all"):
     emit([])
 if len(ARGS) > 2 and ARGS[:2] == ["api", "graphql"]:

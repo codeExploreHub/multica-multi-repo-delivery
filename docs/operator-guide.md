@@ -13,7 +13,7 @@ For editable work:
 
 ```bash
 python3 -m venv .venv
-python3 -m pip install -e '.[dev]'
+.venv/bin/python -m pip install -e '.[dev]'
 ```
 
 The Skill is the directory `skills/multica-multi-repo-delivery`. Copy that directory to the Skill location configured by the target agent runtime. It calls the installed CLI; it contains no second provisioning implementation.

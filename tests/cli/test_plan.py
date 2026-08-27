@@ -83,7 +83,12 @@ class PlanTests(unittest.TestCase):
         )
 
     def test_plan_body_has_exact_fields_ttl_and_canonical_hash(self):
-        action = PlanAction("project.create", "control", ())
+        action = PlanAction(
+            "project.create",
+            "control",
+            (),
+            "Reconcile control with project.create.",
+        )
         body = PlanBody(
             schema_version=1,
             mode="onboard",
@@ -97,6 +102,11 @@ class PlanTests(unittest.TestCase):
             actions=(action,),
         )
         envelope = PlanEnvelope.create(body)
+
+        self.assertEqual(
+            envelope.to_value()["result"]["body"]["actions"][0]["reason"],
+            "Reconcile control with project.create.",
+        )
 
         self.assertEqual(
             set(body.to_value()),
@@ -124,7 +134,17 @@ class PlanTests(unittest.TestCase):
         for changed in (
             replace(body, created_at=1787836799, expires_at=1787837399),
             replace(body, manifest_digest="d" * 64),
-            replace(body, actions=(PlanAction("project.create", "api", ()),)),
+            replace(
+                body,
+                actions=(
+                    PlanAction(
+                        "project.create",
+                        "api",
+                        (),
+                        "Reconcile api with project.create.",
+                    ),
+                ),
+            ),
         ):
             self.assertNotEqual(PlanEnvelope.create(changed).plan_hash, envelope.plan_hash)
 

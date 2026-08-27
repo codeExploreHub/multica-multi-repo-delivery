@@ -88,7 +88,14 @@ class ApplyTests(unittest.TestCase):
             "state_fingerprint": "c" * 64,
             "created_at": 1787836800,
             "expires_at": 1787837400,
-            "actions": (PlanAction("project.create", "control", ()),),
+            "actions": (
+                PlanAction(
+                    "project.create",
+                    "control",
+                    (),
+                    "Reconcile control with project.create.",
+                ),
+            ),
         }
         values.update(overrides)
         return PlanBody(**values)

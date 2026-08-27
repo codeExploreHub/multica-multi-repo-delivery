@@ -7,7 +7,6 @@ from importlib.resources.abc import Traversable
 import os
 from pathlib import Path
 import re
-from tempfile import TemporaryDirectory
 from typing import Any, Mapping
 
 import yaml
@@ -212,7 +211,7 @@ def _manifest_document(
                 )
     try:
         rendered = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
-        load_manifest_text(rendered)
+        load_manifest_text(rendered, strict_commands=True)
     except (ManifestError, yaml.YAMLError):
         raise CliError(
             "confirmation.incomplete",
@@ -266,16 +265,31 @@ def initialize_scaffold(
         "env.example": _environment_example(document),
     }
 
-    with TemporaryDirectory(prefix=f".{destination.name}.", dir=destination.parent) as staging_name:
-        staging = Path(staging_name)
+    try:
+        destination.mkdir(mode=0o700)
+    except OSError:
+        raise CliError(
+            "init.concurrent_target",
+            "The scaffold target changed during initialization",
+            ExitCode.VALIDATION,
+        ) from None
+
+    created: list[Path] = []
+    try:
         for filename, content in artifacts.items():
-            atomic_write_new(staging / filename, content)
+            artifact = destination / filename
+            atomic_write_new(artifact, content)
+            created.append(artifact)
+    except OSError:
+        for artifact in reversed(created):
+            artifact.unlink(missing_ok=True)
         try:
-            os.rename(staging, destination)
+            destination.rmdir()
         except OSError:
-            raise CliError(
-                "init.concurrent_target",
-                "The scaffold target changed during initialization",
-                ExitCode.VALIDATION,
-            ) from None
+            pass
+        raise CliError(
+            "init.concurrent_target",
+            "The scaffold target changed during initialization",
+            ExitCode.VALIDATION,
+        ) from None
     return tuple(destination / name for name in artifacts)

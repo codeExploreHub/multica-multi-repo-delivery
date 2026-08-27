@@ -49,6 +49,9 @@ class FakeGitHub:
             repository: RepositoryInfo(repository, "private", "main")
             for repository in repositories
         }
+        self.repositories["openai/superpowers"] = RepositoryInfo(
+            "openai/superpowers", "public", "main"
+        )
         self.calls: list[str] = []
 
     def get_repository(self, repository: str) -> RepositoryInfo:
@@ -1360,6 +1363,14 @@ class ProvisionerTests(unittest.TestCase):
             repository, "private", "foreign-default"
         )
         with self.assertRaisesRegex(ProvisionError, "default branch"):
+            self.apply()
+        self.assertFalse(self.multica.was_mutated)
+
+    def test_private_skill_repository_is_fatal_before_mutation(self):
+        self.github.repositories["openai/superpowers"] = RepositoryInfo(
+            "openai/superpowers", "private", "main"
+        )
+        with self.assertRaisesRegex(ProvisionError, "Skill repository must be public"):
             self.apply()
         self.assertFalse(self.multica.was_mutated)
 

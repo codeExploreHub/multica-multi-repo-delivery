@@ -17,7 +17,14 @@ from multica_delivery.core.provision import SUPPORTED_MULTICA_CLI
 
 from .clock import Clock
 from .errors import CliError, ExitCode
-from .plan import PlanAction, PlanBody, PlanEnvelope, PlanObservation, lock_digest
+from .plan import (
+    PlanAction,
+    PlanBody,
+    PlanEnvelope,
+    PlanObservation,
+    action_reason,
+    lock_digest,
+)
 from .validation import ValidationReport, validate_control_directory
 
 
@@ -57,6 +64,11 @@ def _migration_actions(source: str) -> tuple[PlanAction, ...]:
             "framework.version",
             f"{source}->{__version__}",
             ("skill_version", "engine_version", "supported_multica_cli", "manifest_digest"),
+            action_reason(
+                "framework.version",
+                f"{source}->{__version__}",
+                ("skill_version", "engine_version", "supported_multica_cli", "manifest_digest"),
+            ),
         ),
     )
 
@@ -109,7 +121,10 @@ class UpgradeService:
                 ExitCode.VALIDATION,
             )
         try:
-            manifest = load_manifest(root / "delivery.yaml")
+            manifest = load_manifest(
+                root / "delivery.yaml",
+                strict_commands=True,
+            )
             lock = load_lock(root / "framework.lock")
         except ManifestError:
             raise CliError(

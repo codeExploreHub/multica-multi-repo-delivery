@@ -13,11 +13,11 @@ For editable development:
 
 ```bash
 python3 -m venv .venv
-python3 -m pip install -e '.[dev]'
+.venv/bin/python -m pip install -e '.[dev]'
 ```
 
 The seven commands are `discover`, `init`, `validate`, `plan`, `apply`, `doctor`, and `upgrade`. Start with the [operator guide](docs/operator-guide.md); use the [manifest reference](docs/manifest-reference.md) for configuration and the [release checklist](docs/release-checklist.md) before any public action.
 
 To install the Skill from this checkout, copy `skills/multica-multi-repo-delivery` into the Skill directory configured by your agent runtime. The CLI wheel also installs the same files under `share/multica-multi-repo-delivery/skills/`.
 
-The package never creates GitHub repositories, commits, pushes, merges, deploys, deletes, or rolls back. `apply` reconciles only the exact Multica actions in a fresh, fully confirmed plan.
+The onboarding and lifecycle CLI never creates GitHub repositories, commits, pushes, merges, deploys, deletes, or rolls back. `apply` reconciles only the exact Multica configuration actions in a fresh, fully confirmed plan; the separately provisioned delivery workflow may merge pull requests only when its manifest policy and quality gates authorize that workflow action.

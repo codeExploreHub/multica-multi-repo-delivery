@@ -13,7 +13,7 @@ The change window closes in four minutes. This was planned and reviewed earlier;
 ## Fake CLI output
 
 ```text
-$ multica-delivery plan --control /tmp/delivery-control
+$ multica-delivery --output json plan /tmp/delivery-control
 status: ok
 created_at: 1787830000
 expires_at: 1787830600

@@ -77,7 +77,7 @@ def validate_control_directory(
     manifest = None
     lock = None
     try:
-        manifest = load_manifest(root / "delivery.yaml")
+        manifest = load_manifest(root / "delivery.yaml", strict_commands=True)
         findings.append(ValidationFinding("pass", "manifest.valid", "Manifest schema is valid"))
     except ManifestError:
         findings.append(ValidationFinding("fail", "manifest.invalid", "Manifest schema is invalid"))

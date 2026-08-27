@@ -38,19 +38,29 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(manifest.policy.automatic_merge)
         self.assertEqual(manifest.policy.deployment, "forbidden")
 
+    def test_standalone_boundary_rejects_scalar_commands(self):
+        text = FIXTURE.read_text(encoding="utf-8").replace(
+            "focused_test: [npm, run, \"test:focused\"]",
+            "focused_test: npm run test:focused",
+            1,
+        )
+
+        with self.assertRaisesRegex(ManifestError, "must be a string list"):
+            load_manifest_text(text, strict_commands=True)
+
     def test_digest_is_stable_for_equivalent_key_order(self):
         first = load_manifest(FIXTURE)
         text = FIXTURE.read_text().replace(
-            "      focused_test: ./scripts/test-focused.sh\n"
-            "      test: ./scripts/test.sh\n"
-            "      build: ./scripts/build.sh\n"
-            "      start: ./scripts/start.sh\n"
-            "      smoke: ./scripts/smoke.sh\n",
-            "      smoke: ./scripts/smoke.sh\n"
-            "      start: ./scripts/start.sh\n"
-            "      build: ./scripts/build.sh\n"
-            "      test: ./scripts/test.sh\n"
-            "      focused_test: ./scripts/test-focused.sh\n",
+            "      focused_test: [./scripts/test-focused.sh]\n"
+            "      test: [./scripts/test.sh]\n"
+            "      build: [./scripts/build.sh]\n"
+            "      start: [./scripts/start.sh]\n"
+            "      smoke: [./scripts/smoke.sh]\n",
+            "      smoke: [./scripts/smoke.sh]\n"
+            "      start: [./scripts/start.sh]\n"
+            "      build: [./scripts/build.sh]\n"
+            "      test: [./scripts/test.sh]\n"
+            "      focused_test: [./scripts/test-focused.sh]\n",
             1,
         )
         second = load_manifest_text(text)
@@ -146,7 +156,7 @@ class ManifestTests(unittest.TestCase):
             manifest.repositories["other"] = manifest.repositories["api"]
 
     def test_rejects_missing_mandatory_command(self):
-        text = FIXTURE.read_text().replace("      smoke: npm run smoke\n", "", 1)
+        text = FIXTURE.read_text().replace("      smoke: [npm, run, smoke]\n", "", 1)
         with self.assertRaisesRegex(ManifestError, "smoke"):
             load_manifest_text(text)
 

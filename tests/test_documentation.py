@@ -46,7 +46,10 @@ class DocumentationTests(unittest.TestCase):
             environment = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}")
             for argv in commands:
                 with self.subTest(argv=argv):
-                    self.assertIn(argv[0], {"multica-delivery", "pipx", "python3"})
+                    self.assertIn(
+                        argv[0],
+                        {"multica-delivery", "pipx", "python3", ".venv/bin/python"},
+                    )
                     if argv[0] == "multica-delivery":
                         executable = str(Path(sys.executable).with_name("multica-delivery"))
                         if "--version" in argv:
@@ -57,6 +60,14 @@ class DocumentationTests(unittest.TestCase):
                             documented_lifecycle.add(command)
                             probe = [executable, command, "--help"]
                         completed = subprocess.run(probe, capture_output=True, text=True, check=False)
+                    elif argv[0] == ".venv/bin/python":
+                        completed = subprocess.run(
+                            [str(fake / "python3"), *argv[1:]],
+                            env=environment,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
                     else:
                         completed = subprocess.run(argv, env=environment, capture_output=True, text=True, check=False)
                     self.assertEqual(completed.returncode, 0)

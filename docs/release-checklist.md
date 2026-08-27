@@ -11,8 +11,8 @@ This checklist prepares `0.1.0`; it does not authorize a public release.
 - [ ] No credentials, private repository identities, internal Skill sources, or literal secret values are present.
 
 ```bash
-python3 -B -m unittest discover -s tests -p 'test_*.py' -q
-python3 -m build
+.venv/bin/python -B -m unittest discover -s tests -p 'test_*.py' -q
+.venv/bin/python -m build
 ```
 
 ## Explicit approval gates

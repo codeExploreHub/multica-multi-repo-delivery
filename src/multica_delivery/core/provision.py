@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from multica_delivery import __version__
 
 from ..adapters.github_client import RepositoryInfo
-from .manifest import manifest_digest
+from .manifest import manifest_digest, skill_repository_slug
 from .model import (
     DeliveryManifest,
     FrameworkLock,
@@ -405,6 +405,22 @@ class Provisioner:
                 raise ProvisionError(f"GitHub repository identity mismatch for {key}")
             if default_branch is not None and observed.default_branch != default_branch:
                 raise ProvisionError(f"GitHub default branch mismatch for {key}")
+
+        skill_repositories = {
+            skill_repository_slug(source.url)
+            for source in manifest.skill_registry.values()
+        }
+        for repository in sorted(skill_repositories):
+            try:
+                observed = self.github.get_repository(repository)
+            except Exception:
+                raise ProvisionError(
+                    f"GitHub Skill repository preflight failed for {repository}"
+                ) from None
+            if observed.repository != repository or observed.visibility != "public":
+                raise ProvisionError(
+                    f"Skill repository must be public: {repository}"
+                )
 
     def _desired_state(self, manifest: DeliveryManifest) -> _DesiredState:
         if manifest.policy.watcher_cron != "*/30 * * * *":

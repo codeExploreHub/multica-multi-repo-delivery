@@ -17,7 +17,7 @@ from multica_delivery.core.provision import ProvisionError, ReconcileAction
 from .clock import Clock
 from .errors import CliError, ExitCode
 from .files import atomic_replace_private
-from .plan import PlanAction, PlanStore, PlanningService, lock_digest
+from .plan import PlanAction, PlanStore, PlanningService, action_reason, lock_digest
 from .secrets import SecretSource
 
 
@@ -197,7 +197,7 @@ class ApplyService:
             self._validate_confirmation(confirmation, approved.plan_hash)
 
         try:
-            manifest = load_manifest(manifest_file)
+            manifest = load_manifest(manifest_file, strict_commands=True)
             lock = load_lock(lock_file)
         except ManifestError:
             raise CliError(
@@ -251,7 +251,12 @@ class ApplyService:
             raise CliError(code, "Apply could not establish converged authoritative state", exit_code) from None
 
         applied_actions = tuple(
-            PlanAction(action.kind, action.key, action.changed_fields)
+            PlanAction(
+                action.kind,
+                action.key,
+                action.changed_fields,
+                action_reason(action.kind, action.key, action.changed_fields),
+            )
             for action in reconciled.actions
         )
         if applied_actions != body.actions:

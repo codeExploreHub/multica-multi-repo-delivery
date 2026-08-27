@@ -158,7 +158,7 @@ class DefaultServices:
         manifest_path = args.manifest_path or control / "delivery.yaml"
         lock_path = args.lock_path or control / "framework.lock"
         try:
-            manifest = load_manifest(manifest_path)
+            manifest = load_manifest(manifest_path, strict_commands=True)
         except ManifestError:
             raise CliError(
                 "apply.invalid_manifest",
@@ -203,7 +203,10 @@ class DefaultServices:
             return validate_control_directory(path)
 
         def contract(path: Path):
-            manifest = load_manifest(path / "delivery.yaml")
+            manifest = load_manifest(
+                path / "delivery.yaml",
+                strict_commands=True,
+            )
             return audit_contracts(
                 planning.provisioner.multica,
                 planning.provisioner.github,

@@ -112,7 +112,16 @@ resource_ids: {}
             "events": [], "rejected_argv": [],
         }))
         github_path.write_text(json.dumps({
-            "repositories": {slug: {"default_branch": "main"} for slug in (control_slug,) + repository_slugs},
+            "repositories": {
+                **{
+                    slug: {"default_branch": "main", "visibility": "private"}
+                    for slug in (control_slug,) + repository_slugs
+                },
+                "openai/superpowers": {
+                    "default_branch": "main",
+                    "visibility": "public",
+                },
+            },
             "read_calls": [], "prohibited_events": [],
         }))
         return multica_path, github_path
@@ -141,7 +150,10 @@ resource_ids: {}
                         runtime_id="11111111-1111-4111-8111-111111111111",
                         daemon_id="22222222-2222-4222-8222-222222222222",
                     )
-                    github = GitHubClient(runner, frozenset((control_slug,) + slugs))
+                    github = GitHubClient(
+                        runner,
+                        frozenset((control_slug,) + slugs + ("openai/superpowers",)),
+                    )
                     provisioner = Provisioner(multica, github)
                     planning = PlanningService(
                         provisioner,

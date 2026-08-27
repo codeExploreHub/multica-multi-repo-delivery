@@ -7,7 +7,7 @@ import subprocess
 
 from multica_delivery.adapters.github_client import GitHubClient
 from multica_delivery.adapters.multica_client import CommandResult, MulticaClient
-from multica_delivery.core.manifest import load_manifest
+from multica_delivery.core.manifest import load_manifest, skill_repository_slug
 from multica_delivery.core.provision import Provisioner
 
 from .plan import PlanningService
@@ -38,10 +38,17 @@ class ClosedSubprocessRunner:
 
 
 def build_planning_service(control_path: Path) -> PlanningService:
-    manifest = load_manifest(Path(control_path) / "delivery.yaml")
+    manifest = load_manifest(
+        Path(control_path) / "delivery.yaml",
+        strict_commands=True,
+    )
     allowed = frozenset(
         {manifest.control.github}
         | {repository.github for repository in manifest.repositories.values()}
+        | {
+            skill_repository_slug(source.url)
+            for source in manifest.skill_registry.values()
+        }
     )
     runner = ClosedSubprocessRunner()
     multica = MulticaClient(

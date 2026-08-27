@@ -61,6 +61,7 @@ class PlanAction:
     kind: str
     key: str
     changed_fields: tuple[str, ...] = ()
+    reason: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -71,6 +72,8 @@ class PlanAction:
             or type(self.changed_fields) is not tuple
             or not all(type(field) is str and field for field in self.changed_fields)
             or len(self.changed_fields) != len(set(self.changed_fields))
+            or type(self.reason) is not str
+            or not self.reason
         ):
             raise _invalid_plan("Plan action is invalid")
 
@@ -79,16 +82,30 @@ class PlanAction:
             "kind": self.kind,
             "key": self.key,
             "changed_fields": list(self.changed_fields),
+            "reason": self.reason,
         }
 
     @classmethod
     def from_value(cls, value: object) -> "PlanAction":
-        if not isinstance(value, dict) or set(value) != {"kind", "key", "changed_fields"}:
+        if not isinstance(value, dict) or set(value) != {
+            "kind",
+            "key",
+            "changed_fields",
+            "reason",
+        }:
             raise _invalid_plan("Plan action fields are invalid")
         changed = value["changed_fields"]
         if not isinstance(changed, list):
             raise _invalid_plan("Plan action changed_fields must be a list")
-        return cls(value["kind"], value["key"], tuple(changed))
+        return cls(value["kind"], value["key"], tuple(changed), value["reason"])
+
+
+def action_reason(kind: str, key: str, changed_fields: tuple[str, ...]) -> str:
+    """Build the stable, human-readable rationale authenticated by a plan."""
+    if changed_fields:
+        fields_text = ", ".join(changed_fields)
+        return f"Reconcile {key} with {kind}; changed fields: {fields_text}."
+    return f"Reconcile {key} with {kind}."
 
 
 @dataclass(frozen=True)
@@ -310,7 +327,10 @@ class PlanningService:
                 ExitCode.VALIDATION,
             )
         try:
-            manifest = load_manifest(root / "delivery.yaml")
+            manifest = load_manifest(
+                root / "delivery.yaml",
+                strict_commands=True,
+            )
             lock = load_lock(root / "framework.lock")
         except ManifestError:
             raise CliError(
@@ -365,7 +385,12 @@ class PlanningService:
             lock_digest(lock),
             reconciled.state_fingerprint,
             tuple(
-                PlanAction(action.kind, action.key, action.changed_fields)
+                PlanAction(
+                    action.kind,
+                    action.key,
+                    action.changed_fields,
+                    action_reason(action.kind, action.key, action.changed_fields),
+                )
                 for action in reconciled.actions
             ),
         )

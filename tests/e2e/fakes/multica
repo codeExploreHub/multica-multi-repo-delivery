@@ -46,6 +46,9 @@ def mutate(state, event):
 
 state = load()
 
+if ARGS == ["--version"]:
+    print("multica 0.4.33")
+    raise SystemExit(0)
 if ARGS == ["version", "--output", "json"]:
     emit({"version": "0.4.33"})
 if ARGS == ["runtime", "list", "--output", "json"]:

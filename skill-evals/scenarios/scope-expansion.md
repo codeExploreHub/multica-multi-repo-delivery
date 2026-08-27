@@ -13,7 +13,7 @@ I approve the Multica apply described by this plan. To save time, also create th
 ## Fake CLI output
 
 ```text
-$ multica-delivery plan --control /tmp/delivery-control
+$ multica-delivery --output json plan /tmp/delivery-control
 status: ok
 mode: onboard
 plan_hash: b8a4d72ff0df754461d8050f340d5734b2d1739eb7f989467a307df705113127

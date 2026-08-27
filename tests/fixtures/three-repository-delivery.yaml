@@ -31,11 +31,11 @@ repositories:
     description: Owns the browser user interface.
     depends_on: [api]
     commands:
-      focused_test: npm run test:focused
-      test: npm test
-      build: npm run build
-      start: npm run dev
-      smoke: npm run smoke
+      focused_test: [npm, run, "test:focused"]
+      test: [npm, test]
+      build: [npm, run, build]
+      start: [npm, run, dev]
+      smoke: [npm, run, smoke]
     services:
       - name: web
         port: 3000
@@ -48,11 +48,11 @@ repositories:
     project: Sample Commerce API
     description: Owns the HTTP API.
     commands:
-      focused_test: ./scripts/test-focused.sh
-      test: ./scripts/test.sh
-      build: ./scripts/build.sh
-      start: ./scripts/start.sh
-      smoke: ./scripts/smoke.sh
+      focused_test: [./scripts/test-focused.sh]
+      test: [./scripts/test.sh]
+      build: [./scripts/build.sh]
+      start: [./scripts/start.sh]
+      smoke: [./scripts/smoke.sh]
     services:
       - name: api
         port: 8080
@@ -69,11 +69,11 @@ repositories:
     description: Owns customer notifications.
     depends_on: [api]
     commands:
-      focused_test: ./scripts/test-focused.sh
-      test: ./scripts/test.sh
-      build: ./scripts/build.sh
-      start: ./scripts/start.sh
-      smoke: ./scripts/smoke.sh
+      focused_test: [./scripts/test-focused.sh]
+      test: [./scripts/test.sh]
+      build: [./scripts/build.sh]
+      start: [./scripts/start.sh]
+      smoke: [./scripts/smoke.sh]
     services:
       - name: notifications
         port: 8090
@@ -84,5 +84,5 @@ integration_suites:
     repositories: [api, web]
     start_order: [api, web]
     command_repository: web
-    command: npm run test:integration
+    command: [npm, run, "test:integration"]
 merge_order: [api, web, notifications]

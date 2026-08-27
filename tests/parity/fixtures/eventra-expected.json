@@ -1,0 +1,42 @@
+{
+  "decisions": {
+    "initial_cross_stack": {
+      "dispatch_kind": "implementation",
+      "kind": "dispatch",
+      "next_attempt": null,
+      "reason": "dispatch the next dependency-ready implementation wave",
+      "repositories": [
+        "backend"
+      ]
+    }
+  },
+  "manifest": {
+    "digest": "43a0cd01a4fd605c45be137d884c780f6448cd7508b00284c0b536e68d7e7218",
+    "integration_start_order": [
+      "backend",
+      "frontend"
+    ],
+    "merge_order": [
+      "backend",
+      "frontend"
+    ],
+    "repositories": [
+      "frontend",
+      "backend"
+    ]
+  },
+  "metadata": {
+    "parent": "{\"affected_repositories\":[\"frontend\",\"backend\"],\"attempt\":0,\"candidate_shas\":{},\"contract_hashes\":{},\"instance_key\":\"eventra\",\"last_action\":\"dispatch\",\"merge_plan\":[],\"merge_state\":\"pending\",\"metadata_version\":1,\"repository_dag\":{\"backend\":[],\"frontend\":[\"backend\"]},\"stage_ordinal\":0,\"workflow_version\":1}"
+  },
+  "provision": {
+    "effective_skill_bindings": {
+      "backend-engineer": ["using-superpowers", "executing-plans", "test-driven-development", "systematic-debugging", "requesting-code-review", "receiving-code-review", "verification-before-completion", "rest-api-conventions", "testing-pyramid", "spring-security-jwt"],
+      "delivery-lead": ["using-superpowers", "brainstorming", "writing-plans", "verification-before-completion"],
+      "frontend-engineer": ["using-superpowers", "executing-plans", "test-driven-development", "systematic-debugging", "requesting-code-review", "receiving-code-review", "verification-before-completion", "vercel-react-best-practices"],
+      "independent-reviewer": ["using-superpowers", "systematic-debugging", "verification-before-completion"],
+      "integration-qa": ["using-superpowers", "systematic-debugging", "verification-before-completion", "playwright-cli"],
+      "workflow-watcher": ["using-superpowers", "systematic-debugging", "verification-before-completion"]
+    }
+  },
+  "source_commit": "f62310731394ec27034645787d87749b1eb95d38"
+}

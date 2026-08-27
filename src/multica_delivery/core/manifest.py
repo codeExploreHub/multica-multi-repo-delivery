@@ -93,13 +93,14 @@ def _expect_keys(data: Mapping[str, Any], field: str, required: set[str], option
         raise ManifestError(f"{field} has unknown key(s): {', '.join(sorted(unknown))}")
 
 
-def _command(value: Any, field: str) -> tuple[str, ...]:
-    if isinstance(value, str):
+def _command(value: Any, field: str, *, strict: bool) -> tuple[str, ...]:
+    if isinstance(value, str) and not strict:
         result = tuple(shlex.split(value))
     elif isinstance(value, list) and all(isinstance(part, str) and part for part in value):
         result = tuple(value)
     else:
-        raise ManifestError(f"{field} must be a command string or string list")
+        expected = "a string list" if strict else "a command string or string list"
+        raise ManifestError(f"{field} must be {expected}")
     if not result:
         raise ManifestError(f"{field} must not be empty")
     return result
@@ -134,6 +135,21 @@ def _public_skill_url(value: Any, field: str) -> str:
     return url
 
 
+def skill_repository_slug(url: str) -> str:
+    """Return the authoritative GitHub repository named by a validated Skill URL."""
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or len(parts) < 2
+    ):
+        raise ManifestError("Skill URL must identify a GitHub repository")
+    return _github_slug(f"{parts[0]}/{parts[1]}", "Skill repository")
+
+
 def _topological_order(repositories: Mapping[str, RepositorySpec]) -> tuple[str, ...]:
     pending = {key: set(spec.depends_on) for key, spec in repositories.items()}
     order: list[str] = []
@@ -160,14 +176,17 @@ def _validate_dependency_order(order: tuple[str, ...], repositories: Mapping[str
                 raise ManifestError(f"{field} is inconsistent with repository dependencies")
 
 
-def load_manifest(path: Path) -> DeliveryManifest:
+def load_manifest(path: Path, *, strict_commands: bool = False) -> DeliveryManifest:
     try:
-        return load_manifest_text(Path(path).read_text(encoding="utf-8"))
+        return load_manifest_text(
+            Path(path).read_text(encoding="utf-8"),
+            strict_commands=strict_commands,
+        )
     except OSError as error:
         raise ManifestError(f"cannot read manifest {path}: {error}") from error
 
 
-def load_manifest_text(text: str) -> DeliveryManifest:
+def load_manifest_text(text: str, *, strict_commands: bool = False) -> DeliveryManifest:
     try:
         document = yaml.load(text, Loader=_UniqueKeyLoader)
     except (yaml.YAMLError, ManifestError) as error:
@@ -278,7 +297,14 @@ def load_manifest_text(text: str) -> DeliveryManifest:
         missing_commands = _REQUIRED_COMMANDS - commands_data.keys()
         if missing_commands:
             raise ManifestError(f"repositories.{name}.commands missing: {', '.join(sorted(missing_commands))}")
-        commands = _frozen({command: _command(value, f"repositories.{name}.commands.{command}") for command, value in commands_data.items()})
+        commands = _frozen({
+            command: _command(
+                value,
+                f"repositories.{name}.commands.{command}",
+                strict=strict_commands,
+            )
+            for command, value in commands_data.items()
+        })
         services: list[ServiceSpec] = []
         for service in _sequence(data["services"], f"repositories.{name}.services"):
             service_data = _mapping(service, f"repositories.{name}.service")
@@ -344,7 +370,17 @@ def load_manifest_text(text: str) -> DeliveryManifest:
         command_repository = _string(data["command_repository"], f"integration_suites.{name}.command_repository")
         if command_repository not in members:
             raise ManifestError(f"integration_suites.{name}.command_repository must be in repositories")
-        suites.append(IntegrationSuiteSpec(name, members, start_order, command_repository, _command(data["command"], f"integration_suites.{name}.command")))
+        suites.append(IntegrationSuiteSpec(
+            name,
+            members,
+            start_order,
+            command_repository,
+            _command(
+                data["command"],
+                f"integration_suites.{name}.command",
+                strict=strict_commands,
+            ),
+        ))
 
     merge_order = tuple(_string(value, "merge_order") for value in _sequence(top["merge_order"], "merge_order"))
     _validate_dependency_order(merge_order, frozen_repositories, "merge_order")
