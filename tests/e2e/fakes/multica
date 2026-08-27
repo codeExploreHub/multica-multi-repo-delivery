@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Deterministic fake for the exact Multica argv emitted by production adapters."""
+
+import json
+import os
+from pathlib import Path
+import sys
+
+
+STATE = Path(os.environ["MULTICA_FAKE_STATE"])
+ARGS = sys.argv[1:]
+
+
+def load():
+    return json.loads(STATE.read_text())
+
+
+def save(state):
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, sort_keys=True))
+    os.replace(temporary, STATE)
+
+
+def emit(value, code=0):
+    print(json.dumps(value, sort_keys=True))
+    raise SystemExit(code)
+
+
+def option(name):
+    try:
+        return ARGS[ARGS.index(name) + 1]
+    except (ValueError, IndexError):
+        emit({"error": "unsupported argv"}, 2)
+
+
+def next_id(state, kind):
+    value = state["counters"].get(kind, 0) + 1
+    state["counters"][kind] = value
+    return f"{kind}-{value}"
+
+
+def mutate(state, event):
+    state["mutation_count"] += 1
+    state["events"].append(event)
+
+
+state = load()
+
+if ARGS == ["version", "--output", "json"]:
+    emit({"version": "0.4.33"})
+if ARGS == ["runtime", "list", "--output", "json"]:
+    emit({"runtimes": [state["runtime"]]})
+if ARGS == ["project", "list", "--output", "json"]:
+    emit({"projects": [{"id": item["id"], "title": item["title"]} for item in state["projects"].values()]})
+if len(ARGS) == 5 and ARGS[:2] == ["project", "get"] and ARGS[3:] == ["--output", "json"]:
+    emit({"project": state["projects"][ARGS[2]]})
+if len(ARGS) == 6 and ARGS[:3] == ["project", "resource", "list"] and ARGS[4:] == ["--output", "json"]:
+    emit({"resources": list(state["resources"].get(ARGS[3], {}).values())})
+if ARGS == ["agent", "list", "--output", "json"]:
+    emit({"agents": [{"id": item["id"], "name": item["name"]} for item in state["agents"].values()]})
+if len(ARGS) == 5 and ARGS[:2] == ["agent", "get"] and ARGS[3:] == ["--output", "json"]:
+    emit({"agent": state["agents"][ARGS[2]]})
+if len(ARGS) == 6 and ARGS[:3] == ["agent", "skills", "list"] and ARGS[4:] == ["--output", "json"]:
+    identifiers = state["bindings"].get(ARGS[3], [])
+    emit({"skills": [{"id": identifier, "name": state["skills"][identifier]["name"]} for identifier in identifiers]})
+if len(ARGS) == 6 and ARGS[:3] == ["agent", "env", "get"] and ARGS[4:] == ["--output", "json"]:
+    agent_id = ARGS[3]
+    emit({"environment": {"agent_id": agent_id, "custom_env": state["environments"].get(agent_id, {})}})
+if ARGS == ["skill", "list", "--output", "json"]:
+    emit({"skills": [{"id": item["id"], "name": item["name"]} for item in state["skills"].values()]})
+if len(ARGS) == 5 and ARGS[:2] == ["skill", "get"] and ARGS[3:] == ["--output", "json"]:
+    emit({"skill": state["skills"][ARGS[2]]})
+if ARGS == ["squad", "list", "--output", "json"]:
+    emit({"squads": [{"id": item["id"], "name": item["name"]} for item in state["squads"].values()]})
+if len(ARGS) == 5 and ARGS[:2] == ["squad", "get"] and ARGS[3:] == ["--output", "json"]:
+    emit({"squad": state["squads"][ARGS[2]]})
+if len(ARGS) == 6 and ARGS[:3] == ["squad", "member", "list"] and ARGS[4:] == ["--output", "json"]:
+    emit({"members": list(state["members"].get(ARGS[3], {}).values())})
+if ARGS == ["autopilot", "list", "--output", "json"]:
+    items = list(state["autopilots"].values())
+    emit({"autopilots": items, "total": len(items)})
+if len(ARGS) == 5 and ARGS[:2] == ["autopilot", "get"] and ARGS[3:] == ["--output", "json"]:
+    autopilot = state["autopilots"][ARGS[2]]
+    emit({"autopilot": autopilot, "collaborators": [], "triggers": list(state["triggers"].get(ARGS[2], {}).values())})
+if ARGS == ["capability", "get", "skill-import", "--output", "json"]:
+    emit({"capability": {"dry_run": False}})
+
+if ARGS[:2] == ["skill", "import"]:
+    url = option("--url")
+    identifier = next_id(state, "skill")
+    record = {"id": identifier, "name": url.rstrip("/").split("/")[-1], "config": {"origin": {"source_url": url}}}
+    state["skills"][identifier] = record
+    mutate(state, "skill.import")
+    save(state)
+    emit({"status": "created", "skill": {"id": identifier, "name": record["name"]}})
+if ARGS[:2] == ["project", "create"]:
+    identifier = next_id(state, "project")
+    state["projects"][identifier] = {"id": identifier, "title": option("--title"), "description": option("--description")}
+    state["resources"][identifier] = {}
+    mutate(state, "project.create")
+    save(state)
+    emit({"project": {"id": identifier}})
+if ARGS[:2] == ["project", "update"]:
+    identifier = ARGS[2]
+    state["projects"][identifier].update(title=option("--title"), description=option("--description"))
+    mutate(state, "project.update")
+    save(state)
+    emit({"ok": True})
+if ARGS[:4] == ["project", "resource", "add", ARGS[3]]:
+    project_id = ARGS[3]
+    identifier = next_id(state, "resource")
+    state["resources"].setdefault(project_id, {})[identifier] = {
+        "id": identifier,
+        "project_id": project_id,
+        "resource_type": "local_directory",
+        "resource_ref": {
+            "local_path": option("--local-path"),
+            "daemon_id": option("--daemon-id"),
+            "execution_mode": option("--execution-mode"),
+        },
+    }
+    mutate(state, "worktree.create")
+    save(state)
+    emit({"resource": {"id": identifier, "project_id": project_id}})
+if ARGS[:3] == ["project", "resource", "update"]:
+    project_id, identifier = ARGS[3], ARGS[4]
+    reference = state["resources"][project_id][identifier]["resource_ref"]
+    reference.update(daemon_id=option("--daemon-id"), execution_mode=option("--execution-mode"))
+    mutate(state, "worktree.update")
+    save(state)
+    emit({"ok": True})
+if ARGS[:2] == ["agent", "create"] or ARGS[:2] == ["agent", "update"]:
+    creating = ARGS[1] == "create"
+    identifier = next_id(state, "agent") if creating else ARGS[2]
+    state["agents"][identifier] = {
+        "id": identifier,
+        "name": option("--name"),
+        "description": option("--description"),
+        "instructions": option("--instructions"),
+        "runtime_id": option("--runtime-id"),
+        "visibility": option("--visibility"),
+        "max_concurrent_tasks": int(option("--max-concurrent-tasks")),
+    }
+    state["bindings"].setdefault(identifier, [])
+    state["environments"].setdefault(identifier, {})
+    mutate(state, "agent.create" if creating else "agent.update")
+    save(state)
+    emit({"agent": {"id": identifier}} if creating else {"ok": True})
+if ARGS[:3] == ["agent", "skills", "add"]:
+    agent_id, skill_id = ARGS[3], option("--skill-ids")
+    if skill_id not in state["bindings"].setdefault(agent_id, []):
+        state["bindings"][agent_id].append(skill_id)
+    mutate(state, "agent.skill.add")
+    save(state)
+    emit({"ok": True})
+if ARGS[:3] == ["agent", "env", "set"]:
+    agent_id = ARGS[3]
+    state["environments"][agent_id] = json.loads(sys.stdin.read())
+    mutate(state, "agent.environment.set")
+    save(state)
+    emit({"ok": True})
+if ARGS[:2] == ["squad", "create"]:
+    identifier = next_id(state, "squad")
+    leader = option("--leader")
+    state["squads"][identifier] = {"id": identifier, "name": option("--name"), "description": option("--description"), "instructions": "", "leader_id": leader}
+    state["members"][identifier] = {leader: {"id": f"member-{leader}", "squad_id": identifier, "member_id": leader, "member_type": "agent", "role": "leader"}}
+    mutate(state, "squad.create")
+    save(state)
+    emit({"squad": {"id": identifier}})
+if ARGS[:2] == ["squad", "update"]:
+    identifier = ARGS[2]
+    state["squads"][identifier].update(name=option("--name"), description=option("--description"), instructions=option("--instructions"), leader_id=option("--leader"))
+    mutate(state, "squad.update")
+    save(state)
+    emit({"ok": True})
+if ARGS[:3] == ["squad", "member", "add"] or ARGS[:3] == ["squad", "member", "set-role"]:
+    squad_id, agent_id = ARGS[3], option("--member-id")
+    state["members"].setdefault(squad_id, {})[agent_id] = {"id": f"member-{agent_id}", "squad_id": squad_id, "member_id": agent_id, "member_type": "agent", "role": option("--role")}
+    mutate(state, "squad.member")
+    save(state)
+    emit({"member": {"member_id": agent_id}})
+if ARGS[:2] == ["autopilot", "create"] or ARGS[:2] == ["autopilot", "update"]:
+    creating = ARGS[1] == "create"
+    identifier = next_id(state, "autopilot") if creating else ARGS[2]
+    state["autopilots"][identifier] = {
+        "id": identifier,
+        "title": option("--title"),
+        "description": option("--description"),
+        "execution_mode": option("--mode"),
+        "project_id": option("--project"),
+        "assignee_id": option("--agent"),
+        "assignee_type": "agent",
+        "status": "active" if creating else option("--status"),
+    }
+    state["triggers"].setdefault(identifier, {})
+    mutate(state, "autopilot.create" if creating else "autopilot.update")
+    save(state)
+    emit({"autopilot": {"id": identifier}} if creating else {"ok": True})
+if ARGS[:2] == ["autopilot", "trigger-add"] or ARGS[:2] == ["autopilot", "trigger-update"]:
+    updating = ARGS[1] == "trigger-update"
+    autopilot_id = ARGS[2]
+    identifier = ARGS[3] if updating else next_id(state, "trigger")
+    state["triggers"].setdefault(autopilot_id, {})[identifier] = {
+        "id": identifier,
+        "autopilot_id": autopilot_id,
+        "kind": "schedule",
+        "cron_expression": option("--cron"),
+        "timezone": option("--timezone"),
+        "enabled": True,
+        "label": option("--label"),
+        "provider": None,
+        "signing_secret_hint": None,
+        "webhook_path": None,
+        "webhook_token": None,
+        "webhook_token_hint": None,
+        "webhook_url": None,
+        "has_signing_secret": False,
+        "has_webhook_token": False,
+    }
+    mutate(state, "trigger.update" if updating else "trigger.create")
+    save(state)
+    emit({"trigger": {"id": identifier, "autopilot_id": autopilot_id}})
+
+state["rejected_argv"].append(ARGS)
+save(state)
+emit({"error": "unsupported argv"}, 2)

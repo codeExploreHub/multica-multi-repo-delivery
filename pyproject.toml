@@ -29,5 +29,8 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+multica_delivery = ["templates/*"]
+
 [tool.setuptools.dynamic]
 version = { attr = "multica_delivery.__version__" }

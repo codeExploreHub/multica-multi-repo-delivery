@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from importlib.resources import files
+from importlib.resources.abc import Traversable
 import os
 from pathlib import Path
 import re
@@ -33,6 +35,17 @@ supported_multica_cli: ''
 manifest_digest: ''
 resource_ids: {}
 """
+_PACKAGED_TEMPLATE_NAMES = frozenset(
+    {"delivery.yaml", "framework.lock", "env.example", "AGENTS.md", "gitignore.fragment"}
+)
+
+
+def template_path(name: str) -> Traversable:
+    """Return one closed, packaged scaffold resource."""
+
+    if type(name) is not str or name not in _PACKAGED_TEMPLATE_NAMES:
+        raise ValueError("unknown packaged template")
+    return files("multica_delivery").joinpath("templates", name)
 
 
 def _github_slug(remote: str) -> str | None:
