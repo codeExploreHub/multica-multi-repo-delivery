@@ -1,0 +1,6 @@
+{
+  "name": "sample-worker",
+  "scripts": {
+    "test": "node --test"
+  }
+}
