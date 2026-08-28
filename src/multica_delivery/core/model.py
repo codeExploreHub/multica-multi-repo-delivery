@@ -1,6 +1,6 @@
 """Immutable values decoded from delivery manifests and framework locks."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -54,7 +54,9 @@ class RepositorySpec:
     skills: tuple[str, ...]
     description: str = ""
     services: tuple[ServiceSpec, ...] = ()
-    secret_env: Mapping[str, SecretEnvSpec] = MappingProxyType({})
+    secret_env: Mapping[str, SecretEnvSpec] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True)
@@ -125,7 +127,9 @@ class DeliveryManifest:
     integration_suites: tuple[IntegrationSuiteSpec, ...]
     policy: PolicySpec
     merge_order: tuple[str, ...]
-    role_skills: Mapping[str, tuple[str, ...]] = MappingProxyType({})
+    role_skills: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True)
