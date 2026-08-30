@@ -304,6 +304,7 @@ class FakeWorkflowStore:
         self.change_candidate_after_first_progress = False
         self.add_pr_evidence_after_reservation = False
         self.duplicate_repair_child_on_create = False
+        self.replace_repair_digest_after_create = False
 
     def add_blank(
         self,
@@ -607,6 +608,13 @@ class FakeWorkflowStore:
                         identifier=f"{repairs[-1].identifier}-DUPLICATE",
                     )
                 )
+        if self.replace_repair_digest_after_create:
+            workflow_children = [
+                replace(child, failure_bundle_digest="f" * 64)
+                if child.phase == "repair"
+                else child
+                for child in workflow_children
+            ]
         self.states[parent_identifier] = replace(
             state,
             metadata=metadata,
@@ -3190,6 +3198,37 @@ class GenericWorkflowTests(unittest.TestCase):
             if item.phase == "repair"
         ]
         self.assertEqual(len(repairs), 2)
+
+    def test_post_create_repair_with_a_different_stored_digest_is_uncertain(self):
+        snapshot = replace(
+            passing_snapshot(),
+            reviews={
+                **passing_snapshot().reviews,
+                "api": RepositoryEvidence(SHA["api"], "pending"),
+            },
+        )
+        child = WorkflowChild(
+            "PRO-101-API-REVIEW", "api", "api", "", "review", 5, 0,
+            "in_progress", "review:" + "6" * 64, True,
+            creation_candidate_shas=snapshot.candidate_shas,
+        )
+        self.store.add_state(
+            "PRO-101", snapshot, children=(child,),
+            pull_requests=pull_request_targets(),
+        )
+        self.store.replace_repair_digest_after_create = True
+
+        result = self.workflow.record_phase_completion(
+            completion_for("api", phase="review", result="fail", comment_digit="6")
+        )
+
+        self.assertEqual(result.next_action, "uncertain")
+        self.assertEqual(result.mutation_count, 2)
+        repair = next(
+            child for child in self.store.states["PRO-101"].children
+            if child.phase == "repair"
+        )
+        self.assertEqual(repair.failure_bundle_digest, "f" * 64)
 
     def test_direct_resume_waits_for_current_stage_before_one_shared_repair(self):
         snapshot = replace(
