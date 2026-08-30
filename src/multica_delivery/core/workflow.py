@@ -1691,7 +1691,11 @@ class GenericWorkflow:
                     or type(metadata.merge_state) is not str
                     or type(metadata.repair_round) is not int
                     or type(metadata.automatic_repairs_used) is not int
-                    or not 0 <= metadata.automatic_repairs_used <= metadata.repair_round
+                    or metadata.automatic_repairs_used
+                    != min(
+                        metadata.repair_round,
+                        self.manifest.policy.max_repair_attempts,
+                    )
                     or metadata.repair_round > self.manifest.policy.max_repair_attempts + 1
                     or type(metadata.last_action) is not str
                 ):
@@ -2098,7 +2102,7 @@ class GenericWorkflow:
 
     @staticmethod
     def _candidate_heads_match(state: WorkflowState) -> bool:
-        return all(
+        return set(state.pull_requests) <= set(state.snapshot.pull_requests) and all(
             state.snapshot.candidate_shas.get(repository) == pull_request.head_sha
             for repository, pull_request in state.snapshot.pull_requests.items()
         )
@@ -3245,6 +3249,63 @@ class GenericWorkflow:
             )
         return self._result(observed, "complete", decision.reason, action_key=key, mutation_count=1)
 
+    def _completed_sibling_candidate_changes(
+        self,
+        state: WorkflowState,
+        child: WorkflowChild,
+    ) -> Mapping[str, str]:
+        """Return candidate changes proven by completed siblings from one creation wave."""
+
+        changes: dict[str, str] = {}
+        for sibling in state.children:
+            if (
+                sibling.identifier == child.identifier
+                or sibling.repository_key == child.repository_key
+                or sibling.phase != child.phase
+                or sibling.stage_ordinal != child.stage_ordinal
+                or sibling.attempt != child.attempt
+                or sibling.action_key != child.action_key
+                or sibling.creation_candidate_shas != child.creation_candidate_shas
+                or sibling.failure_bundle_digest != child.failure_bundle_digest
+                or sibling.authorizing_comment_uuid != child.authorizing_comment_uuid
+                or sibling.active
+                or sibling.status not in _TERMINAL_CHILD_STATUSES
+                or sibling.phase_result != "pass"
+                or not _canonical_uuid(sibling.evidence_comment_uuid)
+                or not _https_evidence_url(sibling.evidence_comment_url)
+                or sibling.target_key != sibling.repository_key
+                or sibling.suite_key
+            ):
+                continue
+            repository = sibling.repository_key
+            evidence = state.snapshot.children.get(repository)
+            pull_request = state.snapshot.pull_requests.get(repository)
+            candidate = state.snapshot.candidate_shas.get(repository)
+            if (
+                evidence is None
+                or evidence.result != "pass"
+                or evidence.candidate_sha != candidate
+                or pull_request is None
+                or pull_request.head_sha != candidate
+            ):
+                continue
+            changes[repository] = candidate
+        return MappingProxyType(changes)
+
+    def _creation_candidates_match(
+        self,
+        state: WorkflowState,
+        child: WorkflowChild,
+    ) -> bool:
+        creation = dict(child.creation_candidate_shas)
+        current = dict(state.snapshot.candidate_shas)
+        if child.phase not in {"implementation", "repair"}:
+            return creation == current
+        sibling_changes = dict(self._completed_sibling_candidate_changes(state, child))
+        expected = dict(creation)
+        expected.update(sibling_changes)
+        return expected == current
+
     def _completion_problem(
         self,
         state: WorkflowState,
@@ -3361,33 +3422,36 @@ class GenericWorkflow:
             and matching[0].failure_bundle_digest != completion.failure_bundle_digest
         ):
             return "repair completion failure bundle digest does not match assigned child", None
-        if completion.phase in {"implementation", "repair"}:
-            child = matching[0]
-            expected_creation_key = self._action_key(
-                state,
-                completion.phase,
-                child.stage_ordinal,
-                attempt=child.attempt,
-                candidate_shas=child.creation_candidate_shas,
-                failure_bundle_digest=(
-                    child.failure_bundle_digest
-                    if completion.phase == "repair"
-                    else ""
-                ),
-                authorizing_comment_uuid=(
-                    child.authorizing_comment_uuid
-                    if completion.phase == "repair"
-                    else ""
-                ),
-            )
-            if (
-                dict(child.creation_candidate_shas)
-                != dict(state.snapshot.candidate_shas)
-                or child.action_key != expected_creation_key
-                or expected_creation_key not in state.applied_action_keys
-            ):
-                return "phase completion child creation provenance is not current", None
-        return None, matching[0]
+        child = matching[0]
+        creation_stage_kind = (
+            "gates"
+            if completion.phase in {"review", "qa", "integration_qa"}
+            else completion.phase
+        )
+        expected_creation_key = self._action_key(
+            state,
+            creation_stage_kind,
+            child.stage_ordinal,
+            attempt=child.attempt,
+            candidate_shas=child.creation_candidate_shas,
+            failure_bundle_digest=(
+                child.failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                child.authorizing_comment_uuid
+                if completion.phase == "repair"
+                else ""
+            ),
+        )
+        if (
+            child.action_key != expected_creation_key
+            or expected_creation_key not in state.applied_action_keys
+            or not self._creation_candidates_match(state, child)
+        ):
+            return "phase completion child creation provenance is not current", None
+        return None, child
 
     @staticmethod
     def _zero_mutation_block(
@@ -3633,6 +3697,14 @@ class GenericWorkflow:
                 state,
                 "new phase evidence is allowed only for an active pre-merge parent",
             )
+        missing_head_evidence = set(state.pull_requests) - set(
+            state.snapshot.pull_requests
+        )
+        if missing_head_evidence:
+            return self._zero_mutation_block(
+                state,
+                "managed pull request lacks authoritative head evidence",
+            )
         mismatched_heads = {
             repository
             for repository, pull_request in state.snapshot.pull_requests.items()
@@ -3640,6 +3712,7 @@ class GenericWorkflow:
         }
         if mismatched_heads and (
             completion.phase not in {"implementation", "repair"}
+            or completion.result != "pass"
             or mismatched_heads != {completion.repository_key}
             or state.snapshot.pull_requests[completion.repository_key].head_sha
             != completion.candidate_sha
@@ -3647,6 +3720,17 @@ class GenericWorkflow:
             return self._zero_mutation_block(
                 state,
                 "out-of-band pull-request head change",
+            )
+        if (
+            completion.phase in {"implementation", "repair"}
+            and completion.result != "pass"
+            and completion.repository_key in state.snapshot.candidate_shas
+            and state.snapshot.candidate_shas[completion.repository_key]
+            != completion.candidate_sha
+        ):
+            return self._zero_mutation_block(
+                state,
+                "non-PASS completion cannot replace a candidate SHA",
             )
         completion_problem, child = self._completion_problem(state, completion)
         if completion_problem is not None or child is None:
@@ -3658,7 +3742,10 @@ class GenericWorkflow:
             completion.repository_key
         )
         candidate_shas = dict(state.snapshot.candidate_shas)
-        if completion.phase in {"implementation", "repair"}:
+        if (
+            completion.phase in {"implementation", "repair"}
+            and completion.result == "pass"
+        ):
             candidate_shas[completion.repository_key] = completion.candidate_sha
         action_candidates = (
             completion.candidate_shas
@@ -3775,6 +3862,7 @@ class GenericWorkflow:
                 isinstance(current, WorkflowState)
                 and current.parent_identifier == parent_identifier
                 and current.metadata == metadata
+                and dict(current.snapshot.candidate_shas) == candidate_shas
                 and key in current.applied_action_keys
                 and len(
                     tuple(
@@ -3804,6 +3892,7 @@ class GenericWorkflow:
             return self._block(done_state, "phase child done status was not authoritative")
         replacement = (
             completion.phase in {"implementation", "repair"}
+            and completion.result == "pass"
             and previous_candidate_sha is not None
             and previous_candidate_sha != completion.candidate_sha
         )
@@ -3848,7 +3937,11 @@ class GenericWorkflow:
                 mutation_count=1,
             )
         resumed = self.resume_parent(parent_identifier)
-        return replace(resumed, completed_child_status="done")
+        return replace(
+            resumed,
+            completed_child_status="done",
+            mutation_count=resumed.mutation_count + 1,
+        )
 
     def _preflight(
         self,
@@ -4954,6 +5047,11 @@ class GenericWorkflow:
         scope_problem = self._watch_scope_problem(initial, parent_identifier)
         if scope_problem is not None:
             return self._recovery_noop(parent_identifier, scope_problem)
+        if not self._candidate_heads_match(initial):
+            return self._zero_mutation_block(
+                initial,
+                "out-of-band pull-request head change",
+            )
         decision = self._parent_decision(initial)
         if (
             decision.kind is DecisionKind.BLOCK
@@ -5033,6 +5131,11 @@ class GenericWorkflow:
                 parent_identifier,
                 "workflow changed before recovery",
                 trusted_state=initial,
+            )
+        if not self._candidate_heads_match(fresh):
+            return self._zero_mutation_block(
+                fresh,
+                "out-of-band pull-request head change",
             )
         if (
             fresh != initial

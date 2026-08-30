@@ -398,13 +398,6 @@ class FakeWorkflowStore:
         project_key: str | None = None,
         stage_ordinal: int | None = None,
     ) -> None:
-        children = tuple(
-            replace(child, action_key="stage:" + child.action_key.split(":", 1)[1])
-            if child.phase in {"review", "qa", "integration_qa"}
-            and child.action_key.startswith(("review:", "qa:"))
-            else child
-            for child in children
-        )
         latest_child_stage = max(
             (child.stage_ordinal for child in children),
             default=5,
@@ -433,6 +426,31 @@ class FakeWorkflowStore:
                 merge_state=metadata.merge_state,
                 attempt=snapshot.attempt,
                 last_action=metadata.last_action,
+            )
+        elif isinstance(metadata, ParentMetadata):
+            # Legacy fixtures used phase-prefixed placeholder keys. Normalize those
+            # fixtures to the exact shared gate-creation identity used in production.
+            children = tuple(
+                replace(
+                    child,
+                    action_key=coordinator_action_key(
+                        workflow_version=metadata.workflow_version,
+                        instance_key=metadata.instance_key,
+                        parent_identifier=identifier,
+                        stage_kind="gates",
+                        stage_ordinal=child.stage_ordinal,
+                        attempt=child.attempt,
+                        affected_repositories=frozenset(
+                            metadata.affected_repositories
+                        ),
+                        candidate_shas=child.creation_candidate_shas,
+                        contract_hashes=metadata.contract_hashes,
+                    ),
+                )
+                if child.phase in {"review", "qa", "integration_qa"}
+                and child.action_key.startswith(("review:", "qa:"))
+                else child
+                for child in children
             )
         self.states[identifier] = WorkflowState(
             parent_identifier=identifier,
@@ -689,29 +707,30 @@ class FakeWorkflowStore:
                 completion.candidate_sha,
                 completion.result,
             )
-            candidates[completion.repository_key] = completion.candidate_sha
-            pull_requests[completion.repository_key] = PullRequestEvidence(
-                completion.candidate_sha,
-                "open",
-                True,
-                True,
-            )
-            if completion.pull_request_url:
-                number = int(completion.pull_request_url.rsplit("/", 1)[1])
-                targets[completion.repository_key] = PullRequestTarget(
-                    completion.repository_key,
-                    number,
-                    completion.pull_request_url,
+            if completion.result == "pass":
+                candidates[completion.repository_key] = completion.candidate_sha
+                pull_requests[completion.repository_key] = PullRequestEvidence(
+                    completion.candidate_sha,
+                    "open",
+                    True,
+                    True,
                 )
-            if (
-                previous_sha is not None
-                and previous_sha != completion.candidate_sha
-                and not self.retain_gates_on_replacement
-            ):
-                reviews.clear()
-                qa.clear()
-                integration.clear()
-                smoke_reads = ()
+                if completion.pull_request_url:
+                    number = int(completion.pull_request_url.rsplit("/", 1)[1])
+                    targets[completion.repository_key] = PullRequestTarget(
+                        completion.repository_key,
+                        number,
+                        completion.pull_request_url,
+                    )
+                if (
+                    previous_sha is not None
+                    and previous_sha != completion.candidate_sha
+                    and not self.retain_gates_on_replacement
+                ):
+                    reviews.clear()
+                    qa.clear()
+                    integration.clear()
+                    smoke_reads = ()
         elif completion.phase == "review":
             reviews[completion.repository_key] = RepositoryEvidence(
                 completion.candidate_sha,
@@ -1858,6 +1877,333 @@ class WorkflowLegacyCompletionTests(TaskFourWorkflowFixture, unittest.TestCase):
         self.assertEqual(self.store.events, [("read-parent", "PRO-200")])
 
 
+class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCase):
+    def test_current_gate_completion_requires_exact_creation_provenance(self):
+        cases = (
+            ("review", "api", "", {"reviews": {"api": RepositoryEvidence(SHA["api"], "pending")}}),
+            ("qa", "api", "", {"qa": {"api": RepositoryEvidence(SHA["api"], "pending")}}),
+            (
+                "integration_qa",
+                "web-api",
+                "web-api",
+                {"integration_qa": {"web-api": GateEvidence(passing_snapshot().candidate_shas, "pending")}},
+            ),
+        )
+        for phase, target, suite, evidence in cases:
+            for corruption in ("action", "candidate-map"):
+                with self.subTest(phase=phase, corruption=corruption):
+                    snapshot = replace(passing_snapshot(), **evidence)
+                    repository = "web" if phase == "integration_qa" else "api"
+                    creation_candidates = (
+                        dict(snapshot.candidate_shas)
+                        if corruption == "action"
+                        else {**snapshot.candidate_shas, "api": OTHER_SHA}
+                    )
+                    action_key = (
+                        "stage:" + "9" * 64
+                        if corruption == "action"
+                        else coordinator_action_key(
+                            workflow_version=2,
+                            instance_key=self.manifest.instance.key,
+                            parent_identifier="PRO-200",
+                            stage_kind="gates",
+                            stage_ordinal=5,
+                            attempt=0,
+                            affected_repositories=frozenset(
+                                snapshot.affected_repositories
+                            ),
+                            candidate_shas=creation_candidates,
+                            contract_hashes={},
+                        )
+                    )
+                    child = WorkflowChild(
+                        f"PRO-200-{phase}", target, repository, suite, phase, 5, 0,
+                        "in_progress", action_key, True,
+                        creation_candidate_shas=creation_candidates,
+                    )
+                    self.store.add_state(
+                        "PRO-200", snapshot, children=(child,),
+                        pull_requests=pull_request_targets(),
+                    )
+                    self.store.events.clear()
+                    completion = completion_for(
+                        repository,
+                        parent="PRO-200",
+                        phase=phase,
+                        suite_key=suite,
+                        candidate_shas=(dict(snapshot.candidate_shas) if suite else None),
+                    )
+
+                    result = self.workflow.record_phase_completion(completion)
+
+                    self.assertEqual(result.next_action, "block")
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(event[0] == "write-completion" for event in self.store.events)
+                    )
+
+    def test_failed_repair_cannot_adopt_a_changed_pull_request_head(self):
+        bundle = self.dispatch_authorized_repair()
+        state = self.store.states["PRO-200"]
+        self.store.states["PRO-200"] = replace(
+            state,
+            snapshot=replace(
+                state.snapshot,
+                pull_requests={
+                    "api": PullRequestEvidence(REPLACEMENT_SHA, "open", True, True)
+                },
+            ),
+        )
+        self.store.events.clear()
+
+        result = self.workflow.record_phase_completion(
+            completion_for(
+                "api", parent="PRO-200", phase="repair", result="fail",
+                attempt=3, sha=REPLACEMENT_SHA,
+                failure_bundle_digest=bundle.digest,
+            )
+        )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(self.store.candidate_sha("api"), SHA["api"])
+        self.assertFalse(any(event[0] == "write-completion" for event in self.store.events))
+
+        bundle = self.dispatch_authorized_repair()
+        self.store.events.clear()
+        result = self.workflow.record_phase_completion(
+            completion_for(
+                "api", parent="PRO-200", phase="repair", result="fail",
+                attempt=3, sha=REPLACEMENT_SHA,
+                failure_bundle_digest=bundle.digest,
+            )
+        )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(self.store.candidate_sha("api"), SHA["api"])
+        self.assertFalse(any(event[0] == "write-completion" for event in self.store.events))
+
+    def test_three_repository_implementation_wave_accepts_completed_sibling_increment(self):
+        base_candidates: dict[str, str] = {}
+        action_key = coordinator_action_key(
+            workflow_version=2,
+            instance_key=self.manifest.instance.key,
+            parent_identifier="PRO-200",
+            stage_kind="implementation",
+            stage_ordinal=1,
+            attempt=0,
+            affected_repositories=frozenset({"api", "web", "notifications"}),
+            candidate_shas=base_candidates,
+            contract_hashes={},
+        )
+        api_evidence = evidence_uuid("three-repository-api-completion")
+        children = (
+            WorkflowChild(
+                "PRO-200-API", "api", "api", "", "implementation", 1, 0,
+                "done", action_key, False, evidence_comment_uuid=api_evidence,
+                creation_candidate_shas=base_candidates, phase_result="pass",
+                evidence_comment_url=f"https://example.test/evidence/{api_evidence}",
+            ),
+            WorkflowChild(
+                "PRO-200-WEB", "web", "web", "", "implementation", 1, 0,
+                "in_progress", action_key, True, creation_candidate_shas=base_candidates,
+            ),
+            WorkflowChild(
+                "PRO-200-NOTIFICATIONS", "notifications", "notifications", "",
+                "implementation", 1, 0, "in_progress", action_key, True,
+                creation_candidate_shas=base_candidates,
+            ),
+        )
+        snapshot = ParentSnapshot(
+            affected_repositories=("api", "web", "notifications"),
+            candidate_shas={"api": SHA["api"]},
+            children={
+                "api": RepositoryEvidence(SHA["api"], "pass"),
+                "web": RepositoryEvidence("", "pending"),
+                "notifications": RepositoryEvidence("", "pending"),
+            },
+            pull_requests={"api": PullRequestEvidence(SHA["api"], "open", True, True)},
+        )
+        self.store.add_state("PRO-200", snapshot, children=children, stage_ordinal=1)
+
+        result = self.workflow.record_phase_completion(
+            completion_for("notifications", parent="PRO-200")
+        )
+
+        self.assertEqual(result.next_action, "wait")
+        self.assertEqual(result.completed_child_status, "done")
+        self.assertEqual(self.store.candidate_sha("notifications"), SHA["notifications"])
+
+    def test_multi_repository_repair_wave_accepts_completed_sibling_increment(self):
+        base = {"api": SHA["api"], "web": SHA["web"]}
+        bundle_digest = "f" * 64
+        action_key = coordinator_action_key(
+            workflow_version=2,
+            instance_key=self.manifest.instance.key,
+            parent_identifier="PRO-200",
+            stage_kind="repair",
+            stage_ordinal=6,
+            attempt=1,
+            affected_repositories=frozenset(base),
+            candidate_shas=base,
+            contract_hashes={},
+            failure_bundle_digest=bundle_digest,
+        )
+        api_failure_uuid = evidence_uuid("multi-repair-api-failure")
+        web_failure_uuid = evidence_uuid("multi-repair-web-failure")
+        api_evidence = evidence_uuid("multi-repair-api-completion")
+        children = (
+            WorkflowChild(
+                "PRO-200-API-REPAIR", "api", "api", "", "repair", 6, 1,
+                "done", action_key, False, evidence_comment_uuid=api_evidence,
+                creation_candidate_shas=base, phase_result="pass",
+                evidence_comment_url=f"https://example.test/evidence/{api_evidence}",
+                failure_bundle_digest=bundle_digest,
+                failure_evidence_uuids=(api_failure_uuid,),
+            ),
+            WorkflowChild(
+                "PRO-200-WEB-REPAIR", "web", "web", "", "repair", 6, 1,
+                "in_progress", action_key, True, creation_candidate_shas=base,
+                failure_bundle_digest=bundle_digest,
+                failure_evidence_uuids=(web_failure_uuid,),
+            ),
+        )
+        snapshot = ParentSnapshot(
+            affected_repositories=("api", "web"),
+            candidate_shas={"api": REPLACEMENT_SHA, "web": SHA["web"]},
+            children={
+                "api": RepositoryEvidence(REPLACEMENT_SHA, "pass"),
+                "web": RepositoryEvidence(SHA["web"], "pending"),
+            },
+            pull_requests={
+                "api": PullRequestEvidence(REPLACEMENT_SHA, "open", True, True),
+                "web": PullRequestEvidence(OTHER_SHA, "open", True, True),
+            },
+            attempt=1,
+        )
+        self.store.add_state(
+            "PRO-200", snapshot, children=children,
+            pull_requests=pull_request_targets(), stage_ordinal=6,
+        )
+
+        result = self.workflow.record_phase_completion(
+            completion_for(
+                "web", parent="PRO-200", phase="repair", attempt=1,
+                sha=OTHER_SHA, failure_bundle_digest=bundle_digest,
+            )
+        )
+
+        self.assertEqual(result.completed_child_status, "done")
+        self.assertEqual(result.mutation_count, 2)
+        self.assertEqual(self.store.candidate_sha("web"), OTHER_SHA)
+
+    def test_missing_managed_pull_request_evidence_blocks_every_mutation_boundary(self):
+        dispatch_snapshot = replace(
+            passing_snapshot(), reviews={}, qa={}, integration_qa={}, pull_requests={},
+        )
+        self.store.add_state(
+            "PRO-200", dispatch_snapshot, pull_requests=pull_request_targets(),
+        )
+        result = self.workflow.resume_parent("PRO-200")
+        self.assertEqual((result.next_action, result.mutation_count), ("block", 0))
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+        self.add_failed_review_state(attempt=0)
+        state = self.store.states["PRO-200"]
+        self.store.states["PRO-200"] = replace(
+            state, snapshot=replace(state.snapshot, pull_requests={}),
+        )
+        self.store.events.clear()
+        result = self.workflow.resume_parent("PRO-200")
+        self.assertEqual((result.next_action, result.mutation_count), ("block", 0))
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+        merge_snapshot = replace(passing_snapshot(), pull_requests={})
+        self.store.add_state(
+            "PRO-200", merge_snapshot, pull_requests=pull_request_targets(),
+        )
+        self.store.events.clear()
+        result = self.workflow.execute_merge_plan("PRO-200")
+        self.assertEqual((result.next_action, result.mutation_count), ("block", 0))
+        self.assertEqual(self.github.merged, [])
+
+        bundle = self.dispatch_authorized_repair()
+        state = self.store.states["PRO-200"]
+        self.store.states["PRO-200"] = replace(
+            state, snapshot=replace(state.snapshot, pull_requests={}),
+        )
+        self.store.events.clear()
+        result = self.workflow.record_phase_completion(
+            repair_completion(REPLACEMENT_SHA, bundle.digest)
+        )
+        self.assertEqual((result.next_action, result.mutation_count), ("block", 0))
+        self.assertFalse(any(event[0] == "write-completion" for event in self.store.events))
+
+    def test_recovery_and_watcher_block_managed_head_drift_before_rerun(self):
+        for entrypoint in ("recovery", "watcher"):
+            with self.subTest(entrypoint=entrypoint):
+                child = WorkflowChild(
+                    "PRO-200-API", "api", "api", "", "implementation", 1, 0,
+                    "in_progress", "dispatch:" + "3" * 64, False,
+                    creation_candidate_shas={"api": SHA["api"]},
+                )
+                snapshot = ParentSnapshot(
+                    affected_repositories=("api",),
+                    candidate_shas={"api": SHA["api"]},
+                    children={"api": RepositoryEvidence(SHA["api"], "pending")},
+                    pull_requests={
+                        "api": PullRequestEvidence(OTHER_SHA, "open", True, True)
+                    },
+                    stalled=True,
+                    stalled_repository="api",
+                )
+                self.store.add_state(
+                    "PRO-200", snapshot, children=(child,),
+                    pull_requests={"api": pull_request_targets()["api"]},
+                    stage_ordinal=1,
+                )
+                self.store.activate_on_rerun = True
+                self.store.events.clear()
+
+                result = (
+                    self.workflow.recover_stalled_parent("PRO-200")
+                    if entrypoint == "recovery"
+                    else self.workflow.watch_active_parents()
+                )
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(any(event[0] == "rerun" for event in self.store.events))
+
+    def test_round_three_requires_exactly_two_automatic_repairs_used(self):
+        for invalid_count in (0, 1):
+            with self.subTest(invalid_count=invalid_count):
+                snapshot = ParentSnapshot(
+                    affected_repositories=("api",),
+                    candidate_shas={"api": SHA["api"]},
+                    children={"api": RepositoryEvidence(SHA["api"], "pass")},
+                    pull_requests={
+                        "api": PullRequestEvidence(SHA["api"], "open", True, True)
+                    },
+                    attempt=3,
+                )
+                self.store.add_state(
+                    "PRO-200", snapshot,
+                    pull_requests={"api": pull_request_targets()["api"]},
+                )
+                metadata = self.store.states["PRO-200"].metadata
+                assert isinstance(metadata, ParentMetadata)
+                object.__setattr__(metadata, "automatic_repairs_used", invalid_count)
+                self.store.events.clear()
+
+                result = self.workflow.resume_parent("PRO-200")
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertIn("schema", result.reason)
+
+
 class GenericWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = load_manifest(FIXTURE)
@@ -2763,7 +3109,7 @@ class GenericWorkflowTests(unittest.TestCase):
         )
 
         self.assertEqual(result.next_action, "uncertain")
-        self.assertEqual(result.mutation_count, 1)
+        self.assertEqual(result.mutation_count, 2)
         repairs = [
             item
             for item in self.store.states["PRO-101"].children
