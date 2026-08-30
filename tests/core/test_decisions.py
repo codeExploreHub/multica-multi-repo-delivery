@@ -445,6 +445,24 @@ class ParentDecisionTests(unittest.TestCase):
         self.assertEqual(decision.kind, DecisionKind.WAIT)
         self.assertEqual(decision.repositories, ())
 
+    def test_stalled_parent_still_waits_while_gate_evidence_is_pending(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            reviews={
+                **snapshot.reviews,
+                "api": gate_for("api", result="pending"),
+            },
+            stalled=True,
+            stalled_repository="api",
+        )
+
+        decision = decide_parent_action(self.manifest, snapshot)
+
+        self.assertEqual(decision.kind, DecisionKind.WAIT)
+        self.assertIsNone(decision.dispatch_kind)
+        self.assertEqual(decision.repositories, ())
+
     def test_missing_review_and_qa_dispatches_exact_gate_work(self):
         snapshot = passing_snapshot()
         snapshot = replace(snapshot, reviews={}, qa={}, integration_qa={})

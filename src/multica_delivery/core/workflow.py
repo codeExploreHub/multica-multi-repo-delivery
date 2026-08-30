@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -394,6 +395,12 @@ def _failure_bundle_digest(
         "workflow_version": workflow_version,
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _failure_uuid_partition(
+    failures: tuple[FailureEvidenceRef, ...],
+) -> tuple[str, ...]:
+    return tuple(sorted(failure.evidence_comment_uuid for failure in failures))
 
 
 @dataclass(frozen=True)
@@ -1732,6 +1739,34 @@ class GenericWorkflow:
                         _valid_sha,
                     )
                     or set(child.creation_candidate_shas) - affected
+                    or type(child.phase_result) is not str
+                    or child.phase_result not in _PHASE_RESULTS | {""}
+                    or type(child.evidence_comment_url) is not str
+                    or (
+                        child.evidence_comment_url
+                        and not _https_evidence_url(child.evidence_comment_url)
+                    )
+                    or type(child.responsible_repositories) is not tuple
+                    or any(
+                        not _exact_stable(repository)
+                        for repository in child.responsible_repositories
+                    )
+                    or len(set(child.responsible_repositories))
+                    != len(child.responsible_repositories)
+                    or type(child.failure_bundle_digest) is not str
+                    or (
+                        child.failure_bundle_digest
+                        and not _valid_digest(child.failure_bundle_digest)
+                    )
+                    or type(child.failure_evidence_uuids) is not tuple
+                    or any(
+                        not _canonical_uuid(evidence_uuid)
+                        for evidence_uuid in child.failure_evidence_uuids
+                    )
+                    or len(set(child.failure_evidence_uuids))
+                    != len(child.failure_evidence_uuids)
+                    or child.failure_evidence_uuids
+                    != tuple(sorted(child.failure_evidence_uuids))
                 ):
                     return malformed
                 identifiers.add(child.identifier)
@@ -1745,15 +1780,52 @@ class GenericWorkflow:
                 }[child.phase]
                 if not child.action_key.startswith(expected_prefix):
                     return malformed
+                if child.phase == "repair":
+                    if (
+                        not child.failure_bundle_digest
+                        or not child.failure_evidence_uuids
+                        or child.responsible_repositories
+                    ):
+                        return malformed
+                elif child.failure_bundle_digest or child.failure_evidence_uuids:
+                    return malformed
+                completion_fields = (
+                    bool(child.evidence_comment_uuid),
+                    bool(child.phase_result),
+                    bool(child.evidence_comment_url),
+                )
+                if any(completion_fields) and not all(completion_fields):
+                    return malformed
+                if child.phase in {"review", "qa", "integration_qa"}:
+                    if child.phase_result == "pass" and child.responsible_repositories:
+                        return malformed
+                    if (
+                        child.phase_result in {"fail", "blocked"}
+                        and not child.responsible_repositories
+                    ):
+                        return malformed
+                elif child.responsible_repositories:
+                    return malformed
                 if child.phase == "integration_qa":
                     suite = applicable_suites.get(child.suite_key)
                     if (
                         suite is None
                         or child.target_key != child.suite_key
                         or child.repository_key != suite.command_repository
+                        or not set(child.responsible_repositories)
+                        <= set(suite.repositories)
                     ):
                         return malformed
-                elif child.target_key != child.repository_key or child.suite_key:
+                elif (
+                    child.target_key != child.repository_key
+                    or child.suite_key
+                    or (
+                        child.phase in {"review", "qa"}
+                        and child.phase_result in {"fail", "blocked"}
+                        and child.responsible_repositories
+                        != (child.repository_key,)
+                    )
+                ):
                     return malformed
 
             if any(
@@ -2419,6 +2491,30 @@ class GenericWorkflow:
             for suite in self.manifest.integration_suites
             if set(suite.repositories) <= affected
         }
+        current_identities = tuple(
+            (child.phase, child.target_key, child.suite_key)
+            for child in current
+        )
+        if len(set(current_identities)) != len(current_identities):
+            raise WorkflowError("repair bundle source Stage repeats a gate identity")
+        expected_nonpass = {
+            (phase, repository, "")
+            for phase, evidence_by_repository in (
+                ("review", state.snapshot.reviews),
+                ("qa", state.snapshot.qa),
+            )
+            for repository, evidence in evidence_by_repository.items()
+            if evidence.result in {"fail", "blocked"}
+        }
+        expected_nonpass.update(
+            ("integration_qa", suite_key, suite_key)
+            for suite_key, evidence in state.snapshot.integration_qa.items()
+            if evidence.result in {"fail", "blocked"}
+        )
+        if not expected_nonpass <= set(current_identities):
+            raise WorkflowError(
+                "repair bundle lacks a current child for terminal non-PASS gate evidence"
+            )
         failures: list[FailureEvidenceRef] = []
         evidence_uuids: set[str] = set()
         for child in current:
@@ -2602,40 +2698,6 @@ class GenericWorkflow:
             next_action = "dispatch"
         if not requests:
             return self._result(state, "noop", "requested successor already exists")
-        if repair:
-            expected = {
-                (
-                    request.target_key,
-                    request.phase,
-                    request.attempt,
-                    request.failure_bundle.digest,
-                    tuple(ref.evidence_comment_uuid for ref in request.failure_refs),
-                )
-                for request in requests
-                if request.failure_bundle is not None
-            }
-            observed_successors = {
-                (
-                    child.target_key,
-                    child.phase,
-                    child.attempt,
-                    child.failure_bundle_digest,
-                    child.failure_evidence_uuids,
-                )
-                for child in state.children
-                if child.phase == "repair"
-                and child.attempt == decision.next_attempt
-                and child.target_key in decision.repositories
-            }
-            if observed_successors:
-                if observed_successors == expected:
-                    return self._result(state, "noop", "repair bundle successors already exist")
-                return self._zero_mutation_block(
-                    state,
-                    "repair successor bundle identity conflicts with the complete failure bundle",
-                )
-        elif self._has_successor(state, requests):
-            return self._result(state, "noop", "an intended successor already exists")
         key = self._action_key(
             state,
             stage_kind,
@@ -2643,6 +2705,69 @@ class GenericWorkflow:
             attempt=attempt,
             failure_bundle_digest="" if bundle is None else bundle.digest,
         )
+
+        def request_identity(request: ChildRequest) -> tuple[object, ...]:
+            return (
+                request.target_key,
+                request.repository_key,
+                request.suite_key,
+                request.phase,
+                request.stage_ordinal,
+                request.attempt,
+                key,
+                tuple(request.candidate_shas.items()),
+                "" if request.failure_bundle is None else request.failure_bundle.digest,
+                _failure_uuid_partition(request.failure_refs),
+            )
+
+        def child_identity(child: WorkflowChild) -> tuple[object, ...]:
+            return (
+                child.target_key,
+                child.repository_key,
+                child.suite_key,
+                child.phase,
+                child.stage_ordinal,
+                child.attempt,
+                child.action_key,
+                tuple(child.creation_candidate_shas.items()),
+                child.failure_bundle_digest,
+                child.failure_evidence_uuids,
+            )
+
+        wanted = Counter(request_identity(request) for request in requests)
+
+        def relevant_repair_children(
+            workflow_state: WorkflowState,
+        ) -> tuple[WorkflowChild, ...]:
+            repositories = frozenset(decision.repositories)
+            return tuple(
+                child
+                for child in workflow_state.children
+                if child.phase == "repair"
+                and child.attempt == decision.next_attempt
+                and (
+                    child.target_key in repositories
+                    or child.repository_key in repositories
+                )
+            )
+
+        if repair:
+            observed_successors = Counter(
+                child_identity(child)
+                for child in relevant_repair_children(state)
+            )
+            if observed_successors:
+                if (
+                    observed_successors == wanted
+                    and key in state.applied_action_keys
+                ):
+                    return self._result(state, "noop", "repair bundle successors already exist")
+                return self._zero_mutation_block(
+                    state,
+                    "repair successor bundle identity conflicts with the complete failure bundle",
+                )
+        elif self._has_successor(state, requests):
+            return self._result(state, "noop", "an intended successor already exists")
         if key in state.applied_action_keys:
             return self._result(state, "noop", "coordinator action already exists", action_key=key)
         metadata = self._metadata(
@@ -2661,45 +2786,33 @@ class GenericWorkflow:
         except Exception:
             # Reconcile because the effect may have committed before failing.
             pass
-        wanted = {
-            (
-                request.target_key,
-                request.repository_key,
-                request.suite_key,
-                request.phase,
-                request.stage_ordinal,
-                request.attempt,
-                key,
-                tuple(request.candidate_shas.items()),
-                "" if request.failure_bundle is None else request.failure_bundle.digest,
-                tuple(ref.evidence_comment_uuid for ref in request.failure_refs),
+
+        def successor_creation_matches(current: object) -> bool:
+            if (
+                not isinstance(current, WorkflowState)
+                or current.parent_identifier != state.parent_identifier
+                or current.metadata != metadata
+                or key not in current.applied_action_keys
+            ):
+                return False
+            if repair:
+                observed_successors = Counter(
+                    child_identity(child)
+                    for child in relevant_repair_children(current)
+                )
+                return observed_successors == wanted
+            observed_children = Counter(
+                child_identity(child)
+                for child in current.children
             )
-            for request in requests
-        }
+            return all(
+                observed_children[identity] >= count
+                for identity, count in wanted.items()
+            )
+
         observed = self._reconcile_parent(
             state.parent_identifier,
-            lambda current: (
-                isinstance(current, WorkflowState)
-                and current.parent_identifier == state.parent_identifier
-                and current.metadata == metadata
-                and key in current.applied_action_keys
-                and wanted
-                <= {
-                    (
-                        child.target_key,
-                        child.repository_key,
-                        child.suite_key,
-                        child.phase,
-                        child.stage_ordinal,
-                        child.attempt,
-                        child.action_key,
-                        tuple(child.creation_candidate_shas.items()),
-                        child.failure_bundle_digest,
-                        child.failure_evidence_uuids,
-                    )
-                    for child in current.children
-                }
-            ),
+            successor_creation_matches,
         )
         if observed is None:
             return self._uncertain(

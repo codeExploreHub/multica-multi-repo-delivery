@@ -622,7 +622,7 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
             repair_repositories.update(suites[suite_key])
 
     if pending_reason is not None:
-        return _wait_or_recover(manifest, snapshot, pending_reason)
+        return _decision(DecisionKind.WAIT, pending_reason)
 
     for repository in _ordered(manifest, affected):
         pull_request = snapshot.pull_requests[repository]
