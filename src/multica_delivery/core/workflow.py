@@ -3256,7 +3256,7 @@ class GenericWorkflow:
     ) -> Mapping[str, str]:
         """Return candidate changes proven by completed siblings from one creation wave."""
 
-        changes: dict[str, str] = {}
+        eligible: dict[str, tuple[WorkflowChild, str]] = {}
         for sibling in state.children:
             if (
                 sibling.identifier == child.identifier
@@ -3289,8 +3289,60 @@ class GenericWorkflow:
                 or pull_request.head_sha != candidate
             ):
                 continue
-            changes[repository] = candidate
-        return MappingProxyType(changes)
+            if child.creation_candidate_shas.get(repository) != candidate:
+                eligible[repository] = (sibling, candidate)
+
+        target = dict(child.creation_candidate_shas)
+        target.update(
+            {repository: candidate for repository, (_, candidate) in eligible.items()}
+        )
+        if target != dict(state.snapshot.candidate_shas):
+            return MappingProxyType({})
+
+        def completion_chain(
+            candidates: dict[str, str],
+            remaining: frozenset[str],
+        ) -> dict[str, str] | None:
+            if not remaining:
+                return {}
+            for repository in sorted(remaining):
+                sibling, candidate = eligible[repository]
+                action_candidates = {**candidates, repository: candidate}
+                completion_action = self._action_key(
+                    state,
+                    f"{sibling.phase}:{sibling.target_key}",
+                    sibling.stage_ordinal,
+                    attempt=sibling.attempt,
+                    candidate_shas=action_candidates,
+                    failure_bundle_digest=(
+                        sibling.failure_bundle_digest
+                        if sibling.phase == "repair"
+                        else ""
+                    ),
+                    authorizing_comment_uuid=(
+                        sibling.authorizing_comment_uuid
+                        if sibling.phase == "repair"
+                        else ""
+                    ),
+                )
+                if (
+                    completion_action == sibling.action_key
+                    or completion_action not in state.applied_action_keys
+                ):
+                    continue
+                tail = completion_chain(
+                    action_candidates,
+                    remaining - {repository},
+                )
+                if tail is not None:
+                    return {repository: candidate, **tail}
+            return None
+
+        changes = completion_chain(
+            dict(child.creation_candidate_shas),
+            frozenset(eligible),
+        )
+        return MappingProxyType(changes or {})
 
     def _creation_candidates_match(
         self,

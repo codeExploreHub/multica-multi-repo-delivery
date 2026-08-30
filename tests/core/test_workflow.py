@@ -1878,6 +1878,86 @@ class WorkflowLegacyCompletionTests(TaskFourWorkflowFixture, unittest.TestCase):
 
 
 class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCase):
+    def add_three_repository_implementation_wave(
+        self,
+        *,
+        include_completed_sibling_action: bool,
+    ) -> None:
+        base_candidates: dict[str, str] = {}
+        creation_action = coordinator_action_key(
+            workflow_version=2,
+            instance_key=self.manifest.instance.key,
+            parent_identifier="PRO-200",
+            stage_kind="implementation",
+            stage_ordinal=1,
+            attempt=0,
+            affected_repositories=frozenset({"api", "web", "notifications"}),
+            candidate_shas=base_candidates,
+            contract_hashes={},
+        )
+        api_completion_action = coordinator_action_key(
+            workflow_version=2,
+            instance_key=self.manifest.instance.key,
+            parent_identifier="PRO-200",
+            stage_kind="implementation:api",
+            stage_ordinal=1,
+            attempt=0,
+            affected_repositories=frozenset({"api", "web", "notifications"}),
+            candidate_shas={"api": SHA["api"]},
+            contract_hashes={},
+        )
+        wrong_api_completion_action = coordinator_action_key(
+            workflow_version=2,
+            instance_key=self.manifest.instance.key,
+            parent_identifier="PRO-200",
+            stage_kind="implementation:api",
+            stage_ordinal=1,
+            attempt=0,
+            affected_repositories=frozenset({"api", "web", "notifications"}),
+            candidate_shas={"api": OTHER_SHA},
+            contract_hashes={},
+        )
+        api_evidence = evidence_uuid("three-repository-api-completion")
+        children = (
+            WorkflowChild(
+                "PRO-200-API", "api", "api", "", "implementation", 1, 0,
+                "done", creation_action, False, evidence_comment_uuid=api_evidence,
+                creation_candidate_shas=base_candidates, phase_result="pass",
+                evidence_comment_url=f"https://example.test/evidence/{api_evidence}",
+            ),
+            WorkflowChild(
+                "PRO-200-WEB", "web", "web", "", "implementation", 1, 0,
+                "in_progress", creation_action, True,
+                creation_candidate_shas=base_candidates,
+            ),
+            WorkflowChild(
+                "PRO-200-NOTIFICATIONS", "notifications", "notifications", "",
+                "implementation", 1, 0, "in_progress", creation_action, True,
+                creation_candidate_shas=base_candidates,
+            ),
+        )
+        snapshot = ParentSnapshot(
+            affected_repositories=("api", "web", "notifications"),
+            candidate_shas={"api": SHA["api"]},
+            children={
+                "api": RepositoryEvidence(SHA["api"], "pass"),
+                "web": RepositoryEvidence("", "pending"),
+                "notifications": RepositoryEvidence("", "pending"),
+            },
+            pull_requests={"api": PullRequestEvidence(SHA["api"], "open", True, True)},
+        )
+        self.store.add_state("PRO-200", snapshot, children=children, stage_ordinal=1)
+        state = self.store.states["PRO-200"]
+        self.store.states["PRO-200"] = replace(
+            state,
+            applied_action_keys=state.applied_action_keys
+            | {
+                api_completion_action
+                if include_completed_sibling_action
+                else wrong_api_completion_action
+            },
+        )
+
     def test_current_gate_completion_requires_exact_creation_provenance(self):
         cases = (
             ("review", "api", "", {"reviews": {"api": RepositoryEvidence(SHA["api"], "pending")}}),
@@ -1985,47 +2065,9 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         self.assertFalse(any(event[0] == "write-completion" for event in self.store.events))
 
     def test_three_repository_implementation_wave_accepts_completed_sibling_increment(self):
-        base_candidates: dict[str, str] = {}
-        action_key = coordinator_action_key(
-            workflow_version=2,
-            instance_key=self.manifest.instance.key,
-            parent_identifier="PRO-200",
-            stage_kind="implementation",
-            stage_ordinal=1,
-            attempt=0,
-            affected_repositories=frozenset({"api", "web", "notifications"}),
-            candidate_shas=base_candidates,
-            contract_hashes={},
+        self.add_three_repository_implementation_wave(
+            include_completed_sibling_action=True,
         )
-        api_evidence = evidence_uuid("three-repository-api-completion")
-        children = (
-            WorkflowChild(
-                "PRO-200-API", "api", "api", "", "implementation", 1, 0,
-                "done", action_key, False, evidence_comment_uuid=api_evidence,
-                creation_candidate_shas=base_candidates, phase_result="pass",
-                evidence_comment_url=f"https://example.test/evidence/{api_evidence}",
-            ),
-            WorkflowChild(
-                "PRO-200-WEB", "web", "web", "", "implementation", 1, 0,
-                "in_progress", action_key, True, creation_candidate_shas=base_candidates,
-            ),
-            WorkflowChild(
-                "PRO-200-NOTIFICATIONS", "notifications", "notifications", "",
-                "implementation", 1, 0, "in_progress", action_key, True,
-                creation_candidate_shas=base_candidates,
-            ),
-        )
-        snapshot = ParentSnapshot(
-            affected_repositories=("api", "web", "notifications"),
-            candidate_shas={"api": SHA["api"]},
-            children={
-                "api": RepositoryEvidence(SHA["api"], "pass"),
-                "web": RepositoryEvidence("", "pending"),
-                "notifications": RepositoryEvidence("", "pending"),
-            },
-            pull_requests={"api": PullRequestEvidence(SHA["api"], "open", True, True)},
-        )
-        self.store.add_state("PRO-200", snapshot, children=children, stage_ordinal=1)
 
         result = self.workflow.record_phase_completion(
             completion_for("notifications", parent="PRO-200")
@@ -2034,6 +2076,20 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         self.assertEqual(result.next_action, "wait")
         self.assertEqual(result.completed_child_status, "done")
         self.assertEqual(self.store.candidate_sha("notifications"), SHA["notifications"])
+
+    def test_done_pass_sibling_without_exact_completion_action_cannot_explain_increment(self):
+        self.add_three_repository_implementation_wave(
+            include_completed_sibling_action=False,
+        )
+        self.store.events.clear()
+
+        result = self.workflow.record_phase_completion(
+            completion_for("notifications", parent="PRO-200")
+        )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "write-completion" for event in self.store.events))
 
     def test_multi_repository_repair_wave_accepts_completed_sibling_increment(self):
         base = {"api": SHA["api"], "web": SHA["web"]}
@@ -2085,6 +2141,24 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         self.store.add_state(
             "PRO-200", snapshot, children=children,
             pull_requests=pull_request_targets(), stage_ordinal=6,
+        )
+        api_completion_action = coordinator_action_key(
+            workflow_version=2,
+            instance_key=self.manifest.instance.key,
+            parent_identifier="PRO-200",
+            stage_kind="repair:api",
+            stage_ordinal=6,
+            attempt=1,
+            affected_repositories=frozenset(base),
+            candidate_shas={"api": REPLACEMENT_SHA, "web": SHA["web"]},
+            contract_hashes={},
+            failure_bundle_digest=bundle_digest,
+        )
+        state = self.store.states["PRO-200"]
+        self.store.states["PRO-200"] = replace(
+            state,
+            applied_action_keys=state.applied_action_keys
+            | {api_completion_action},
         )
 
         result = self.workflow.record_phase_completion(
