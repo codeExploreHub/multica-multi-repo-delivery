@@ -35,7 +35,7 @@ from ..adapters.exact_sha import (
     ExactShaVerification,
     LocalExactShaCommandRunner,
 )
-from .metadata import MetadataError, ParentMetadata, canonical_json
+from .metadata import LegacyParentMetadataV1, MetadataError, ParentMetadata, canonical_json
 from .model import DeliveryManifest, validate_policy_authority
 from ..adapters.processes import OwnedProcess, ProcessManager, ProcessOwnershipError, ProcessRun
 from .topology import TopologyError, merge_order
@@ -69,6 +69,7 @@ _FUTURE_CHILD_RELATIONSHIP = "workflow child relationship is ahead of parent met
 _UNINITIALIZED_PARENT_STATE = "parent has no initialized workflow metadata"
 _WRONG_PARENT_STATE = "authoritative parent read returned the wrong parent"
 _OUTSIDE_PROJECT_STATE = "parent is outside the configured instance projects"
+_LEGACY_PARENT_STATE = "version one parent requires explicit metadata migration"
 _SMOKE_PERSISTENCE_AUTHORITY = object()
 
 
@@ -324,8 +325,7 @@ class FailureEvidenceRef:
 
     def __post_init__(self) -> None:
         if (
-            type(self.child_identifier) is not str
-            or _ISSUE_IDENTIFIER.fullmatch(self.child_identifier) is None
+            not _exact_stable(self.child_identifier)
             or type(self.phase) is not str
             or self.phase not in {"review", "qa", "integration_qa"}
             or type(self.result) is not str
@@ -659,7 +659,7 @@ class WorkflowState:
     parent_identifier: str
     parent_status: str
     project_key: str
-    metadata: ParentMetadata | None
+    metadata: ParentMetadata | LegacyParentMetadataV1 | None
     snapshot: ParentSnapshot
     children: tuple[WorkflowChild, ...] = ()
     pull_requests: Mapping[str, PullRequestTarget] = field(default_factory=dict)
@@ -670,7 +670,10 @@ class WorkflowState:
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, ParentSnapshot):
             raise WorkflowError("workflow state snapshot is malformed")
-        if self.metadata is not None and not isinstance(self.metadata, ParentMetadata):
+        if self.metadata is not None and not isinstance(
+            self.metadata,
+            (ParentMetadata, LegacyParentMetadataV1),
+        ):
             raise WorkflowError("workflow state metadata is malformed")
         if not isinstance(self.children, tuple) or any(
             not isinstance(child, WorkflowChild) for child in self.children
@@ -1247,6 +1250,7 @@ def coordinator_action_key(
     affected_repositories: frozenset[str],
     candidate_shas: Mapping[str, str],
     contract_hashes: Mapping[str, str],
+    failure_bundle_digest: str = "",
 ) -> str:
     """Hash every frozen coordinator input into one stable idempotency key."""
 
@@ -1281,6 +1285,10 @@ def coordinator_action_key(
         for key, value in contract_values.items()
     ):
         raise WorkflowError("contract hash map is malformed")
+    if not isinstance(failure_bundle_digest, str) or (
+        failure_bundle_digest and not _valid_digest(failure_bundle_digest)
+    ):
+        raise WorkflowError("failure bundle digest is malformed")
     action_kind = stage_kind.split(":", 1)[0]
     prefix = {
         "implementation": "dispatch",
@@ -1295,8 +1303,7 @@ def coordinator_action_key(
         "smoke": "smoke",
         "recovery": "recovery",
     }.get(action_kind, "resume")
-    payload = canonical_json(
-        {
+    payload_values = {
             "affected_repositories": sorted(affected_repositories),
             "attempt": attempt,
             "candidate_shas": dict(sorted(candidate_values.items())),
@@ -1307,7 +1314,9 @@ def coordinator_action_key(
             "stage_ordinal": stage_ordinal,
             "workflow_version": workflow_version,
         }
-    )
+    if failure_bundle_digest:
+        payload_values["failure_bundle_digest"] = failure_bundle_digest
+    payload = canonical_json(payload_values)
     return f"{prefix}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
 
 
@@ -1323,7 +1332,7 @@ class GenericWorkflow:
         github: GitHubMergeClient | None = None,
         smoke_executor: SmokeExecutor | None = None,
         scope_resolver: ScopeResolver | None = None,
-        workflow_version: int = 1,
+        workflow_version: int = 2,
         supported_workflow_versions: frozenset[int] | None = None,
     ) -> None:
         if not isinstance(manifest, DeliveryManifest):
@@ -1418,6 +1427,7 @@ class GenericWorkflow:
         candidate_shas: Mapping[str, str] | None = None,
         affected: frozenset[str] | None = None,
         contract_hashes: Mapping[str, str] | None = None,
+        failure_bundle_digest: str = "",
     ) -> str:
         metadata = state.metadata
         return coordinator_action_key(
@@ -1426,7 +1436,7 @@ class GenericWorkflow:
             parent_identifier=state.parent_identifier,
             stage_kind=stage_kind,
             stage_ordinal=stage_ordinal,
-            attempt=(0 if metadata is None else metadata.attempt) if attempt is None else attempt,
+            attempt=(0 if metadata is None else metadata.repair_round) if attempt is None else attempt,
             affected_repositories=(
                 frozenset(state.snapshot.affected_repositories)
                 if affected is None
@@ -1436,6 +1446,7 @@ class GenericWorkflow:
             contract_hashes=(
                 {} if metadata is None else metadata.contract_hashes
             ) if contract_hashes is None else contract_hashes,
+            failure_bundle_digest=failure_bundle_digest,
         )
 
     def _exact_state_schema_problem(self, state: object) -> str | None:
@@ -1605,6 +1616,8 @@ class GenericWorkflow:
 
             metadata = state.metadata
             if metadata is not None:
+                if type(metadata) is LegacyParentMetadataV1:
+                    return _LEGACY_PARENT_STATE
                 if (
                     type(metadata) is not ParentMetadata
                     or type(metadata.workflow_version) is not int
@@ -1627,7 +1640,9 @@ class GenericWorkflow:
                     or type(metadata.merge_plan) is not tuple
                     or any(not _exact_stable(item) for item in metadata.merge_plan)
                     or type(metadata.merge_state) is not str
-                    or type(metadata.attempt) is not int
+                    or type(metadata.repair_round) is not int
+                    or type(metadata.automatic_repairs_used) is not int
+                    or metadata.automatic_repairs_used != metadata.repair_round
                     or type(metadata.last_action) is not str
                 ):
                     return malformed
@@ -1657,7 +1672,9 @@ class GenericWorkflow:
                     stage_ordinal=metadata.stage_ordinal,
                     merge_plan=metadata.merge_plan,
                     merge_state=metadata.merge_state,
-                    attempt=metadata.attempt,
+                    repair_round=metadata.repair_round,
+                    automatic_repairs_used=metadata.automatic_repairs_used,
+                    repair_authorization=metadata.repair_authorization,
                     last_action=metadata.last_action,
                 )
                 if (
@@ -1778,7 +1795,7 @@ class GenericWorkflow:
         metadata = state.metadata
         if (
             type(metadata) is not ParentMetadata
-            or metadata.metadata_version != 1
+            or metadata.metadata_version != 2
             or metadata.workflow_version not in self.supported_workflow_versions
             or metadata.instance_key != self.manifest.instance.key
         ):
@@ -1787,13 +1804,16 @@ class GenericWorkflow:
             return "parent affected repository metadata disagrees with its snapshot"
         if dict(metadata.candidate_shas) != dict(state.snapshot.candidate_shas):
             return "parent candidate SHA metadata disagrees with its snapshot"
-        if metadata.merge_state != state.snapshot.merge_state or metadata.attempt != state.snapshot.attempt:
+        if (
+            metadata.merge_state != state.snapshot.merge_state
+            or metadata.repair_round != state.snapshot.attempt
+        ):
             return "parent transition metadata disagrees with its snapshot"
         if any(
             child.stage_ordinal > metadata.stage_ordinal
             or (
                 child.stage_ordinal == metadata.stage_ordinal
-                and child.attempt > metadata.attempt
+                and child.attempt > metadata.repair_round
             )
             for child in state.children
         ):
@@ -1815,7 +1835,11 @@ class GenericWorkflow:
         if problem is None or (
             future_child_only
             and problem
-            not in {_FUTURE_CHILD_RELATIONSHIP, "parent state schema is unsupported"}
+            not in {
+                _FUTURE_CHILD_RELATIONSHIP,
+                _LEGACY_PARENT_STATE,
+                "parent state schema is unsupported",
+            }
         ):
             return None
         merge_state = (
@@ -1841,7 +1865,7 @@ class GenericWorkflow:
             child
             for child in state.children
             if child.stage_ordinal == state.metadata.stage_ordinal
-            and child.attempt == state.metadata.attempt
+            and child.attempt == state.metadata.repair_round
         )
         return state.active_work or any(
             child.active or child.status not in _TERMINAL_CHILD_STATUSES
@@ -1874,7 +1898,8 @@ class GenericWorkflow:
         if stage_ordinal is not None:
             values["stage_ordinal"] = stage_ordinal
         if attempt is not None:
-            values["attempt"] = attempt
+            values["repair_round"] = attempt
+            values["automatic_repairs_used"] = attempt
         if candidate_shas is not None:
             values["candidate_shas"] = candidate_shas
         if merge_plan is not None:
@@ -2286,7 +2311,7 @@ class GenericWorkflow:
         try:
             metadata = ParentMetadata(
                 workflow_version=self.workflow_version,
-                metadata_version=1,
+                metadata_version=2,
                 instance_key=self.manifest.instance.key,
                 affected_repositories=tuple(
                     repository for repository in self.manifest.merge_order if repository in selected
@@ -2297,7 +2322,8 @@ class GenericWorkflow:
                 stage_ordinal=0,
                 merge_plan=(),
                 merge_state="pending",
-                attempt=0,
+                repair_round=0,
+                automatic_repairs_used=0,
                 last_action=key,
             )
             self.executor.initialize_parent(parent_identifier, metadata, action_key=key)
@@ -2372,6 +2398,139 @@ class GenericWorkflow:
                 )
         return tuple(requests)
 
+    def _failure_bundle(
+        self,
+        state: WorkflowState,
+        decision: ParentDecision,
+    ) -> FailureBundle:
+        if state.metadata is None or decision.next_attempt is None:
+            raise WorkflowError("repair bundle lacks its parent transition identity")
+        current = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == state.metadata.stage_ordinal
+            and child.attempt == state.snapshot.attempt
+        )
+        if not current:
+            raise WorkflowError("repair bundle lacks a complete source Stage")
+        affected = frozenset(state.snapshot.affected_repositories)
+        applicable_suites = {
+            suite.key: frozenset(suite.repositories)
+            for suite in self.manifest.integration_suites
+            if set(suite.repositories) <= affected
+        }
+        failures: list[FailureEvidenceRef] = []
+        evidence_uuids: set[str] = set()
+        for child in current:
+            if (
+                child.phase not in {"review", "qa", "integration_qa"}
+                or child.active
+                or child.status not in _TERMINAL_CHILD_STATUSES
+                or dict(child.creation_candidate_shas)
+                != dict(state.snapshot.candidate_shas)
+                or child.phase_result not in _PHASE_RESULTS
+                or not _canonical_uuid(child.evidence_comment_uuid)
+                or not _https_evidence_url(child.evidence_comment_url)
+                or child.evidence_comment_uuid in evidence_uuids
+            ):
+                raise WorkflowError("repair bundle source Stage evidence is incomplete")
+            evidence_uuids.add(child.evidence_comment_uuid)
+
+            if child.phase in {"review", "qa"}:
+                evidence_by_repository = (
+                    state.snapshot.reviews if child.phase == "review" else state.snapshot.qa
+                )
+                evidence = evidence_by_repository.get(child.repository_key)
+                expected_owners = (child.repository_key,) if child.phase_result != "pass" else ()
+                if (
+                    evidence is None
+                    or evidence.candidate_sha
+                    != state.snapshot.candidate_shas.get(child.repository_key)
+                    or evidence.result != child.phase_result
+                    or child.target_key != child.repository_key
+                    or child.suite_key
+                    or child.responsible_repositories != expected_owners
+                ):
+                    raise WorkflowError("repair bundle repository evidence is inconsistent")
+            else:
+                suite_repositories = applicable_suites.get(child.suite_key)
+                evidence = state.snapshot.integration_qa.get(child.suite_key)
+                if (
+                    suite_repositories is None
+                    or evidence is None
+                    or dict(evidence.candidate_shas)
+                    != dict(state.snapshot.candidate_shas)
+                    or evidence.result != child.phase_result
+                    or (
+                        child.phase_result == "pass"
+                        and child.responsible_repositories
+                    )
+                    or (
+                        child.phase_result != "pass"
+                        and (
+                            not child.responsible_repositories
+                            or not set(child.responsible_repositories)
+                            <= suite_repositories
+                        )
+                    )
+                ):
+                    raise WorkflowError("repair bundle integration evidence is inconsistent")
+
+            if child.phase_result != "pass":
+                failures.append(
+                    FailureEvidenceRef(
+                        child_identifier=child.identifier,
+                        phase=child.phase,
+                        result=child.phase_result,
+                        stage_ordinal=child.stage_ordinal,
+                        repair_round=child.attempt,
+                        candidate_shas=child.creation_candidate_shas,
+                        responsible_repositories=child.responsible_repositories,
+                        evidence_comment_uuid=child.evidence_comment_uuid,
+                        evidence_comment_url=child.evidence_comment_url,
+                        suite_key=child.suite_key,
+                    )
+                )
+        owners = frozenset(
+            repository
+            for failure in failures
+            for repository in failure.responsible_repositories
+        )
+        if not failures or owners != frozenset(decision.repositories):
+            raise WorkflowError("repair decision disagrees with complete failure ownership")
+        return FailureBundle.build(
+            state.parent_identifier,
+            state.metadata.workflow_version,
+            state.metadata.stage_ordinal,
+            decision.next_attempt,
+            state.snapshot.candidate_shas,
+            tuple(failures),
+        )
+
+    @staticmethod
+    def _repair_requests(
+        state: WorkflowState,
+        decision: ParentDecision,
+        bundle: FailureBundle,
+        ordinal: int,
+    ) -> tuple[ChildRequest, ...]:
+        assert decision.next_attempt is not None
+        return tuple(
+            ChildRequest(
+                target_key=repository,
+                repository_key=repository,
+                suite_key="",
+                phase="repair",
+                stage_ordinal=ordinal,
+                attempt=decision.next_attempt,
+                candidate_shas=state.snapshot.candidate_shas,
+                pull_request=state.pull_requests[repository],
+                failure_bundle=bundle,
+                failure_refs=bundle.for_repository(repository),
+            )
+            for repository in decision.repositories
+        )
+
     @staticmethod
     def _has_successor(state: WorkflowState, requests: tuple[ChildRequest, ...]) -> bool:
         wanted = {
@@ -2393,6 +2552,7 @@ class GenericWorkflow:
         if state.metadata is None:
             return self._block(state, "parent has no initialized workflow metadata")
         ordinal = state.metadata.stage_ordinal + 1
+        bundle: FailureBundle | None = None
         if repair:
             if decision.next_attempt is None:
                 return self._block(state, "repair decision lacks the next attempt")
@@ -2414,19 +2574,14 @@ class GenericWorkflow:
                         state,
                         "repair pull request target is outside the manifest repository",
                     )
-            requests = tuple(
-                ChildRequest(
-                    repository,
-                    repository,
-                    "",
-                    "repair",
-                    ordinal,
-                    decision.next_attempt,
-                    state.snapshot.candidate_shas,
-                    state.pull_requests[repository],
+            try:
+                bundle = self._failure_bundle(state, decision)
+                requests = self._repair_requests(state, decision, bundle, ordinal)
+            except (MetadataError, WorkflowError, TypeError, ValueError):
+                return self._zero_mutation_block(
+                    state,
+                    "complete terminal failure evidence could not be bundled",
                 )
-                for repository in decision.repositories
-            )
             stage_kind = "repair"
             attempt = decision.next_attempt
             next_action = "repair"
@@ -2447,13 +2602,46 @@ class GenericWorkflow:
             next_action = "dispatch"
         if not requests:
             return self._result(state, "noop", "requested successor already exists")
-        if self._has_successor(state, requests):
+        if repair:
+            expected = {
+                (
+                    request.target_key,
+                    request.phase,
+                    request.attempt,
+                    request.failure_bundle.digest,
+                    tuple(ref.evidence_comment_uuid for ref in request.failure_refs),
+                )
+                for request in requests
+                if request.failure_bundle is not None
+            }
+            observed_successors = {
+                (
+                    child.target_key,
+                    child.phase,
+                    child.attempt,
+                    child.failure_bundle_digest,
+                    child.failure_evidence_uuids,
+                )
+                for child in state.children
+                if child.phase == "repair"
+                and child.attempt == decision.next_attempt
+                and child.target_key in decision.repositories
+            }
+            if observed_successors:
+                if observed_successors == expected:
+                    return self._result(state, "noop", "repair bundle successors already exist")
+                return self._zero_mutation_block(
+                    state,
+                    "repair successor bundle identity conflicts with the complete failure bundle",
+                )
+        elif self._has_successor(state, requests):
             return self._result(state, "noop", "an intended successor already exists")
         key = self._action_key(
             state,
             stage_kind,
             ordinal,
             attempt=attempt,
+            failure_bundle_digest="" if bundle is None else bundle.digest,
         )
         if key in state.applied_action_keys:
             return self._result(state, "noop", "coordinator action already exists", action_key=key)
@@ -2483,6 +2671,8 @@ class GenericWorkflow:
                 request.attempt,
                 key,
                 tuple(request.candidate_shas.items()),
+                "" if request.failure_bundle is None else request.failure_bundle.digest,
+                tuple(ref.evidence_comment_uuid for ref in request.failure_refs),
             )
             for request in requests
         }
@@ -2504,6 +2694,8 @@ class GenericWorkflow:
                         child.attempt,
                         child.action_key,
                         tuple(child.creation_candidate_shas.items()),
+                        child.failure_bundle_digest,
+                        child.failure_evidence_uuids,
                     )
                     for child in current.children
                 }
@@ -2878,6 +3070,11 @@ class GenericWorkflow:
             completed[0].stage_ordinal,
             attempt=completed[0].attempt,
             candidate_shas=completed[0].creation_candidate_shas,
+            failure_bundle_digest=(
+                completed[0].failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
         )
         unchanged_creation_candidates = all(
             repository == completion.repository_key
@@ -2913,6 +3110,11 @@ class GenericWorkflow:
             completed[0].stage_ordinal,
             attempt=completion.attempt,
             candidate_shas=action_candidates,
+            failure_bundle_digest=(
+                completion.failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
         )
         if (
             expected_completion_key == completed[0].action_key
@@ -3000,6 +3202,11 @@ class GenericWorkflow:
             child.stage_ordinal,
             attempt=completion.attempt,
             candidate_shas=action_candidates,
+            failure_bundle_digest=(
+                completion.failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
         )
         merge_plan = state.metadata.merge_plan if state.metadata is not None else ()
         merge_state = state.metadata.merge_state if state.metadata is not None else "pending"
@@ -3241,7 +3448,7 @@ class GenericWorkflow:
             instance_key=state.metadata.instance_key,
             repository_dag=MappingProxyType(dict(state.metadata.repository_dag)),
             contract_hashes=MappingProxyType(dict(state.metadata.contract_hashes)),
-            attempt=state.metadata.attempt,
+            attempt=state.metadata.repair_round,
         )
 
     def _merge_authority_matches(
@@ -4304,7 +4511,7 @@ class GenericWorkflow:
                 return False
             if (
                 child.stage_ordinal != initial.metadata.stage_ordinal
-                or child.attempt != initial.metadata.attempt
+                or child.attempt != initial.metadata.repair_round
                 or child.action_key not in initial.applied_action_keys
                 or child.repository_key != repository
             ):

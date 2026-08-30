@@ -296,6 +296,12 @@ def _repair(
     reason: str,
     repositories: set[str] | frozenset[str],
 ) -> ParentDecision:
+    affected = frozenset(snapshot.affected_repositories)
+    if not repositories or not repositories <= affected:
+        return _decision(
+            DecisionKind.BLOCK,
+            f"{reason}; repair ownership is outside the affected repository set",
+        )
     if snapshot.merge_state in {"merging", "merged", "partial"} or snapshot.merged_shas:
         return _decision(
             DecisionKind.BLOCK,
@@ -587,7 +593,10 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
             evidence = values.get(repository)
             if evidence is None:
                 continue
-            if evidence.candidate_sha != snapshot.candidate_shas[repository]:
+            if evidence.result == "pending":
+                if pending_reason is None:
+                    pending_reason = f"{repository} {label} is still active"
+            elif evidence.candidate_sha != snapshot.candidate_shas[repository]:
                 repair_findings.append(
                     f"{repository} {label} evidence does not match candidate SHA"
                 )
@@ -595,14 +604,15 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
             elif evidence.result in {"fail", "blocked"}:
                 repair_findings.append(f"{repository} {label} evidence did not pass")
                 repair_repositories.add(repository)
-            elif evidence.result != "pass" and pending_reason is None:
-                pending_reason = f"{repository} {label} is still active"
 
     for suite_key in sorted(suites):
         evidence = snapshot.integration_qa.get(suite_key)
         if evidence is None:
             continue
-        if dict(evidence.candidate_shas) != dict(snapshot.candidate_shas):
+        if evidence.result == "pending":
+            if pending_reason is None:
+                pending_reason = f"{suite_key} integration QA is still active"
+        elif dict(evidence.candidate_shas) != dict(snapshot.candidate_shas):
             repair_findings.append(
                 f"{suite_key} integration QA evidence does not match candidate SHA map"
             )
@@ -610,8 +620,9 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
         elif evidence.result in {"fail", "blocked"}:
             repair_findings.append(f"{suite_key} integration QA evidence did not pass")
             repair_repositories.update(suites[suite_key])
-        elif evidence.result != "pass" and pending_reason is None:
-            pending_reason = f"{suite_key} integration QA is still active"
+
+    if pending_reason is not None:
+        return _wait_or_recover(manifest, snapshot, pending_reason)
 
     for repository in _ordered(manifest, affected):
         pull_request = snapshot.pull_requests[repository]
@@ -652,6 +663,8 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
             "; ".join(repair_findings),
             repair_repositories,
         )
+    if pending_reason is not None:
+        return _wait_or_recover(manifest, snapshot, pending_reason)
     if missing_gate_repositories or missing_suites:
         dispatch = set(missing_gate_repositories)
         for suite in missing_suites:
@@ -662,9 +675,6 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
             _ordered(manifest, dispatch),
             dispatch_kind=DispatchKind.GATES,
         )
-    if pending_reason is not None:
-        return _wait_or_recover(manifest, snapshot, pending_reason)
-
     if all_merged:
         return _smoke_decision(manifest, snapshot, affected, suites)
     if snapshot.merge_state == "merging":
