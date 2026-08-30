@@ -2,9 +2,100 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from types import MappingProxyType
-from typing import Mapping
+from typing import Any, Mapping
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+_GITHUB_COMPONENT = re.compile(r"[A-Za-z0-9._-]+\Z")
+_COMMIT_REF = re.compile(r"[0-9a-f]{40}\Z")
+_CASE_INSENSITIVE_COMMIT_REF = re.compile(r"[0-9A-Fa-f]{40}\Z")
+
+
+def parse_github_skill_url(value: Any) -> dict[str, str]:
+    """Parse one canonical public GitHub tree URL without normalization."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError("Skill URL must be a canonical public GitHub tree URL")
+    parsed = urlsplit(value)
+    parts = parsed.path.split("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or len(parts) < 6
+        or parts[0] != ""
+        or any(
+            not part
+            or part in {".", ".."}
+            or _GITHUB_COMPONENT.fullmatch(part) is None
+            for part in parts[1:]
+        )
+        or parts[3] != "tree"
+    ):
+        raise ValueError("Skill URL must be a canonical public GitHub tree URL")
+    owner, repo, ref = parts[1], parts[2], parts[4]
+    path = "/".join(parts[5:])
+    if (
+        _CASE_INSENSITIVE_COMMIT_REF.fullmatch(ref) is not None
+        and _COMMIT_REF.fullmatch(ref) is None
+    ):
+        raise ValueError("Skill URL must be a canonical public GitHub tree URL")
+    canonical = f"https://github.com/{owner}/{repo}/tree/{ref}/{path}"
+    if value != canonical:
+        raise ValueError("Skill URL must be a canonical public GitHub tree URL")
+    return {
+        "owner": owner,
+        "repo": repo,
+        "ref": ref,
+        "path": path,
+        "source_url": value,
+    }
+
+
+def github_skill_origin_matches(
+    desired_url: Any,
+    observed_origin: Any,
+) -> bool:
+    """Compare a desired GitHub Skill URL with structured Multica evidence."""
+
+    if not isinstance(observed_origin, Mapping):
+        return False
+    required = ("type", "owner", "repo", "ref", "path", "source_url")
+    if any(
+        not isinstance(observed_origin.get(field), str)
+        or not observed_origin[field]
+        for field in required
+    ):
+        return False
+    if observed_origin["type"] != "github":
+        return False
+    try:
+        desired = parse_github_skill_url(desired_url)
+        observed = parse_github_skill_url(observed_origin["source_url"])
+    except ValueError:
+        return False
+    if any(
+        observed_origin[field] != observed[field]
+        for field in ("owner", "repo", "ref", "path")
+    ):
+        return False
+    if any(
+        desired[field] != observed[field]
+        for field in ("owner", "repo", "path")
+    ):
+        return False
+    desired_ref = desired["ref"]
+    observed_ref = observed["ref"]
+    if _COMMIT_REF.fullmatch(desired_ref) is not None:
+        return observed_ref == desired_ref
+    return (
+        observed_ref == desired_ref
+        or _COMMIT_REF.fullmatch(observed_ref) is not None
+    )
 
 
 @dataclass(frozen=True)

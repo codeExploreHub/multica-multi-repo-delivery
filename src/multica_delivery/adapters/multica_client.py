@@ -82,6 +82,11 @@ class SkillState:
     id: str
     name: str
     source_url: str
+    origin_type: str = ""
+    owner: str = ""
+    repo: str = ""
+    ref: str = ""
+    path: str = ""
 
 
 @dataclass(frozen=True)
@@ -591,6 +596,11 @@ class MulticaClient:
                     summary.id,
                     self._string_field(detail, "name", detail_operation),
                     self._string_field(origin, "source_url", detail_operation),
+                    self._string_field(origin, "type", detail_operation),
+                    self._string_field(origin, "owner", detail_operation),
+                    self._string_field(origin, "repo", detail_operation),
+                    self._string_field(origin, "ref", detail_operation),
+                    self._string_field(origin, "path", detail_operation),
                 )
             )
         return tuple(skills)

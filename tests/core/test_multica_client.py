@@ -401,7 +401,14 @@ class MulticaClientTests(unittest.TestCase):
         }
         runner = FakeRunner(
             {"data": {"skills": [{"id": "skill-1", "name": "using-superpowers"}]}},
-            {"data": {"skill": {"id": "skill-1", "name": "using-superpowers", "config": {"origin": {"source_url": "https://github.com/example/skills/tree/main/using-superpowers"}}}}},
+            {"data": {"skill": {"id": "skill-1", "name": "using-superpowers", "config": {"origin": {
+                "type": "github",
+                "owner": "example",
+                "repo": "skills",
+                "ref": "main",
+                "path": "using-superpowers",
+                "source_url": "https://github.com/example/skills/tree/main/using-superpowers",
+            }}}}},
             {"data": {"projects": [{"id": "project-1", "title": "Control"}]}},
             {"data": {"project": {"id": "project-1", "title": "Control", "description": "control project"}}},
             {"data": {"resources": [{"id": "worktree-1", "project_id": "project-1", "resource_type": "local_directory", "resource_ref": {"local_path": "/tmp/repository", "daemon_id": "daemon-1", "execution_mode": "worktree"}}]}},
@@ -416,7 +423,20 @@ class MulticaClientTests(unittest.TestCase):
         )
         client = MulticaClient(runner)
 
-        self.assertEqual(client.list_skills(), (SkillState("skill-1", "using-superpowers", "https://github.com/example/skills/tree/main/using-superpowers"),))
+        skills = client.list_skills()
+        self.assertEqual(
+            vars(skills[0]),
+            {
+                "id": "skill-1",
+                "name": "using-superpowers",
+                "source_url": "https://github.com/example/skills/tree/main/using-superpowers",
+                "origin_type": "github",
+                "owner": "example",
+                "repo": "skills",
+                "ref": "main",
+                "path": "using-superpowers",
+            },
+        )
         projects = client.list_projects()
         self.assertEqual(projects, (ProjectState("project-1", "Control", "control project"),))
         self.assertEqual(client.list_project_resources("project-1"), (ProjectResourceState("worktree-1", "project-1", "local_directory", "/tmp/repository", "daemon-1", "worktree"),))

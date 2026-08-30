@@ -7,7 +7,6 @@ import hashlib
 import json
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
-from urllib.parse import urlparse
 
 from multica_delivery import __version__
 
@@ -17,6 +16,8 @@ from .model import (
     DeliveryManifest,
     FrameworkLock,
     RepositorySpec,
+    github_skill_origin_matches,
+    parse_github_skill_url,
     validate_policy_authority,
 )
 from ..adapters.multica_client import (
@@ -426,16 +427,11 @@ class Provisioner:
         if manifest.policy.watcher_cron != "*/30 * * * *":
             raise ProvisionError("Watcher requires the approved 30-minute schedule")
         for key, source in manifest.skill_registry.items():
-            parsed = urlparse(source.url)
-            if (
-                not source.approved
-                or parsed.scheme != "https"
-                or parsed.hostname != "github.com"
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.query
-                or parsed.fragment
-            ):
+            try:
+                parsed = parse_github_skill_url(source.url)
+            except (TypeError, ValueError):
+                parsed = None
+            if not source.approved or parsed is None:
                 raise ProvisionError(f"skill {key!r} is not an approved public origin")
 
         display = manifest.instance.display_name
@@ -613,7 +609,10 @@ class Provisioner:
                 label="skill",
                 allow_rename=False,
             )
-            if state is not None and state.source_url != manifest.skill_registry[key].url:
+            if state is not None and not self._skill_origin_matches(
+                manifest.skill_registry[key].url,
+                state,
+            ):
                 raise ProvisionError(f"skill {key!r} has a same-name/different-origin conflict")
             skills[key] = state
 
@@ -1143,8 +1142,22 @@ class Provisioner:
                     ),
                 )
                 observed = snapshot.skills[key]
-            if observed is None or observed.source_url != source:
+            if observed is None or not self._skill_origin_matches(source, observed):
                 raise ProvisionError(f"skill reconciliation failed for {key}")
+
+    @staticmethod
+    def _skill_origin_matches(desired_url: str, observed: SkillState) -> bool:
+        return github_skill_origin_matches(
+            desired_url,
+            {
+                "type": observed.origin_type,
+                "owner": observed.owner,
+                "repo": observed.repo,
+                "ref": observed.ref,
+                "path": observed.path,
+                "source_url": observed.source_url,
+            },
+        )
 
     def _apply_projects(
         self,

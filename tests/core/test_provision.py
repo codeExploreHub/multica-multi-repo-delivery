@@ -40,6 +40,26 @@ def no_secrets(name: str) -> str:
     raise AssertionError(f"unexpected secret lookup for {name}")
 
 
+def structured_skill_state(
+    identifier: str,
+    name: str,
+    source_url: str,
+) -> SkillState:
+    """Build the complete Multica 0.4.36 observed origin without production helpers."""
+
+    parts = source_url.split("/")
+    state = SkillState(identifier, name, source_url)
+    for field, value in (
+        ("origin_type", "github"),
+        ("owner", parts[3]),
+        ("repo", parts[4]),
+        ("ref", parts[6]),
+        ("path", "/".join(parts[7:])),
+    ):
+        object.__setattr__(state, field, value)
+    return state
+
+
 class FakeGitHub:
     def __init__(self, manifest):
         repositories = (manifest.control.github,) + tuple(
@@ -178,7 +198,11 @@ class StatefulMultica:
         if self._mutate("skill.import"):
             identifier = self._id("skill")
             name = url.rstrip("/").rsplit("/", 1)[-1]
-            self.skills[identifier] = SkillState(identifier, name, url)
+            self.skills[identifier] = structured_skill_state(
+                identifier,
+                name,
+                url,
+            )
         return MutationResult("ignored-acknowledgement")
 
     def list_projects(self) -> tuple[ProjectState, ...]:
@@ -837,6 +861,102 @@ class ProvisionerTests(unittest.TestCase):
                 secret_lookup=self.secrets,
             )
         self.assertFalse(self.multica.was_mutated)
+
+    def test_resolved_commit_skill_origin_reconciles_without_mutation_or_duplicate(self):
+        initial = self.apply()
+        target_id = initial.lock.resource_ids["skill"]["using-superpowers"]
+        commit = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
+        self.multica.skills[target_id] = structured_skill_state(
+            target_id,
+            "using-superpowers",
+            "https://github.com/openai/superpowers/tree/"
+            f"{commit}/skills/using-superpowers",
+        )
+        mutations_before = tuple(self.multica.mutations)
+
+        result = self.apply(initial.lock)
+
+        self.assertEqual(result.actions, ())
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(tuple(self.multica.mutations), mutations_before)
+        self.assertEqual(
+            [
+                skill.id
+                for skill in self.multica.skills.values()
+                if skill.name == "using-superpowers"
+            ],
+            [target_id],
+        )
+
+    def test_skill_origin_requires_consistent_structured_github_identity(self):
+        desired_url = self.manifest.skill_registry["using-superpowers"].url
+        cases = (
+            ("origin_type", "http"),
+            ("owner", "attacker"),
+            ("repo", "lookalike"),
+            ("path", "skills/lookalike"),
+            ("ref", "other-branch"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                multica = StatefulMultica(self.manifest)
+                state = structured_skill_state(
+                    "skill-target",
+                    "using-superpowers",
+                    desired_url,
+                )
+                object.__setattr__(state, field, value)
+                multica.skills[state.id] = state
+
+                with self.assertRaisesRegex(
+                    ProvisionError,
+                    "same-name/different-origin",
+                ):
+                    Provisioner(multica, FakeGitHub(self.manifest)).reconcile(
+                        self.manifest,
+                        FrameworkLock.empty(),
+                        apply=False,
+                        secret_lookup=no_secrets,
+                    )
+
+                self.assertFalse(multica.was_mutated)
+
+    def test_skill_origin_rejects_noncanonical_or_different_urls(self):
+        upper_commit = "B36E0829C6D0140E93CFEF2CA599B1B07D4A7797"
+        cases = (
+            "http://github.com/openai/superpowers/tree/main/skills/using-superpowers",
+            "https://github.com:443/openai/superpowers/tree/main/skills/using-superpowers",
+            "https://user@github.com/openai/superpowers/tree/main/skills/using-superpowers",
+            "https://github.com/openai/superpowers/tree/main/skills/../using-superpowers",
+            "https://github.com/openai/superpowers/tree/main//skills/using-superpowers",
+            "https://github.com/openai/superpowers/tree/main/skills/using-superpowers?ref=main",
+            "https://github.com/openai/superpowers/tree/main/skills/using-superpowers#fragment",
+            f"https://github.com/openai/superpowers/tree/{upper_commit}/skills/using-superpowers",
+            "https://github.com/openai/superpowers/tree/other/skills/using-superpowers",
+            "https://github.com/attacker/superpowers/tree/main/skills/using-superpowers",
+        )
+        for source_url in cases:
+            with self.subTest(source_url=source_url):
+                multica = StatefulMultica(self.manifest)
+                state = structured_skill_state(
+                    "skill-target",
+                    "using-superpowers",
+                    source_url,
+                )
+                multica.skills[state.id] = state
+
+                with self.assertRaisesRegex(
+                    ProvisionError,
+                    "same-name/different-origin|approved public origin",
+                ):
+                    Provisioner(multica, FakeGitHub(self.manifest)).reconcile(
+                        self.manifest,
+                        FrameworkLock.empty(),
+                        apply=False,
+                        secret_lookup=no_secrets,
+                    )
+
+                self.assertFalse(multica.was_mutated)
 
     def test_duplicate_target_project_is_fatal_before_mutation(self):
         for identifier in ("project-a", "project-b"):
