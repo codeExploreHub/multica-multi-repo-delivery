@@ -167,7 +167,7 @@ def _phase_completion_schema_problem(
     manifest: DeliveryManifest,
 ) -> str | None:
     try:
-        max_attempt = manifest.policy.max_repair_attempts
+        max_attempt = manifest.policy.max_repair_attempts + 1
         if type(completion) is not PhaseCompletion:
             return "phase completion is malformed"
         if (
@@ -522,6 +522,7 @@ class WorkflowChild:
     responsible_repositories: tuple[str, ...] = ()
     failure_bundle_digest: str = ""
     failure_evidence_uuids: tuple[str, ...] = ()
+    authorizing_comment_uuid: str = ""
 
     def __post_init__(self) -> None:
         _stable(self.identifier, "child identifier")
@@ -565,6 +566,7 @@ class WorkflowChild:
             or type(self.failure_evidence_uuids) is not tuple
             or any(not _canonical_uuid(item) for item in self.failure_evidence_uuids)
             or len(set(self.failure_evidence_uuids)) != len(self.failure_evidence_uuids)
+            or not _canonical_uuid(self.authorizing_comment_uuid, empty=True)
         ):
             raise WorkflowError("child failure evidence is malformed")
         owners = _exact_repository_tuple(
@@ -591,6 +593,7 @@ class ChildRequest:
     pull_request: PullRequestTarget | None = None
     failure_bundle: FailureBundle | None = None
     failure_refs: tuple[FailureEvidenceRef, ...] = ()
+    authorizing_comment_uuid: str = ""
 
     def __post_init__(self) -> None:
         _stable(self.target_key, "child target")
@@ -612,6 +615,7 @@ class ChildRequest:
                 self.failure_bundle is not None
                 or type(self.failure_refs) is not tuple
                 or self.failure_refs != ()
+                or self.authorizing_comment_uuid
             ):
                 raise WorkflowError("only repair requests can contain failure evidence")
             return
@@ -628,6 +632,7 @@ class ChildRequest:
             or dict(self.candidate_shas) != dict(self.failure_bundle.candidate_shas)
             or self.stage_ordinal != self.failure_bundle.source_stage_ordinal + 1
             or self.attempt != self.failure_bundle.repair_round
+            or not _canonical_uuid(self.authorizing_comment_uuid, empty=True)
         ):
             raise WorkflowError("repair failure bundle partition is malformed")
 
@@ -817,6 +822,21 @@ class StatusTransition:
             raise WorkflowError("status transition action key is malformed")
 
 
+@dataclass(frozen=True)
+class AuthorizingComment:
+    comment_uuid: str
+    comment_url: str
+    author_type: str
+
+    def __post_init__(self) -> None:
+        if (
+            not _canonical_uuid(self.comment_uuid)
+            or not _https_evidence_url(self.comment_url)
+            or not _exact_stable(self.author_type)
+        ):
+            raise WorkflowError("authorizing comment is malformed")
+
+
 class ScopeResolver(Protocol):
     def resolve(self, parent_identifier: str) -> ScopeResolution: ...
 
@@ -834,6 +854,12 @@ class WorkflowSnapshotReader(Protocol):
         parent_identifier: str,
         evidence_comment_uuid: str,
     ) -> PhaseCompletion | None: ...
+
+    def read_authorizing_comment(
+        self,
+        parent_identifier: str,
+        comment_uuid: str,
+    ) -> AuthorizingComment: ...
 
     def list_active_parents(
         self,
@@ -1258,6 +1284,7 @@ def coordinator_action_key(
     candidate_shas: Mapping[str, str],
     contract_hashes: Mapping[str, str],
     failure_bundle_digest: str = "",
+    authorizing_comment_uuid: str = "",
 ) -> str:
     """Hash every frozen coordinator input into one stable idempotency key."""
 
@@ -1296,6 +1323,8 @@ def coordinator_action_key(
         failure_bundle_digest and not _valid_digest(failure_bundle_digest)
     ):
         raise WorkflowError("failure bundle digest is malformed")
+    if not _canonical_uuid(authorizing_comment_uuid, empty=True):
+        raise WorkflowError("authorizing comment UUID is malformed")
     action_kind = stage_kind.split(":", 1)[0]
     prefix = {
         "implementation": "dispatch",
@@ -1323,6 +1352,8 @@ def coordinator_action_key(
         }
     if failure_bundle_digest:
         payload_values["failure_bundle_digest"] = failure_bundle_digest
+    if authorizing_comment_uuid:
+        payload_values["authorizing_comment_uuid"] = authorizing_comment_uuid
     payload = canonical_json(payload_values)
     return f"{prefix}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
 
@@ -1435,15 +1466,25 @@ class GenericWorkflow:
         affected: frozenset[str] | None = None,
         contract_hashes: Mapping[str, str] | None = None,
         failure_bundle_digest: str = "",
+        authorizing_comment_uuid: str = "",
     ) -> str:
         metadata = state.metadata
+        metadata_attempt = (
+            0
+            if metadata is None
+            else (
+                metadata.attempt
+                if type(metadata) is LegacyParentMetadataV1
+                else metadata.repair_round
+            )
+        )
         return coordinator_action_key(
             workflow_version=self.workflow_version if metadata is None else metadata.workflow_version,
             instance_key=self.manifest.instance.key,
             parent_identifier=state.parent_identifier,
             stage_kind=stage_kind,
             stage_ordinal=stage_ordinal,
-            attempt=(0 if metadata is None else metadata.repair_round) if attempt is None else attempt,
+            attempt=metadata_attempt if attempt is None else attempt,
             affected_repositories=(
                 frozenset(state.snapshot.affected_repositories)
                 if affected is None
@@ -1454,6 +1495,7 @@ class GenericWorkflow:
                 {} if metadata is None else metadata.contract_hashes
             ) if contract_hashes is None else contract_hashes,
             failure_bundle_digest=failure_bundle_digest,
+            authorizing_comment_uuid=authorizing_comment_uuid,
         )
 
     def _exact_state_schema_problem(self, state: object) -> str | None:
@@ -1598,7 +1640,7 @@ class GenericWorkflow:
                     for smoke_read in snapshot.smoke_reads
                 )
                 or type(snapshot.attempt) is not int
-                or not 0 <= snapshot.attempt <= self.manifest.policy.max_repair_attempts
+                or not 0 <= snapshot.attempt <= self.manifest.policy.max_repair_attempts + 1
                 or type(snapshot.stalled) is not bool
                 or (
                     snapshot.stalled_repository is not None
@@ -1649,7 +1691,8 @@ class GenericWorkflow:
                     or type(metadata.merge_state) is not str
                     or type(metadata.repair_round) is not int
                     or type(metadata.automatic_repairs_used) is not int
-                    or metadata.automatic_repairs_used != metadata.repair_round
+                    or not 0 <= metadata.automatic_repairs_used <= metadata.repair_round
+                    or metadata.repair_round > self.manifest.policy.max_repair_attempts + 1
                     or type(metadata.last_action) is not str
                 ):
                     return malformed
@@ -1767,6 +1810,10 @@ class GenericWorkflow:
                     != len(child.failure_evidence_uuids)
                     or child.failure_evidence_uuids
                     != tuple(sorted(child.failure_evidence_uuids))
+                    or not _canonical_uuid(
+                        child.authorizing_comment_uuid,
+                        empty=True,
+                    )
                 ):
                     return malformed
                 identifiers.add(child.identifier)
@@ -1785,9 +1832,18 @@ class GenericWorkflow:
                         not child.failure_bundle_digest
                         or not child.failure_evidence_uuids
                         or child.responsible_repositories
+                        or bool(child.authorizing_comment_uuid)
+                        != (
+                            child.attempt
+                            > self.manifest.policy.max_repair_attempts
+                        )
                     ):
                         return malformed
-                elif child.failure_bundle_digest or child.failure_evidence_uuids:
+                elif (
+                    child.failure_bundle_digest
+                    or child.failure_evidence_uuids
+                    or child.authorizing_comment_uuid
+                ):
                     return malformed
                 completion_fields = (
                     bool(child.evidence_comment_uuid),
@@ -1929,6 +1985,93 @@ class GenericWorkflow:
             mutation_count=0,
         )
 
+    def _completed_legacy_replay(
+        self,
+        state: object,
+        parent_identifier: str,
+    ) -> WorkflowResult | None:
+        if (
+            type(state) is not WorkflowState
+            or state.parent_status != "done"
+            or type(state.metadata) is not LegacyParentMetadataV1
+        ):
+            return None
+        metadata = state.metadata
+        try:
+            reconstructed = LegacyParentMetadataV1(
+                workflow_version=metadata.workflow_version,
+                metadata_version=metadata.metadata_version,
+                instance_key=metadata.instance_key,
+                affected_repositories=metadata.affected_repositories,
+                repository_dag=dict(metadata.repository_dag),
+                candidate_shas=dict(metadata.candidate_shas),
+                contract_hashes=dict(metadata.contract_hashes),
+                stage_ordinal=metadata.stage_ordinal,
+                merge_plan=metadata.merge_plan,
+                merge_state=metadata.merge_state,
+                attempt=metadata.attempt,
+                last_action=metadata.last_action,
+            )
+            synthetic = ParentMetadata(
+                workflow_version=2,
+                metadata_version=2,
+                instance_key=metadata.instance_key,
+                affected_repositories=metadata.affected_repositories,
+                repository_dag=dict(metadata.repository_dag),
+                candidate_shas=dict(metadata.candidate_shas),
+                contract_hashes=dict(metadata.contract_hashes),
+                stage_ordinal=metadata.stage_ordinal,
+                merge_plan=metadata.merge_plan,
+                merge_state=metadata.merge_state,
+                repair_round=metadata.attempt,
+                automatic_repairs_used=metadata.attempt,
+                last_action=metadata.last_action,
+            )
+            schema_problem = self._exact_state_schema_problem(
+                replace(state, metadata=synthetic)
+            )
+        except (MetadataError, TypeError, ValueError):
+            schema_problem = "parent state schema is unsupported"
+            reconstructed = None
+        if (
+            reconstructed != metadata
+            or schema_problem is not None
+            or state.parent_identifier != parent_identifier
+            or state.project_key != self.manifest.instance.control_project
+            or metadata.instance_key != self.manifest.instance.key
+            or tuple(metadata.affected_repositories)
+            != tuple(state.snapshot.affected_repositories)
+            or dict(metadata.candidate_shas)
+            != dict(state.snapshot.candidate_shas)
+            or metadata.merge_state != state.snapshot.merge_state
+            or metadata.attempt != state.snapshot.attempt
+        ):
+            return WorkflowResult(
+                parent_identifier,
+                "blocked",
+                "block",
+                "completed version one parent is not authoritative",
+                mutation_count=0,
+            )
+        completed = decide_parent_action(self.manifest, state.snapshot)
+        key = self._action_key(state, "complete", metadata.stage_ordinal)
+        if (
+            completed.kind is not DecisionKind.COMPLETE
+            or metadata.last_action != key
+            or key not in state.applied_action_keys
+        ):
+            return self._uncertain(
+                state,
+                "completed version one parent lacks its exact completion transition",
+                action_key=key,
+            )
+        return self._result(
+            state,
+            "noop",
+            "version one parent completion remains authoritative and immutable",
+            action_key=key,
+        )
+
     @staticmethod
     def _current_stage_is_active(state: WorkflowState) -> bool:
         if state.metadata is None:
@@ -1953,6 +2096,20 @@ class GenericWorkflow:
             "current Stage still has active work",
         )
 
+    @staticmethod
+    def _candidate_heads_match(state: WorkflowState) -> bool:
+        return all(
+            state.snapshot.candidate_shas.get(repository) == pull_request.head_sha
+            for repository, pull_request in state.snapshot.pull_requests.items()
+        )
+
+    def _parent_decision(self, state: WorkflowState) -> ParentDecision:
+        snapshot = state.snapshot
+        automatic_limit = self.manifest.policy.max_repair_attempts
+        if snapshot.attempt > automatic_limit:
+            snapshot = replace(snapshot, attempt=automatic_limit)
+        return decide_parent_action(self.manifest, snapshot)
+
     def _metadata(
         self,
         state: WorkflowState,
@@ -1963,6 +2120,8 @@ class GenericWorkflow:
         candidate_shas: Mapping[str, str] | None = None,
         merge_plan: tuple[str, ...] | None = None,
         merge_state: str | None = None,
+        automatic_repair: bool | None = None,
+        consume_repair_authorization: bool = False,
     ) -> ParentMetadata:
         if state.metadata is None:
             raise WorkflowError("parent has no initialized workflow metadata")
@@ -1971,7 +2130,14 @@ class GenericWorkflow:
             values["stage_ordinal"] = stage_ordinal
         if attempt is not None:
             values["repair_round"] = attempt
-            values["automatic_repairs_used"] = attempt
+            if automatic_repair is True:
+                values["automatic_repairs_used"] = (
+                    state.metadata.automatic_repairs_used + 1
+                )
+            elif automatic_repair is not False:
+                raise WorkflowError("repair authority must classify a new round")
+        if consume_repair_authorization:
+            values["repair_authorization"] = None
         if candidate_shas is not None:
             values["candidate_shas"] = candidate_shas
         if merge_plan is not None:
@@ -2603,12 +2769,62 @@ class GenericWorkflow:
             tuple(failures),
         )
 
+    def _repair_authority(
+        self,
+        state: WorkflowState,
+        bundle: FailureBundle,
+    ) -> tuple[int, bool]:
+        if state.metadata is None:
+            raise WorkflowError("repair authority lacks parent metadata")
+        metadata = state.metadata
+        next_round = metadata.repair_round + 1
+        automatic_limit = self.manifest.policy.max_repair_attempts
+        if bundle.repair_round != next_round:
+            raise WorkflowError("repair authority does not match the failure bundle round")
+        if next_round <= automatic_limit:
+            if metadata.automatic_repairs_used != metadata.repair_round:
+                raise WorkflowError("automatic repair accounting is not contiguous")
+            return next_round, True
+        if (
+            next_round != automatic_limit + 1
+            or metadata.repair_round != automatic_limit
+            or metadata.automatic_repairs_used != automatic_limit
+        ):
+            raise WorkflowError("only one member-authorized repair round is allowed")
+        authorization = metadata.repair_authorization
+        if (
+            authorization is None
+            or authorization.bundle_digest != bundle.digest
+            or authorization.granted_round != next_round
+            or any(
+                child.authorizing_comment_uuid == authorization.comment_uuid
+                for child in state.children
+            )
+        ):
+            raise WorkflowError("repair authorization is absent, stale, or already consumed")
+        try:
+            comment = self.snapshot_reader.read_authorizing_comment(
+                state.parent_identifier,
+                authorization.comment_uuid,
+            )
+        except Exception as error:
+            raise WorkflowError("repair authorization comment could not be reread") from error
+        if (
+            type(comment) is not AuthorizingComment
+            or comment.comment_uuid != authorization.comment_uuid
+            or comment.comment_url != authorization.comment_url
+            or comment.author_type != "member"
+        ):
+            raise WorkflowError("repair authorization comment is not authoritative")
+        return next_round, False
+
     @staticmethod
     def _repair_requests(
         state: WorkflowState,
         decision: ParentDecision,
         bundle: FailureBundle,
         ordinal: int,
+        authorizing_comment_uuid: str = "",
     ) -> tuple[ChildRequest, ...]:
         assert decision.next_attempt is not None
         return tuple(
@@ -2623,6 +2839,7 @@ class GenericWorkflow:
                 pull_request=state.pull_requests[repository],
                 failure_bundle=bundle,
                 failure_refs=bundle.for_repository(repository),
+                authorizing_comment_uuid=authorizing_comment_uuid,
             )
             for repository in decision.repositories
         )
@@ -2649,6 +2866,8 @@ class GenericWorkflow:
             return self._block(state, "parent has no initialized workflow metadata")
         ordinal = state.metadata.stage_ordinal + 1
         bundle: FailureBundle | None = None
+        automatic_repair: bool | None = None
+        authorizing_comment_uuid = ""
         if repair:
             if decision.next_attempt is None:
                 return self._block(state, "repair decision lacks the next attempt")
@@ -2672,11 +2891,25 @@ class GenericWorkflow:
                     )
             try:
                 bundle = self._failure_bundle(state, decision)
-                requests = self._repair_requests(state, decision, bundle, ordinal)
+                authority_round, automatic_repair = self._repair_authority(state, bundle)
+                if authority_round != decision.next_attempt:
+                    raise WorkflowError("repair decision disagrees with its authority")
+                if not automatic_repair:
+                    assert state.metadata.repair_authorization is not None
+                    authorizing_comment_uuid = (
+                        state.metadata.repair_authorization.comment_uuid
+                    )
+                requests = self._repair_requests(
+                    state,
+                    decision,
+                    bundle,
+                    ordinal,
+                    authorizing_comment_uuid,
+                )
             except (MetadataError, WorkflowError, TypeError, ValueError):
                 return self._zero_mutation_block(
                     state,
-                    "complete terminal failure evidence could not be bundled",
+                    "complete failure evidence or repair authority could not be validated",
                 )
             stage_kind = "repair"
             attempt = decision.next_attempt
@@ -2704,6 +2937,7 @@ class GenericWorkflow:
             ordinal,
             attempt=attempt,
             failure_bundle_digest="" if bundle is None else bundle.digest,
+            authorizing_comment_uuid=authorizing_comment_uuid,
         )
 
         def request_identity(request: ChildRequest) -> tuple[object, ...]:
@@ -2718,6 +2952,7 @@ class GenericWorkflow:
                 tuple(request.candidate_shas.items()),
                 "" if request.failure_bundle is None else request.failure_bundle.digest,
                 _failure_uuid_partition(request.failure_refs),
+                request.authorizing_comment_uuid,
             )
 
         def child_identity(child: WorkflowChild) -> tuple[object, ...]:
@@ -2732,6 +2967,7 @@ class GenericWorkflow:
                 tuple(child.creation_candidate_shas.items()),
                 child.failure_bundle_digest,
                 child.failure_evidence_uuids,
+                child.authorizing_comment_uuid,
             )
 
         wanted = Counter(request_identity(request) for request in requests)
@@ -2774,7 +3010,9 @@ class GenericWorkflow:
             state,
             action_key=key,
             stage_ordinal=ordinal,
-            attempt=attempt,
+            attempt=attempt if repair else None,
+            automatic_repair=automatic_repair,
+            consume_repair_authorization=(repair and automatic_repair is False),
         )
         try:
             self.executor.create_children(
@@ -2836,12 +3074,15 @@ class GenericWorkflow:
             state = self.snapshot_reader.read(parent_identifier)
         except Exception:
             return WorkflowResult(parent_identifier, "blocked", "block", "parent could not be read")
+        legacy_completion = self._completed_legacy_replay(state, parent_identifier)
+        if legacy_completion is not None:
+            return legacy_completion
         problem_result = self._state_problem_result(state, parent_identifier)
         if problem_result is not None:
             return problem_result
         if state.parent_status == "done":
             assert state.metadata is not None
-            completed = decide_parent_action(self.manifest, state.snapshot)
+            completed = self._parent_decision(state)
             key = self._action_key(state, "complete", state.metadata.stage_ordinal)
             if (
                 completed.kind is not DecisionKind.COMPLETE
@@ -2863,7 +3104,59 @@ class GenericWorkflow:
             return self._result(state, "noop", "parent is not active")
         if state.human_wait:
             return self._result(state, "wait", "parent is waiting for a human")
-        decision = decide_parent_action(self.manifest, state.snapshot)
+        if not self._candidate_heads_match(state):
+            return self._zero_mutation_block(
+                state,
+                "out-of-band pull-request head change",
+            )
+        assert state.metadata is not None
+        automatic_limit = self.manifest.policy.max_repair_attempts
+        if state.metadata.repair_round == automatic_limit + 1:
+            current_children = tuple(
+                child
+                for child in state.children
+                if child.stage_ordinal == state.metadata.stage_ordinal
+                and child.attempt == state.metadata.repair_round
+            )
+            if (
+                current_children
+                and all(
+                    child.phase == "repair"
+                    and child.status in _ACTIVE_CHILD_STATUSES
+                    and child.active
+                    and child.authorizing_comment_uuid
+                    and child.action_key == state.metadata.last_action
+                    for child in current_children
+                )
+                and state.metadata.last_action in state.applied_action_keys
+            ):
+                return self._result(
+                    state,
+                    "noop",
+                    "member-authorized repair successors already exist",
+                    action_key=state.metadata.last_action,
+                )
+        decision = self._parent_decision(state)
+        if (
+            decision.kind is DecisionKind.BLOCK
+            and decision.reason.endswith("automatic repair attempt limit exhausted")
+        ):
+            if state.metadata.repair_round != automatic_limit:
+                return self._zero_mutation_block(
+                    state,
+                    "member-authorized repair round is already consumed",
+                )
+            prior = replace(state.snapshot, attempt=automatic_limit - 1)
+            repair_decision = decide_parent_action(self.manifest, prior)
+            if repair_decision.kind is not DecisionKind.REPAIR:
+                return self._zero_mutation_block(
+                    state,
+                    "automatic repair exhaustion could not be reconstructed",
+                )
+            decision = replace(
+                repair_decision,
+                next_attempt=automatic_limit + 1,
+            )
         if decision.kind in {
             DecisionKind.DISPATCH,
             DecisionKind.REPAIR,
@@ -2901,7 +3194,7 @@ class GenericWorkflow:
         fresh_problem = self._state_problem_result(fresh, parent_identifier)
         if fresh_problem is not None:
             return fresh_problem
-        if fresh != state or decide_parent_action(self.manifest, fresh.snapshot) != decision:
+        if fresh != state or self._parent_decision(fresh) != decision:
             return self._result(fresh, "noop", "parent changed before completion")
         assert fresh.metadata is not None
         key = self._action_key(fresh, "complete", fresh.metadata.stage_ordinal)
@@ -2970,7 +3263,7 @@ class GenericWorkflow:
         if (
             not isinstance(completion.attempt, int)
             or isinstance(completion.attempt, bool)
-            or not 0 <= completion.attempt <= self.manifest.policy.max_repair_attempts
+            or not 0 <= completion.attempt <= self.manifest.policy.max_repair_attempts + 1
             or completion.attempt != state.snapshot.attempt
         ):
             return "phase completion attempt is not current", None
@@ -3068,6 +3361,32 @@ class GenericWorkflow:
             and matching[0].failure_bundle_digest != completion.failure_bundle_digest
         ):
             return "repair completion failure bundle digest does not match assigned child", None
+        if completion.phase in {"implementation", "repair"}:
+            child = matching[0]
+            expected_creation_key = self._action_key(
+                state,
+                completion.phase,
+                child.stage_ordinal,
+                attempt=child.attempt,
+                candidate_shas=child.creation_candidate_shas,
+                failure_bundle_digest=(
+                    child.failure_bundle_digest
+                    if completion.phase == "repair"
+                    else ""
+                ),
+                authorizing_comment_uuid=(
+                    child.authorizing_comment_uuid
+                    if completion.phase == "repair"
+                    else ""
+                ),
+            )
+            if (
+                dict(child.creation_candidate_shas)
+                != dict(state.snapshot.candidate_shas)
+                or child.action_key != expected_creation_key
+                or expected_creation_key not in state.applied_action_keys
+            ):
+                return "phase completion child creation provenance is not current", None
         return None, matching[0]
 
     @staticmethod
@@ -3159,6 +3478,21 @@ class GenericWorkflow:
                 state,
                 "persisted phase evidence lacks one authoritative child transition",
             )
+        if (
+            completed[0].phase_result != completion.result
+            or completed[0].evidence_comment_url != completion.evidence_comment_url
+            or completed[0].responsible_repositories
+            != completion.responsible_repositories
+            or (
+                completion.phase == "repair"
+                and completed[0].failure_bundle_digest
+                != completion.failure_bundle_digest
+            )
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence conflicts with the completed child",
+            )
         candidate_identity = (
             dict(completion.candidate_shas) == dict(state.snapshot.candidate_shas)
             and completion.candidate_shas.get(completion.repository_key)
@@ -3185,6 +3519,11 @@ class GenericWorkflow:
             candidate_shas=completed[0].creation_candidate_shas,
             failure_bundle_digest=(
                 completed[0].failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                completed[0].authorizing_comment_uuid
                 if completion.phase == "repair"
                 else ""
             ),
@@ -3225,6 +3564,11 @@ class GenericWorkflow:
             candidate_shas=action_candidates,
             failure_bundle_digest=(
                 completion.failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                completed[0].authorizing_comment_uuid
                 if completion.phase == "repair"
                 else ""
             ),
@@ -3289,6 +3633,21 @@ class GenericWorkflow:
                 state,
                 "new phase evidence is allowed only for an active pre-merge parent",
             )
+        mismatched_heads = {
+            repository
+            for repository, pull_request in state.snapshot.pull_requests.items()
+            if state.snapshot.candidate_shas.get(repository) != pull_request.head_sha
+        }
+        if mismatched_heads and (
+            completion.phase not in {"implementation", "repair"}
+            or mismatched_heads != {completion.repository_key}
+            or state.snapshot.pull_requests[completion.repository_key].head_sha
+            != completion.candidate_sha
+        ):
+            return self._zero_mutation_block(
+                state,
+                "out-of-band pull-request head change",
+            )
         completion_problem, child = self._completion_problem(state, completion)
         if completion_problem is not None or child is None:
             return self._zero_mutation_block(
@@ -3317,6 +3676,11 @@ class GenericWorkflow:
             candidate_shas=action_candidates,
             failure_bundle_digest=(
                 completion.failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                child.authorizing_comment_uuid
                 if completion.phase == "repair"
                 else ""
             ),
@@ -3853,10 +4217,15 @@ class GenericWorkflow:
         )
         if problem_result is not None:
             return problem_result
+        if not self._candidate_heads_match(state):
+            return self._zero_mutation_block(
+                state,
+                "out-of-band pull-request head change",
+            )
         stage_wait = self._current_stage_wait(state)
         if stage_wait is not None:
             return stage_wait
-        entry_decision = decide_parent_action(self.manifest, state.snapshot)
+        entry_decision = self._parent_decision(state)
         affected = frozenset(state.snapshot.affected_repositories)
         try:
             confirmed = tuple(repository for repository in self.manifest.merge_order if repository in affected)
@@ -4336,7 +4705,7 @@ class GenericWorkflow:
                 state,
                 "new smoke evidence requires the owned smoke execution authority",
             )
-        decision = decide_parent_action(self.manifest, state.snapshot)
+        decision = self._parent_decision(state)
         if decision.kind is not DecisionKind.SMOKE:
             return self._result(
                 state,
@@ -4409,7 +4778,7 @@ class GenericWorkflow:
         )
         if problem_result is not None:
             return problem_result
-        decision = decide_parent_action(self.manifest, state.snapshot)
+        decision = self._parent_decision(state)
         if decision.kind is DecisionKind.BLOCK:
             return self._result(state, "block", decision.reason)
         if decision.kind is not DecisionKind.SMOKE:
@@ -4585,7 +4954,7 @@ class GenericWorkflow:
         scope_problem = self._watch_scope_problem(initial, parent_identifier)
         if scope_problem is not None:
             return self._recovery_noop(parent_identifier, scope_problem)
-        decision = decide_parent_action(self.manifest, initial.snapshot)
+        decision = self._parent_decision(initial)
         if (
             decision.kind is DecisionKind.BLOCK
             and self._is_all_merged(initial.snapshot)
@@ -4669,7 +5038,7 @@ class GenericWorkflow:
             fresh != initial
             or fresh.human_wait
             or fresh.active_work
-            or decide_parent_action(self.manifest, fresh.snapshot) != decision
+            or self._parent_decision(fresh) != decision
         ):
             return self._result(fresh, "noop", "workflow changed before recovery")
         assert fresh.metadata is not None
