@@ -69,16 +69,24 @@ class DoctorUpgradeTests(unittest.TestCase):
         return control
 
     @staticmethod
-    def _version_one_lock() -> str:
+    def _initialized_lock(release: str, workflow_metadata_version: int) -> str:
         return (
-            LOCK_TEXT.replace("skill_version: ''", "skill_version: 0.1.0")
-            .replace("engine_version: ''", "engine_version: 0.1.0")
+            LOCK_TEXT.replace("skill_version: ''", f"skill_version: {release}")
+            .replace("engine_version: ''", f"engine_version: {release}")
+            .replace(
+                "workflow_metadata_version: 1",
+                f"workflow_metadata_version: {workflow_metadata_version}",
+            )
             .replace(
                 "supported_multica_cli: ''",
                 "supported_multica_cli: '>=0.4,<0.5'",
             )
             .replace("manifest_digest: ''", "manifest_digest: legacy")
         )
+
+    @classmethod
+    def _version_one_lock(cls) -> str:
+        return cls._initialized_lock("0.1.0", 1)
 
     def test_doctor_uses_only_read_only_diagnostics(self):
         validator = RecordingValidator()
@@ -134,7 +142,6 @@ class DoctorUpgradeTests(unittest.TestCase):
                         "version_reader": None,
                         "platform_name": None,
                         "python_version": None,
-                        "workflow_metadata_versions": frozenset({1, 2}),
                     }
                 ],
             )
@@ -168,6 +175,45 @@ class DoctorUpgradeTests(unittest.TestCase):
             (control / "framework.lock").write_bytes(executor.serialize(migrated))
             current = service.create(control, EpochClock(1787836801))
             self.assertEqual(current.body.actions, ())
+
+    def test_upgrade_accepts_only_exact_release_and_workflow_metadata_pairs(self):
+        cases = (
+            ("0.1.0", 1, 1),
+            ("0.2.0", 2, 0),
+            ("0.1.0", 2, None),
+            ("0.2.0", 1, None),
+        )
+        for release, workflow_metadata_version, action_count in cases:
+            with (
+                self.subTest(
+                    release=release,
+                    workflow_metadata_version=workflow_metadata_version,
+                ),
+                TemporaryDirectory() as directory,
+            ):
+                root = Path(directory).resolve()
+                control = self._control(
+                    root,
+                    self._initialized_lock(release, workflow_metadata_version),
+                )
+                service = UpgradeService(validator=RecordingValidator())
+
+                if action_count is not None:
+                    plan = service.create(control, EpochClock(1787836800))
+                    self.assertEqual(len(plan.body.actions), action_count)
+                    continue
+
+                with self.assertRaises(CliError) as caught:
+                    service.create(control, EpochClock(1787836800))
+                self.assertEqual(
+                    caught.exception.code,
+                    "upgrade.incompatible_release_metadata",
+                )
+                self.assertEqual(caught.exception.exit_code, ExitCode.VALIDATION)
+                self.assertIn(
+                    "release and workflow metadata",
+                    caught.exception.safe_message,
+                )
 
     def test_upgrade_rejects_unknown_and_skipped_versions(self):
         versions = ("0.0.0", "0.0.1", "9.0.0")

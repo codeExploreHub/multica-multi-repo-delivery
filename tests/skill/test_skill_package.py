@@ -38,7 +38,7 @@ class SkillPackageTests(unittest.TestCase):
             "name": "multica-multi-repo-delivery",
             "description": DESCRIPTION,
         })
-        self.assertLessEqual(len(body.split()), 500)
+        self.assertLess(len(body.split()), 500)
         self.assertIn("multica-delivery --version", body)
         self.assertIn("Version `0.2.0`", body)
         self.assertIn("every current Gate Stage child", body)
@@ -49,6 +49,12 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("active version-1", body.lower())
         self.assertIn("explicit migration", body)
         self.assertIn("complete 64-character hash", body)
+        self.assertIn("Exactly two repair rounds are automatic", body)
+        self.assertIn("Round 3 requires a member-authored authorization", body)
+        self.assertIn("exact current FailureBundle and digest", body)
+        self.assertIn("exactly the next round", body)
+        self.assertIn("consumed once", body)
+        self.assertIn("different bundle or later round", body)
         self.assertNotRegex(body, r"\b(TODO|FIXME|PLACEHOLDER)\b")
 
         interface = yaml.safe_load((SKILL / "agents" / "openai.yaml").read_text())

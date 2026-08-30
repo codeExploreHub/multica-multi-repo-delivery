@@ -773,6 +773,12 @@ class ProvisionerTests(unittest.TestCase):
         self.assertIn("canonical FailureBundle producer", lead)
         self.assertIn("without reconstruction", lead)
         self.assertIn("sole Stage and child execution actor", lead)
+        self.assertIn("Exactly two repair rounds are automatic", lead)
+        self.assertIn("Round 3 requires a member-authored authorization", lead)
+        self.assertIn("exact current FailureBundle and digest", lead)
+        self.assertIn("exactly the next round", lead)
+        self.assertIn("consumed once", lead)
+        self.assertIn("different bundle or later round", lead)
 
         for role in ("independent-reviewer", "integration-qa"):
             with self.subTest(role=role):

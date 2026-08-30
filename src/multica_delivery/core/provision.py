@@ -468,6 +468,10 @@ class Provisioner:
                     "FailureBundle producer, and decision authority. Validate its canonical "
                     "output and use the exact returned FailureBundle and digest without "
                     "reconstruction. Delivery Lead is the sole Stage and child execution actor."
+                    " Exactly two repair rounds are automatic. Round 3 requires a member-authored "
+                    "authorization bound to the exact current FailureBundle and digest. It "
+                    "authorizes exactly the next round, is consumed once, and cannot authorize "
+                    "a different bundle or later round."
                 ),
                 bindings["delivery-lead"],
                 environment["delivery-lead"],

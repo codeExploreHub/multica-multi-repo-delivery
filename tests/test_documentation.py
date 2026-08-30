@@ -95,6 +95,12 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("current active implementation or repair child", template)
         self.assertIn("every assigned failure-partition reference", template)
         self.assertIn("Watcher cannot create a FailureBundle or dispatch repair", template)
+        self.assertIn("Exactly two repair rounds are automatic", template)
+        self.assertIn("Round 3 requires a member-authored authorization", template)
+        self.assertIn("exact current FailureBundle and digest", template)
+        self.assertIn("exactly the next round", template)
+        self.assertIn("consumed once", template)
+        self.assertIn("different bundle or later round", template)
 
 
 if __name__ == "__main__":

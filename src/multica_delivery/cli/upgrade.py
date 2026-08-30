@@ -28,7 +28,7 @@ from .plan import (
     action_reason,
     lock_digest,
 )
-from .validation import ValidationReport, validate_control_directory
+from .validation import ValidationReport, validate_upgrade_control_directory
 
 
 _MIGRATION_EDGES = (
@@ -91,6 +91,18 @@ def _migration_actions(source: str) -> tuple[PlanAction, ...]:
     )
 
 
+def _validate_release_metadata_pair(source: str, workflow_metadata_version: int) -> None:
+    if (source, workflow_metadata_version) not in {
+        ("0.1.0", 1),
+        (__version__, WORKFLOW_METADATA_VERSION),
+    }:
+        raise CliError(
+            "upgrade.incompatible_release_metadata",
+            "Framework release and workflow metadata versions are an unsupported pair",
+            ExitCode.VALIDATION,
+        )
+
+
 def _upgrade_fingerprint(
     instance_key: str,
     manifest_value: str,
@@ -114,7 +126,7 @@ class UpgradeService:
     def __init__(
         self,
         *,
-        validator: Callable[..., ValidationReport] = validate_control_directory,
+        validator: Callable[..., ValidationReport] = validate_upgrade_control_directory,
         version_reader: object | None = None,
         platform_name: str | None = None,
         python_version: tuple[int, int] | None = None,
@@ -131,7 +143,6 @@ class UpgradeService:
             version_reader=self.version_reader,
             platform_name=self.platform_name,
             python_version=self.python_version,
-            workflow_metadata_versions=frozenset({1, WORKFLOW_METADATA_VERSION}),
         )
         if not report.valid:
             raise CliError(
@@ -153,6 +164,7 @@ class UpgradeService:
             ) from None
         source = _framework_version(lock)
         actions = _migration_actions(source)
+        _validate_release_metadata_pair(source, lock.workflow_metadata_version)
         manifest_value = manifest_digest(manifest)
         lock_value = lock_digest(lock)
         return PlanObservation(
@@ -212,6 +224,7 @@ class MigrationExecutor:
             ) from None
         source = _framework_version(lock)
         expected = _migration_actions(source)
+        _validate_release_metadata_pair(source, lock.workflow_metadata_version)
         if body.actions != expected or body.lock_digest != lock_digest(lock):
             raise CliError(
                 "upgrade.plan_drift",
