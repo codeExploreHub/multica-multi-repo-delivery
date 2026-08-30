@@ -43,6 +43,8 @@ from multica_delivery.adapters.processes import (
 )
 from multica_delivery.core.workflow import (
     ChildRequest,
+    FailureBundle,
+    FailureEvidenceRef,
     GenericWorkflow,
     OwnedSmokeExecutor,
     PhaseCompletion,
@@ -52,6 +54,7 @@ from multica_delivery.core.workflow import (
     WorkflowChild,
     WorkflowError,
     WorkflowState,
+    _phase_completion_schema_problem,
     coordinator_action_key,
 )
 
@@ -91,6 +94,8 @@ def completion_for(
     parent: str = "PRO-101",
     suite_key: str = "",
     candidate_shas: dict[str, str] | None = None,
+    responsible_repositories: tuple[str, ...] | None = None,
+    failure_bundle_digest: str = "",
 ) -> PhaseCompletion:
     comment_uuid = evidence_uuid(
         f"{parent}-{repository}-{phase}-{result}-{attempt}-{sha or SHA.get(repository, 'suite')}"
@@ -104,6 +109,12 @@ def completion_for(
             "web": "sample-commerce-web",
         }[repository]
         pull_request_url = f"https://github.com/codeExploreHub/{slug}/pull/{number}"
+    if responsible_repositories is None:
+        responsible_repositories = (
+            (repository,)
+            if phase in {"review", "qa"} and result != "pass"
+            else (("api", "web") if phase == "integration_qa" and result != "pass" else ())
+        )
     return PhaseCompletion(
         parent_identifier=parent,
         repository_key=repository,
@@ -116,6 +127,8 @@ def completion_for(
         evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
         suite_key=suite_key,
         candidate_shas=candidate_shas or {},
+        responsible_repositories=responsible_repositories,
+        failure_bundle_digest=failure_bundle_digest,
     )
 
 
@@ -477,6 +490,14 @@ class FakeWorkflowStore:
                     action_key=action_key,
                     active=True,
                     creation_candidate_shas=request.candidate_shas,
+                    failure_bundle_digest=(
+                        request.failure_bundle.digest
+                        if request.failure_bundle is not None
+                        else ""
+                    ),
+                    failure_evidence_uuids=tuple(
+                        failure.evidence_comment_uuid for failure in request.failure_refs
+                    ),
                 )
             )
             if request.phase in {"implementation", "repair"}:
@@ -577,6 +598,9 @@ class FakeWorkflowStore:
             status="done",
             active=False,
             evidence_comment_uuid=completion.evidence_comment_uuid,
+            phase_result=completion.result,
+            evidence_comment_url=completion.evidence_comment_url,
+            responsible_repositories=completion.responsible_repositories,
         )
 
         implementation = dict(snapshot.children)
@@ -1077,6 +1101,168 @@ class MutableClosedCommandBackend:
         if self.command_hook is not None:
             self.command_hook(argv, cwd)
         return ClosedCommandResult(1 if argv in self.fail_argv else 0, "", "")
+
+
+class WorkflowValueValidationTests(unittest.TestCase):
+    def failure_ref(
+        self,
+        child: str,
+        repository: str,
+        *,
+        phase: str,
+        comment_digit: str,
+    ) -> FailureEvidenceRef:
+        comment_uuid = f"123e4567-e89b-42d3-a456-42661417400{comment_digit}"
+        return FailureEvidenceRef(
+            child_identifier=child,
+            phase=phase,
+            result="fail",
+            stage_ordinal=7,
+            repair_round=2,
+            candidate_shas=SHA,
+            responsible_repositories=(repository,),
+            evidence_comment_uuid=comment_uuid,
+            evidence_comment_url=f"https://multica.example/comments/{comment_uuid}",
+        )
+
+    def test_failure_bundle_is_canonical_and_order_independent(self):
+        review = self.failure_ref("PRO-201", "api", phase="review", comment_digit="1")
+        qa = self.failure_ref("PRO-202", "api", phase="qa", comment_digit="2")
+        first = FailureBundle.build("PRO-200", 2, 7, 3, SHA, (review, qa))
+        second = FailureBundle.build("PRO-200", 2, 7, 3, SHA, (qa, review))
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first.digest,
+            "63ea21a99267330975b0f7a185c8bcb9e3fa8752456ed70b0a0a3c34185a47bf",
+        )
+        self.assertEqual(first.for_repository("api"), (review, qa))
+        self.assertEqual(
+            review.to_canonical_dict(),
+            {
+                "candidate_shas": SHA,
+                "child_identifier": "PRO-201",
+                "evidence_comment_url": "https://multica.example/comments/123e4567-e89b-42d3-a456-426614174001",
+                "evidence_comment_uuid": "123e4567-e89b-42d3-a456-426614174001",
+                "phase": "review",
+                "repair_round": 2,
+                "responsible_repositories": ["api"],
+                "result": "fail",
+                "stage_ordinal": 7,
+                "suite_key": "",
+            },
+        )
+
+    def test_failure_evidence_rejects_malformed_frozen_values(self):
+        reference = self.failure_ref("PRO-201", "api", phase="review", comment_digit="1")
+        malformed = {
+            "child identifier type": {"child_identifier": 201},
+            "gate phase": {"phase": "implementation"},
+            "nonpassing result": {"result": "pass"},
+            "stage ordinal": {"stage_ordinal": True},
+            "repair round": {"repair_round": -1},
+            "candidate map": {"candidate_shas": [("api", SHA["api"])]},
+            "duplicate owner": {"responsible_repositories": ("api", "api")},
+            "UUID": {"evidence_comment_uuid": "123E4567-e89b-42d3-a456-426614174001"},
+            "URL": {"evidence_comment_url": "http://multica.example/comments/1"},
+        }
+
+        for name, changes in malformed.items():
+            with self.subTest(name=name):
+                with self.assertRaises(WorkflowError):
+                    replace(reference, **changes)
+
+    def test_failure_bundle_rejects_forged_digest(self):
+        failure = self.failure_ref("PRO-201", "api", phase="review", comment_digit="1")
+        bundle = FailureBundle.build("PRO-200", 2, 7, 3, SHA, (failure,))
+
+        with self.assertRaises(WorkflowError):
+            replace(bundle, digest="f" * 64)
+
+    def test_repair_request_requires_its_complete_nonempty_failure_partition(self):
+        failure = self.failure_ref("PRO-201", "api", phase="review", comment_digit="1")
+        bundle = FailureBundle.build("PRO-200", 2, 7, 3, SHA, (failure,))
+        target = PullRequestTarget(
+            "api", 12, "https://github.com/codeExploreHub/sample-commerce-api/pull/12"
+        )
+        request = ChildRequest(
+            "api", "api", "", "repair", 8, 3, SHA, target,
+            failure_bundle=bundle,
+            failure_refs=bundle.for_repository("api"),
+        )
+
+        self.assertEqual(request.failure_refs, (failure,))
+        for field, value in (("failure_bundle", None), ("failure_refs", ())):
+            with self.subTest(field=field):
+                with self.assertRaises(WorkflowError):
+                    replace(request, **{field: value})
+        with self.assertRaises(WorkflowError):
+            replace(request, failure_refs=(replace(failure, responsible_repositories=("web",)),))
+        with self.assertRaises(WorkflowError):
+            ChildRequest("api", "api", "", "implementation", 8, 0, SHA, failure_bundle=bundle)
+
+
+class WorkflowCompletionSchemaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = load_manifest(FIXTURE)
+
+    def test_nonpassing_gate_requires_in_scope_responsible_repository(self):
+        completion = completion_for(
+            "api", phase="review", result="fail", responsible_repositories=()
+        )
+        self.assertEqual(
+            _phase_completion_schema_problem(completion, manifest=self.manifest),
+            "non-PASS gate completion requires responsible repositories",
+        )
+
+    def test_pass_gate_forbids_responsible_repositories(self):
+        completion = completion_for(
+            "api", phase="qa", result="pass", responsible_repositories=("api",)
+        )
+        self.assertEqual(
+            _phase_completion_schema_problem(completion, manifest=self.manifest),
+            "PASS gate completion cannot name responsible repositories",
+        )
+
+    def test_integration_gate_ownership_is_a_nonempty_manifest_suite_subset(self):
+        for owners in (("api",), ("api", "web")):
+            with self.subTest(owners=owners):
+                completion = completion_for(
+                    "web",
+                    phase="integration_qa",
+                    result="fail",
+                    suite_key="web-api",
+                    candidate_shas=dict(SHA),
+                    responsible_repositories=owners,
+                )
+                self.assertIsNone(
+                    _phase_completion_schema_problem(completion, manifest=self.manifest)
+                )
+        rejected = completion_for(
+            "web",
+            phase="integration_qa",
+            result="fail",
+            suite_key="web-api",
+            candidate_shas=dict(SHA),
+            responsible_repositories=("notifications",),
+        )
+        self.assertEqual(
+            _phase_completion_schema_problem(rejected, manifest=self.manifest),
+            "integration QA completion responsible repositories are outside its suite",
+        )
+
+    def test_repair_completion_requires_only_a_valid_failure_bundle_digest(self):
+        digest = "e" * 64
+        repair = completion_for(
+            "api", phase="repair", attempt=1, failure_bundle_digest=digest
+        )
+        non_repair = completion_for("api", failure_bundle_digest=digest)
+
+        self.assertIsNone(_phase_completion_schema_problem(repair, manifest=self.manifest))
+        self.assertEqual(
+            _phase_completion_schema_problem(non_repair, manifest=self.manifest),
+            "non-repair completion cannot contain a failure bundle digest",
+        )
 
 
 class GenericWorkflowTests(unittest.TestCase):

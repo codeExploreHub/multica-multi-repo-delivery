@@ -42,6 +42,7 @@ from .topology import TopologyError, merge_order
 
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _STABLE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
 _ISSUE_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9]*-[1-9][0-9]*\Z")
 _SMOKE_OBSERVATION_ID = re.compile(r"smoke:[0-9a-f]{64}\Z")
@@ -88,6 +89,10 @@ def _valid_sha(value: object) -> bool:
     return type(value) is str and _SHA.fullmatch(value) is not None
 
 
+def _valid_digest(value: object) -> bool:
+    return type(value) is str and _DIGEST.fullmatch(value) is not None
+
+
 def _exact_stable(value: object, *, empty: bool = False) -> bool:
     return type(value) is str and (
         (empty and value == "")
@@ -116,12 +121,51 @@ def _exact_mapping(
     )
 
 
+def _frozen_candidate_shas(value: object, field_name: str) -> Mapping[str, str]:
+    if not isinstance(value, Mapping):
+        raise WorkflowError(f"{field_name} is malformed")
+    candidates = dict(value)
+    if not candidates or any(
+        not _exact_stable(repository) or not _valid_sha(candidate_sha)
+        for repository, candidate_sha in candidates.items()
+    ):
+        raise WorkflowError(f"{field_name} is malformed")
+    return MappingProxyType(dict(sorted(candidates.items())))
+
+
+def _exact_repository_tuple(value: object, field_name: str, *, nonempty: bool = False) -> tuple[str, ...]:
+    if (
+        type(value) is not tuple
+        or (nonempty and not value)
+        or any(not _exact_stable(repository) for repository in value)
+        or len(set(value)) != len(value)
+    ):
+        raise WorkflowError(f"{field_name} is malformed")
+    return tuple(sorted(value))
+
+
+def _https_evidence_url(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.netloc)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and bool(parsed.path)
+    )
+
+
 def _phase_completion_schema_problem(
     completion: object,
     *,
-    max_attempt: int,
+    manifest: DeliveryManifest,
 ) -> str | None:
     try:
+        max_attempt = manifest.policy.max_repair_attempts
         if type(completion) is not PhaseCompletion:
             return "phase completion is malformed"
         if (
@@ -138,6 +182,11 @@ def _phase_completion_schema_problem(
             or not _canonical_uuid(completion.evidence_comment_uuid)
             or not _exact_stable(completion.suite_key, empty=True)
             or not _exact_mapping(completion.candidate_shas, _valid_sha)
+            or type(completion.responsible_repositories) is not tuple
+            or any(not _exact_stable(repository) for repository in completion.responsible_repositories)
+            or len(set(completion.responsible_repositories)) != len(completion.responsible_repositories)
+            or type(completion.failure_bundle_digest) is not str
+            or (completion.failure_bundle_digest and not _valid_digest(completion.failure_bundle_digest))
         ):
             return "phase completion is malformed"
 
@@ -183,6 +232,33 @@ def _phase_completion_schema_problem(
                 return "phase completion integration identity is malformed"
         elif completion.suite_key or completion.candidate_shas:
             return "phase completion repository identity is malformed"
+
+        gate_phase = completion.phase in {"review", "qa", "integration_qa"}
+        if completion.result == "pass" and gate_phase and completion.responsible_repositories:
+            return "PASS gate completion cannot name responsible repositories"
+        if completion.result != "pass" and gate_phase and not completion.responsible_repositories:
+            return "non-PASS gate completion requires responsible repositories"
+        if completion.phase in {"review", "qa"} and (
+            completion.responsible_repositories
+            and completion.responsible_repositories != (completion.repository_key,)
+        ):
+            return "repository gate completion can only name its repository"
+        if completion.phase == "integration_qa" and completion.responsible_repositories:
+            suite = next(
+                (item for item in manifest.integration_suites if item.key == completion.suite_key),
+                None,
+            )
+            if suite is None:
+                return "phase completion integration identity is malformed"
+            if not set(completion.responsible_repositories) <= set(suite.repositories):
+                return "integration QA completion responsible repositories are outside its suite"
+        if completion.phase in {"implementation", "repair"} and completion.responsible_repositories:
+            return "implementation and repair completions cannot name responsible repositories"
+        if completion.phase == "repair":
+            if not _valid_digest(completion.failure_bundle_digest):
+                return "repair completion requires a failure bundle digest"
+        elif completion.failure_bundle_digest:
+            return "non-repair completion cannot contain a failure bundle digest"
     except BaseException:
         return "phase completion is malformed"
     return None
@@ -234,6 +310,193 @@ class PullRequestTarget:
 
 
 @dataclass(frozen=True)
+class FailureEvidenceRef:
+    child_identifier: str
+    phase: str
+    result: str
+    stage_ordinal: int
+    repair_round: int
+    candidate_shas: Mapping[str, str]
+    responsible_repositories: tuple[str, ...]
+    evidence_comment_uuid: str
+    evidence_comment_url: str
+    suite_key: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.child_identifier) is not str
+            or _ISSUE_IDENTIFIER.fullmatch(self.child_identifier) is None
+            or type(self.phase) is not str
+            or self.phase not in {"review", "qa", "integration_qa"}
+            or type(self.result) is not str
+            or self.result not in _PHASE_RESULTS - {"pass"}
+            or type(self.stage_ordinal) is not int
+            or self.stage_ordinal < 0
+            or type(self.repair_round) is not int
+            or self.repair_round < 0
+            or not _canonical_uuid(self.evidence_comment_uuid)
+            or not _https_evidence_url(self.evidence_comment_url)
+            or not _exact_stable(self.suite_key, empty=True)
+            or (self.phase == "integration_qa") != bool(self.suite_key)
+        ):
+            raise WorkflowError("failure evidence is malformed")
+        candidates = _frozen_candidate_shas(self.candidate_shas, "failure candidate SHA map")
+        owners = _exact_repository_tuple(
+            self.responsible_repositories,
+            "failure responsible repositories",
+            nonempty=True,
+        )
+        object.__setattr__(self, "candidate_shas", candidates)
+        object.__setattr__(self, "responsible_repositories", owners)
+
+    def to_canonical_dict(self):
+        return {
+            "candidate_shas": dict(self.candidate_shas),
+            "child_identifier": self.child_identifier,
+            "evidence_comment_url": self.evidence_comment_url,
+            "evidence_comment_uuid": self.evidence_comment_uuid,
+            "phase": self.phase,
+            "repair_round": self.repair_round,
+            "responsible_repositories": list(self.responsible_repositories),
+            "result": self.result,
+            "stage_ordinal": self.stage_ordinal,
+            "suite_key": self.suite_key,
+        }
+
+
+def _ordered_failures(failures: tuple[FailureEvidenceRef, ...]) -> tuple[FailureEvidenceRef, ...]:
+    return tuple(sorted(
+        failures,
+        key=lambda item: (
+            item.responsible_repositories,
+            item.phase,
+            item.suite_key,
+            item.child_identifier,
+            item.evidence_comment_uuid,
+        ),
+    ))
+
+
+def _failure_bundle_digest(
+    parent_identifier: str,
+    workflow_version: int,
+    source_stage_ordinal: int,
+    repair_round: int,
+    candidate_shas: Mapping[str, str],
+    failures: tuple[FailureEvidenceRef, ...],
+) -> str:
+    payload = {
+        "candidate_shas": dict(sorted(candidate_shas.items())),
+        "failures": [failure.to_canonical_dict() for failure in failures],
+        "parent_identifier": parent_identifier,
+        "repair_round": repair_round,
+        "source_stage_ordinal": source_stage_ordinal,
+        "workflow_version": workflow_version,
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class FailureBundle:
+    parent_identifier: str
+    workflow_version: int
+    source_stage_ordinal: int
+    repair_round: int
+    candidate_shas: Mapping[str, str]
+    failures: tuple[FailureEvidenceRef, ...]
+    digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.parent_identifier) is not str
+            or _ISSUE_IDENTIFIER.fullmatch(self.parent_identifier) is None
+            or type(self.workflow_version) is not int
+            or self.workflow_version != 2
+            or type(self.source_stage_ordinal) is not int
+            or self.source_stage_ordinal < 0
+            or type(self.repair_round) is not int
+            or self.repair_round < 1
+            or type(self.failures) is not tuple
+            or not self.failures
+            or any(type(failure) is not FailureEvidenceRef for failure in self.failures)
+        ):
+            raise WorkflowError("failure bundle is malformed")
+        candidates = _frozen_candidate_shas(self.candidate_shas, "failure bundle candidate SHA map")
+        failures = _ordered_failures(self.failures)
+        if (
+            len({failure.evidence_comment_uuid for failure in failures}) != len(failures)
+            or any(
+                failure.stage_ordinal != self.source_stage_ordinal
+                or failure.repair_round != self.repair_round - 1
+                or dict(failure.candidate_shas) != dict(candidates)
+                for failure in failures
+            )
+        ):
+            raise WorkflowError("failure bundle evidence is malformed")
+        digest = _failure_bundle_digest(
+            self.parent_identifier,
+            self.workflow_version,
+            self.source_stage_ordinal,
+            self.repair_round,
+            candidates,
+            failures,
+        )
+        if not _valid_digest(self.digest) or self.digest != digest:
+            raise WorkflowError("failure bundle digest is malformed")
+        object.__setattr__(self, "candidate_shas", candidates)
+        object.__setattr__(self, "failures", failures)
+
+    @classmethod
+    def build(
+        cls,
+        parent_identifier,
+        workflow_version,
+        source_stage_ordinal,
+        repair_round,
+        candidate_shas,
+        failures,
+    ):
+        if type(failures) is not tuple or any(
+            type(failure) is not FailureEvidenceRef for failure in failures
+        ):
+            raise WorkflowError("failure bundle failures are malformed")
+        ordered = _ordered_failures(failures)
+        candidates = _frozen_candidate_shas(candidate_shas, "failure bundle candidate SHA map")
+        digest = _failure_bundle_digest(
+            parent_identifier,
+            workflow_version,
+            source_stage_ordinal,
+            repair_round,
+            candidates,
+            ordered,
+        )
+        return cls(
+            parent_identifier,
+            workflow_version,
+            source_stage_ordinal,
+            repair_round,
+            candidates,
+            ordered,
+            digest,
+        )
+
+    def for_repository(self, repository_key):
+        return tuple(sorted(
+            (
+                failure
+                for failure in self.failures
+                if repository_key in failure.responsible_repositories
+            ),
+            key=lambda failure: (
+                {"review": 0, "qa": 1, "integration_qa": 2}[failure.phase],
+                failure.suite_key,
+                failure.child_identifier,
+                failure.evidence_comment_uuid,
+            ),
+        ))
+
+
+@dataclass(frozen=True)
 class WorkflowChild:
     identifier: str
     target_key: str
@@ -247,6 +510,11 @@ class WorkflowChild:
     active: bool
     evidence_comment_uuid: str = ""
     creation_candidate_shas: Mapping[str, str] = field(default_factory=dict)
+    phase_result: str = ""
+    evidence_comment_url: str = ""
+    responsible_repositories: tuple[str, ...] = ()
+    failure_bundle_digest: str = ""
+    failure_evidence_uuids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _stable(self.identifier, "child identifier")
@@ -282,6 +550,26 @@ class WorkflowChild:
             "creation_candidate_shas",
             MappingProxyType(dict(sorted(candidates.items()))),
         )
+        if (
+            type(self.phase_result) is not str
+            or self.phase_result not in _PHASE_RESULTS | {""}
+            or (self.evidence_comment_url and not _https_evidence_url(self.evidence_comment_url))
+            or (self.failure_bundle_digest and not _valid_digest(self.failure_bundle_digest))
+            or type(self.failure_evidence_uuids) is not tuple
+            or any(not _canonical_uuid(item) for item in self.failure_evidence_uuids)
+            or len(set(self.failure_evidence_uuids)) != len(self.failure_evidence_uuids)
+        ):
+            raise WorkflowError("child failure evidence is malformed")
+        owners = _exact_repository_tuple(
+            self.responsible_repositories,
+            "child responsible repositories",
+        )
+        object.__setattr__(self, "responsible_repositories", owners)
+        object.__setattr__(
+            self,
+            "failure_evidence_uuids",
+            tuple(sorted(self.failure_evidence_uuids)),
+        )
 
 
 @dataclass(frozen=True)
@@ -294,6 +582,8 @@ class ChildRequest:
     attempt: int
     candidate_shas: Mapping[str, str]
     pull_request: PullRequestTarget | None = None
+    failure_bundle: FailureBundle | None = None
+    failure_refs: tuple[FailureEvidenceRef, ...] = ()
 
     def __post_init__(self) -> None:
         _stable(self.target_key, "child target")
@@ -310,6 +600,25 @@ class ChildRequest:
         object.__setattr__(self, "candidate_shas", MappingProxyType(dict(sorted(candidates.items()))))
         if self.phase == "repair" and self.pull_request is None:
             raise WorkflowError("repair must target an existing pull request")
+        if self.phase != "repair":
+            if self.failure_bundle is not None or self.failure_refs:
+                raise WorkflowError("only repair requests can contain failure evidence")
+            return
+        if (
+            type(self.failure_bundle) is not FailureBundle
+            or type(self.failure_refs) is not tuple
+            or not self.failure_refs
+            or any(type(failure) is not FailureEvidenceRef for failure in self.failure_refs)
+        ):
+            raise WorkflowError("repair requires a complete failure bundle partition")
+        expected = self.failure_bundle.for_repository(self.repository_key)
+        if (
+            self.failure_refs != expected
+            or dict(self.candidate_shas) != dict(self.failure_bundle.candidate_shas)
+            or self.stage_ordinal != self.failure_bundle.source_stage_ordinal + 1
+            or self.attempt != self.failure_bundle.repair_round
+        ):
+            raise WorkflowError("repair failure bundle partition is malformed")
 
 
 @dataclass(frozen=True)
@@ -325,10 +634,20 @@ class PhaseCompletion:
     evidence_comment_url: str
     suite_key: str = ""
     candidate_shas: Mapping[str, str] = field(default_factory=dict)
+    responsible_repositories: tuple[str, ...] = ()
+    failure_bundle_digest: str = ""
 
     def __post_init__(self) -> None:
         candidates = dict(self.candidate_shas)
         object.__setattr__(self, "candidate_shas", MappingProxyType(dict(sorted(candidates.items()))))
+        object.__setattr__(
+            self,
+            "responsible_repositories",
+            _exact_repository_tuple(
+                self.responsible_repositories,
+                "phase completion responsible repositories",
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -2331,7 +2650,7 @@ class GenericWorkflow:
     ) -> tuple[str | None, WorkflowChild | None]:
         schema_problem = _phase_completion_schema_problem(
             completion,
-            max_attempt=self.manifest.policy.max_repair_attempts,
+            manifest=self.manifest,
         )
         if schema_problem is not None:
             return schema_problem, None
@@ -2435,6 +2754,11 @@ class GenericWorkflow:
         )
         if len(matching) != 1:
             return "phase completion does not resolve one active authoritative current-stage child", None
+        if (
+            completion.phase == "repair"
+            and matching[0].failure_bundle_digest != completion.failure_bundle_digest
+        ):
+            return "repair completion failure bundle digest does not match assigned child", None
         return None, matching[0]
 
     @staticmethod
@@ -2491,7 +2815,7 @@ class GenericWorkflow:
         if (
             _phase_completion_schema_problem(
                 persisted,
-                max_attempt=self.manifest.policy.max_repair_attempts,
+                manifest=self.manifest,
             )
             is not None
             or persisted != completion
@@ -2615,7 +2939,7 @@ class GenericWorkflow:
             pass
         completion_schema_problem = _phase_completion_schema_problem(
             completion,
-            max_attempt=self.manifest.policy.max_repair_attempts,
+            manifest=self.manifest,
         )
         if completion_schema_problem is not None:
             return WorkflowResult(
