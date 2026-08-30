@@ -39,7 +39,7 @@ from ..adapters.redaction import (
 
 SKILL_VERSION = __version__
 ENGINE_VERSION = __version__
-WORKFLOW_METADATA_VERSION = 1
+WORKFLOW_METADATA_VERSION = 2
 SUPPORTED_MULTICA_CLI = ">=0.4,<0.5"
 WORKTREE_CAPABILITY = "local-worktree-v1"
 

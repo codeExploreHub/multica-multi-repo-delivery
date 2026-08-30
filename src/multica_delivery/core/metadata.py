@@ -5,6 +5,7 @@ import json
 import re
 from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
+from urllib.parse import urlparse
 
 
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -15,6 +16,8 @@ _MERGE_STATES = frozenset({"pending", "not_ready", "ready", "merging", "merged",
 _PHASE_KINDS = frozenset({"implementation", "review", "qa", "integration_qa", "merge", "smoke", "repair"})
 _PHASE_RESULTS = frozenset({"pending", "pass", "fail", "blocked"})
 _RECOVERY_ACTIONS = frozenset({"noop", "rerun", "resume_parent", "block"})
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class MetadataError(ValueError):
@@ -108,10 +111,84 @@ def _validate_merge_plan(
             raise MetadataError("merge_plan is inconsistent with repository_dag")
 
 
+def _validate_parent_fields(metadata: object, integer_fields: tuple[str, ...]) -> None:
+    for name in integer_fields:
+        value = getattr(metadata, name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise MetadataError(f"{name} must be a non-negative integer")
+    object.__setattr__(metadata, "instance_key", _key(metadata.instance_key, "instance_key"))
+    object.__setattr__(metadata, "affected_repositories", _keys(metadata.affected_repositories, "affected_repositories"))
+    object.__setattr__(metadata, "repository_dag", _frozen_dag(metadata.repository_dag, metadata.affected_repositories))
+    object.__setattr__(metadata, "candidate_shas", _frozen_mapping(metadata.candidate_shas, "candidate_shas", sha_values=True))
+    object.__setattr__(metadata, "contract_hashes", _frozen_mapping(metadata.contract_hashes, "contract_hashes", sha_values=True))
+    object.__setattr__(metadata, "merge_plan", _keys(metadata.merge_plan, "merge_plan"))
+    affected = set(metadata.affected_repositories)
+    if set(metadata.candidate_shas) - affected:
+        raise MetadataError("candidate_shas must only contain affected repositories")
+    if set(metadata.merge_plan) - affected:
+        raise MetadataError("merge_plan must only contain affected repositories")
+    if metadata.merge_plan:
+        _validate_merge_plan(metadata.merge_plan, metadata.affected_repositories, metadata.repository_dag)
+        if set(metadata.candidate_shas) != affected:
+            raise MetadataError("candidate_shas must cover every affected repository when merge_plan is present")
+    if metadata.merge_state in {"ready", "merging", "merged"}:
+        if not metadata.merge_plan or set(metadata.candidate_shas) != affected:
+            raise MetadataError("ready, merging, and merged states require a full merge plan and candidate SHA map")
+    object.__setattr__(metadata, "merge_state", _enum(metadata.merge_state, "merge_state", _MERGE_STATES))
+    if not isinstance(metadata.last_action, str) or (
+        metadata.last_action not in _ACTION_KINDS and not _ACTION_KEY.fullmatch(metadata.last_action)
+    ):
+        raise MetadataError("last_action must be an allowed action kind or a kind with a 64-hex digest")
+
+
+@dataclass(frozen=True)
+class RepairAuthorization:
+    comment_uuid: str
+    comment_url: str
+    bundle_digest: str
+    granted_round: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.comment_uuid, str) or not _UUID.fullmatch(self.comment_uuid):
+            raise MetadataError("comment_uuid must be a canonical UUID")
+        if not isinstance(self.comment_url, str):
+            raise MetadataError("comment_url must be an HTTPS URL")
+        parsed = urlparse(self.comment_url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise MetadataError("comment_url must be an HTTPS URL")
+        if not isinstance(self.bundle_digest, str) or not _DIGEST.fullmatch(self.bundle_digest):
+            raise MetadataError("bundle_digest must be a lowercase 64-hex digest")
+        if not isinstance(self.granted_round, int) or isinstance(self.granted_round, bool) or self.granted_round < 0:
+            raise MetadataError("granted_round must be a non-negative integer")
+
+
+@dataclass(frozen=True)
+class LegacyParentMetadataV1:
+    workflow_version: int
+    metadata_version: int
+    instance_key: str
+    affected_repositories: tuple[str, ...]
+    repository_dag: Mapping[str, tuple[str, ...]]
+    candidate_shas: Mapping[str, str]
+    contract_hashes: Mapping[str, str]
+    stage_ordinal: int
+    merge_plan: tuple[str, ...]
+    merge_state: str
+    attempt: int
+    last_action: str
+
+    def __post_init__(self) -> None:
+        _validate_parent_fields(self, ("workflow_version", "metadata_version", "stage_ordinal", "attempt"))
+        if self.workflow_version != 1 or self.metadata_version != 1:
+            raise MetadataError("legacy parent metadata requires workflow and metadata version 1")
+        if self.attempt > 2:
+            raise MetadataError("attempt must be between 0 and 2")
+
+
 @dataclass(frozen=True)
 class ParentMetadata:
-    workflow_version: int = 1
-    metadata_version: int = 1
+    workflow_version: int = 2
+    metadata_version: int = 2
     instance_key: str = "default"
     affected_repositories: tuple[str, ...] = ()
     repository_dag: Mapping[str, tuple[str, ...]] | None = None
@@ -120,41 +197,29 @@ class ParentMetadata:
     stage_ordinal: int = 0
     merge_plan: tuple[str, ...] = ()
     merge_state: str = "pending"
-    attempt: int = 0
+    repair_round: int = 0
+    automatic_repairs_used: int = 0
+    repair_authorization: RepairAuthorization | None = None
     last_action: str = "dispatch"
 
     def __post_init__(self) -> None:
-        for name in ("workflow_version", "metadata_version", "stage_ordinal", "attempt"):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise MetadataError(f"{name} must be a non-negative integer")
-        if not self.workflow_version or not self.metadata_version:
-            raise MetadataError("workflow_version and metadata_version must be positive integers")
-        object.__setattr__(self, "instance_key", _key(self.instance_key, "instance_key"))
-        object.__setattr__(self, "affected_repositories", _keys(self.affected_repositories, "affected_repositories"))
-        object.__setattr__(self, "repository_dag", _frozen_dag(self.repository_dag, self.affected_repositories))
-        object.__setattr__(self, "candidate_shas", _frozen_mapping(self.candidate_shas, "candidate_shas", sha_values=True))
-        object.__setattr__(self, "contract_hashes", _frozen_mapping(self.contract_hashes, "contract_hashes", sha_values=True))
-        object.__setattr__(self, "merge_plan", _keys(self.merge_plan, "merge_plan"))
-        affected = set(self.affected_repositories)
-        if set(self.candidate_shas) - affected:
-            raise MetadataError("candidate_shas must only contain affected repositories")
-        if set(self.merge_plan) - affected:
-            raise MetadataError("merge_plan must only contain affected repositories")
-        if self.merge_plan:
-            _validate_merge_plan(self.merge_plan, self.affected_repositories, self.repository_dag)
-            if set(self.candidate_shas) != affected:
-                raise MetadataError("candidate_shas must cover every affected repository when merge_plan is present")
-        if self.merge_state in {"ready", "merging", "merged"}:
-            if not self.merge_plan or set(self.candidate_shas) != affected:
-                raise MetadataError("ready, merging, and merged states require a full merge plan and candidate SHA map")
-        if self.attempt > 2:
-            raise MetadataError("attempt must be between 0 and 2")
-        object.__setattr__(self, "merge_state", _enum(self.merge_state, "merge_state", _MERGE_STATES))
-        if not isinstance(self.last_action, str) or (
-            self.last_action not in _ACTION_KINDS and not _ACTION_KEY.fullmatch(self.last_action)
-        ):
-            raise MetadataError("last_action must be an allowed action kind or a kind with a 64-hex digest")
+        _validate_parent_fields(
+            self,
+            ("workflow_version", "metadata_version", "stage_ordinal", "repair_round", "automatic_repairs_used"),
+        )
+        if self.workflow_version != 2 or self.metadata_version != 2:
+            raise MetadataError("parent metadata requires workflow and metadata version 2")
+        if self.automatic_repairs_used > 2:
+            raise MetadataError("automatic_repairs_used must be between 0 and 2")
+        if self.automatic_repairs_used > self.repair_round:
+            raise MetadataError("automatic_repairs_used must not exceed repair_round")
+        if self.repair_authorization is not None:
+            if not isinstance(self.repair_authorization, RepairAuthorization):
+                raise MetadataError("repair_authorization must be a RepairAuthorization")
+            if self.automatic_repairs_used != 2:
+                raise MetadataError("repair_authorization requires automatic_repairs_used to equal 2")
+            if self.repair_authorization.granted_round != self.repair_round + 1:
+                raise MetadataError("repair_authorization must grant exactly the next repair round")
 
 
 @dataclass(frozen=True)
@@ -203,7 +268,20 @@ class RecoveryMetadata(ParentMetadata):
         object.__setattr__(self, "recovery_action", _enum(self.recovery_action, "recovery_action", _RECOVERY_ACTIONS))
 
 
-_T = TypeVar("_T", bound=ParentMetadata)
+_T = TypeVar("_T")
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, RepairAuthorization):
+        return {
+            "comment_uuid": value.comment_uuid,
+            "comment_url": value.comment_url,
+            "bundle_digest": value.bundle_digest,
+            "granted_round": value.granted_round,
+        }
+    return value
 
 
 def _encode(metadata: ParentMetadata, metadata_type: type[ParentMetadata]) -> str:
@@ -212,7 +290,7 @@ def _encode(metadata: ParentMetadata, metadata_type: type[ParentMetadata]) -> st
             f"encoder requires exact metadata type {metadata_type.__name__}"
         )
     value = {
-        field_name: dict(field_value) if isinstance(field_value, Mapping) else field_value
+        field_name: _json_value(field_value)
         for field_name, field_value in ((name, getattr(metadata, name)) for name in metadata.__dataclass_fields__)
     }
     return canonical_json(value)
@@ -249,6 +327,11 @@ def _decode(text: str, metadata_type: type[_T]) -> _T:
             repository: tuple(dependencies) if isinstance(dependencies, list) else dependencies
             for repository, dependencies in converted["repository_dag"].items()
         }
+        if "repair_authorization" in converted and converted["repair_authorization"] is not None:
+            authorization = converted["repair_authorization"]
+            if not isinstance(authorization, dict):
+                raise MetadataError("repair_authorization must be an object")
+            converted["repair_authorization"] = RepairAuthorization(**authorization)
         return metadata_type(**converted)
     except (TypeError, MetadataError) as error:
         if isinstance(error, MetadataError):
@@ -260,7 +343,20 @@ def encode_parent_metadata(metadata: ParentMetadata) -> str:
     return _encode(metadata, ParentMetadata)
 
 
-def decode_parent_metadata(text: str) -> ParentMetadata:
+def decode_parent_metadata(text: str) -> LegacyParentMetadataV1 | ParentMetadata:
+    if not isinstance(text, str):
+        raise MetadataError("metadata must be a JSON string")
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise MetadataError(f"invalid JSON metadata: {error.msg}") from error
+    if not isinstance(value, dict):
+        raise MetadataError("metadata must be a JSON object")
+    if (
+        value.get("workflow_version") == 1
+        and value.get("metadata_version") == 1
+    ):
+        return _decode(text, LegacyParentMetadataV1)
     return _decode(text, ParentMetadata)
 
 
