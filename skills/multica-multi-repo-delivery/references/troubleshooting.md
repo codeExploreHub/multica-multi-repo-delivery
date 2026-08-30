@@ -2,7 +2,7 @@
 
 ## Missing or mismatched CLI
 
-Run `multica-delivery --version`; this Skill requires `0.1.0`. If unavailable or different, stop before lifecycle work. Install from an operator-approved local checkout with `pipx install .`, or from the exact approved immutable tag. Do not guess a repository owner or unpinned URL.
+Run `multica-delivery --version`; this Skill requires `0.2.0`. If unavailable or different, stop before lifecycle work. Install from an operator-approved local checkout with `pipx install .`, or from the exact approved immutable tag. Do not guess a repository owner or unpinned URL.
 
 ## Safe responses
 
@@ -13,9 +13,13 @@ Run `multica-delivery --version`; this Skill requires `0.1.0`. If unavailable or
 | Plan expired or is from the future | Create a fresh read-only plan and request new full-hash approval |
 | Manifest, lock, actions, or external fingerprint drifted | Stop; inspect changes and create a new plan |
 | Partial hash or confirmation mismatch | Stop; never expand or autocomplete approval |
+| Completed version-1 parent | Read as immutable history; do not rerun or create a child |
+| Active version-1 parent | Stop mutable work; plan the explicit `0.1.0 -> 0.2.0` migration |
 | External/contract failure | Diagnose credentials/runtime/daemon/repository contracts; do not mutate blindly |
 | Human-block, ambiguity, foreign identity, duplicate, or partial convergence | Preserve state and escalate to the operator; no retry, delete, or rollback |
 
 Use `multica-delivery doctor /absolute/delivery-control` for read-only evidence. Expected CLI failures are sanitized; do not expose raw subprocess output or secrets while investigating.
 
 For supported schema/version changes, run `upgrade`, review its plan, and use the same exact apply authorization. Unknown or skipped migration paths remain human-blocked.
+
+For a version-2 gate block, preserve the complete terminal Gate Stage and Core/plan-parent's exact canonical FailureBundle. Do not reconstruct a bundle, route a verdict directly to an Engineer, or ask the Watcher to dispatch repair.

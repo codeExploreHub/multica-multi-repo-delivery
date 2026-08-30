@@ -123,6 +123,8 @@ class InitValidateTests(unittest.TestCase):
             repository = manifest.repositories["sample-frontend"]
             self.assertEqual(repository.commands["test"], ("npm", "test"))
             self.assertEqual(lock.manifest_schema_version, 1)
+            self.assertEqual(lock.workflow_metadata_version, 2)
+            self.assertEqual((lock.skill_version, lock.engine_version), ("", ""))
             self.assertEqual(lock.resource_ids, {})
             self.assertEqual((target / "env.example").read_text(), "")
 
@@ -325,6 +327,50 @@ values:
             )
             self.assertFalse(failed.valid)
             self.assertIn("tool.gh_missing", [finding.code for finding in failed.findings])
+
+    def test_validation_accepts_current_v2_and_rejects_legacy_v1_outside_upgrade(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            discovery = self._copy_repositories(root, ("frontend",))
+            target = root / "delivery-control"
+            initialize_scaffold(
+                discovery,
+                self._load_confirmation(self._confirmation_document(discovery, target)),
+                target,
+            )
+            tools = VersionReader({"multica": "multica 0.4.33", "gh": "gh version 2.80.0"})
+            lock_path = target / "framework.lock"
+            lock_path.write_text(
+                lock_path.read_text(encoding="utf-8").replace(
+                    "workflow_metadata_version: 1",
+                    "workflow_metadata_version: 2",
+                ),
+                encoding="utf-8",
+            )
+
+            current = validate_control_directory(
+                target,
+                version_reader=tools,
+                platform_name="linux",
+                python_version=(3, 13),
+            )
+
+            self.assertTrue(current.valid)
+            lock_path.write_text(
+                lock_path.read_text(encoding="utf-8").replace(
+                    "workflow_metadata_version: 2",
+                    "workflow_metadata_version: 1",
+                ),
+                encoding="utf-8",
+            )
+            legacy = validate_control_directory(
+                target,
+                version_reader=tools,
+                platform_name="linux",
+                python_version=(3, 13),
+            )
+            self.assertFalse(legacy.valid)
+            self.assertIn("lock.incompatible", {item.code for item in legacy.findings})
 
     def test_validation_rejects_skill_url_query_and_fragment(self):
         for suffix in ("?ref=private", "#fragment"):

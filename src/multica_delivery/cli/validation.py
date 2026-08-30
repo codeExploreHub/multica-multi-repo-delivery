@@ -9,6 +9,7 @@ import sys
 from typing import Protocol
 
 from multica_delivery.core.manifest import ManifestError, load_lock, load_manifest, manifest_digest
+from multica_delivery.core.provision import WORKFLOW_METADATA_VERSION
 
 
 @dataclass(frozen=True, order=True)
@@ -71,6 +72,7 @@ def validate_control_directory(
     version_reader: VersionReader | None = None,
     platform_name: str | None = None,
     python_version: tuple[int, int] | None = None,
+    workflow_metadata_versions: frozenset[int] | None = None,
 ) -> ValidationReport:
     root = Path(path)
     findings: list[ValidationFinding] = []
@@ -110,7 +112,15 @@ def validate_control_directory(
                     ValidationFinding("fail", "path.missing", "A declared local path does not exist")
                 )
     if manifest is not None and lock is not None:
-        if lock.manifest_schema_version != manifest.schema_version or lock.workflow_metadata_version != 1:
+        accepted_workflow_versions = (
+            frozenset({WORKFLOW_METADATA_VERSION})
+            if workflow_metadata_versions is None
+            else workflow_metadata_versions
+        )
+        if (
+            lock.manifest_schema_version != manifest.schema_version
+            or lock.workflow_metadata_version not in accepted_workflow_versions
+        ):
             findings.append(
                 ValidationFinding("fail", "lock.incompatible", "Framework lock versions are incompatible")
             )

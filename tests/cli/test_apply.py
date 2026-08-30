@@ -81,7 +81,7 @@ class ApplyTests(unittest.TestCase):
         values = {
             "schema_version": 1,
             "mode": "onboard",
-            "cli_version": "0.1.0",
+            "cli_version": "0.2.0",
             "instance_key": "sample-commerce",
             "manifest_digest": "a" * 64,
             "lock_digest": "b" * 64,
@@ -143,7 +143,7 @@ class ApplyTests(unittest.TestCase):
             ("future", base, "PLAN_HASH", None, 1787836799, ExitCode.CONFIRMATION),
             (
                 "compatibility",
-                self._body(cli_version="0.2.0"),
+                self._body(cli_version="0.1.0"),
                 "PLAN_HASH",
                 None,
                 1787836800,

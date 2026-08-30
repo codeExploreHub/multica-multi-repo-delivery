@@ -9,7 +9,11 @@ from multica_delivery.cli.apply import ApplyService
 from multica_delivery.cli.doctor import DoctorService
 from multica_delivery.cli.errors import CliError, ExitCode
 from multica_delivery.cli.plan import PlanObservation, PlanStore
-from multica_delivery.cli.upgrade import MigrationExecutor, UpgradeService
+from multica_delivery.cli.upgrade import (
+    _MIGRATION_EDGES,
+    MigrationExecutor,
+    UpgradeService,
+)
 from multica_delivery.cli.commands.doctor import run_doctor
 from multica_delivery.cli.commands.upgrade import run_upgrade
 from multica_delivery.cli.validation import ValidationFinding, ValidationReport
@@ -23,10 +27,12 @@ class RecordingValidator:
     def __init__(self, valid: bool = True) -> None:
         self.valid = valid
         self.calls: list[Path] = []
+        self.keyword_calls: list[dict[str, object]] = []
         self.mutations: list[object] = []
 
     def __call__(self, path: Path, **kwargs) -> ValidationReport:
         self.calls.append(path)
+        self.keyword_calls.append(kwargs)
         severity = "pass" if self.valid else "fail"
         return ValidationReport((ValidationFinding(severity, "local", "local validation"),))
 
@@ -61,6 +67,18 @@ class DoctorUpgradeTests(unittest.TestCase):
         shutil.copyfile(MANIFEST, control / "delivery.yaml")
         (control / "framework.lock").write_text(lock_text)
         return control
+
+    @staticmethod
+    def _version_one_lock() -> str:
+        return (
+            LOCK_TEXT.replace("skill_version: ''", "skill_version: 0.1.0")
+            .replace("engine_version: ''", "engine_version: 0.1.0")
+            .replace(
+                "supported_multica_cli: ''",
+                "supported_multica_cli: '>=0.4,<0.5'",
+            )
+            .replace("manifest_digest: ''", "manifest_digest: legacy")
+        )
 
     def test_doctor_uses_only_read_only_diagnostics(self):
         validator = RecordingValidator()
@@ -97,7 +115,7 @@ class DoctorUpgradeTests(unittest.TestCase):
     def test_upgrade_plans_only_supported_edge_and_current_noop(self):
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            control = self._control(root)
+            control = self._control(root, self._version_one_lock())
             validator = RecordingValidator()
             service = UpgradeService(validator=validator)
 
@@ -108,17 +126,51 @@ class DoctorUpgradeTests(unittest.TestCase):
                 migration.body.actions[0].kind,
                 "framework.version",
             )
-            self.assertEqual(migration.body.actions[0].key, "0.0.0->0.1.0")
+            self.assertEqual(migration.body.actions[0].key, "0.1.0->0.2.0")
+            self.assertEqual(
+                validator.keyword_calls,
+                [
+                    {
+                        "version_reader": None,
+                        "platform_name": None,
+                        "python_version": None,
+                        "workflow_metadata_versions": frozenset({1, 2}),
+                    }
+                ],
+            )
+            self.assertEqual(
+                migration.body.actions[0].changed_fields,
+                (
+                    "skill_version",
+                    "engine_version",
+                    "workflow_metadata_version",
+                    "supported_multica_cli",
+                    "manifest_digest",
+                ),
+            )
             self.assertNotIn("manifest_schema_version", migration.body.actions[0].changed_fields)
+            self.assertEqual({action.kind for action in migration.body.actions}, {"framework.version"})
+            serialized = migration.to_json().lower()
+            for prohibited in (
+                "issue",
+                "pull_request_sha",
+                "merge",
+                "push",
+                "tag",
+                "release",
+                "deploy",
+            ):
+                self.assertNotIn(prohibited, serialized)
 
             executor = MigrationExecutor()
             migrated = executor.apply(migration.body, control / "framework.lock")
+            self.assertEqual(migrated.workflow_metadata_version, 2)
             (control / "framework.lock").write_bytes(executor.serialize(migrated))
             current = service.create(control, EpochClock(1787836801))
             self.assertEqual(current.body.actions, ())
 
     def test_upgrade_rejects_unknown_and_skipped_versions(self):
-        versions = ("0.0.1", "0.2.0", "9.0.0")
+        versions = ("0.0.0", "0.0.1", "9.0.0")
         for version in versions:
             with self.subTest(version=version), TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
@@ -139,7 +191,7 @@ class DoctorUpgradeTests(unittest.TestCase):
     def test_upgrade_apply_uses_common_hash_authorization_and_never_provisioner(self):
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            control = self._control(root)
+            control = self._control(root, self._version_one_lock())
             upgrade = UpgradeService(validator=RecordingValidator())
             plan = upgrade.create(control, EpochClock(1787836800))
             PlanStore().write(control / "plan.json", plan)
@@ -163,10 +215,14 @@ class DoctorUpgradeTests(unittest.TestCase):
             )
 
             lock = load_lock(control / "framework.lock")
-            self.assertEqual((lock.skill_version, lock.engine_version), ("0.1.0", "0.1.0"))
+            self.assertEqual((lock.skill_version, lock.engine_version), ("0.2.0", "0.2.0"))
+            self.assertEqual(lock.workflow_metadata_version, 2)
             self.assertEqual(result.actions, plan.body.actions)
             self.assertEqual(provisioner.calls, [])
             self.assertEqual(secrets.reads, [])
+
+    def test_version_one_to_version_two_is_an_explicit_closed_migration_edge(self):
+        self.assertIn(("0.1.0", "0.2.0"), _MIGRATION_EDGES)
 
     def test_doctor_and_upgrade_commands_return_envelopes(self):
         doctor = DoctorService(RecordingValidator(), RecordingAudit(), RecordingPlanning())
@@ -176,7 +232,7 @@ class DoctorUpgradeTests(unittest.TestCase):
         )
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            control = self._control(root)
+            control = self._control(root, self._version_one_lock())
             upgrade = UpgradeService(validator=RecordingValidator())
             plan_path = control / "plan.json"
             upgrade_envelope = run_upgrade(

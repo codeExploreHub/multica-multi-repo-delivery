@@ -1,4 +1,4 @@
-# Sanitized compatibility fixture derived from Eventra commit f62310731394ec27034645787d87749b1eb95d38.
+# Sanitized compatibility fixture derived from Eventra commit b9a325f43ab387c94ab5a64c46ac2fcf0fa9b35b.
 schema_version: 1
 instance:
   key: eventra

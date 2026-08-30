@@ -13,7 +13,10 @@ import yaml
 from multica_delivery import __version__
 from multica_delivery.core.manifest import ManifestError, load_lock, load_manifest, manifest_digest
 from multica_delivery.core.model import FrameworkLock
-from multica_delivery.core.provision import SUPPORTED_MULTICA_CLI
+from multica_delivery.core.provision import (
+    SUPPORTED_MULTICA_CLI,
+    WORKFLOW_METADATA_VERSION,
+)
 
 from .clock import Clock
 from .errors import CliError, ExitCode
@@ -28,7 +31,10 @@ from .plan import (
 from .validation import ValidationReport, validate_control_directory
 
 
-_MIGRATION_EDGES = (("0.0.0", "0.1.0"),)
+_MIGRATION_EDGES = (
+    ("0.0.0", "0.1.0"),
+    ("0.1.0", "0.2.0"),
+)
 
 
 def _framework_version(lock: FrameworkLock) -> str:
@@ -63,11 +69,23 @@ def _migration_actions(source: str) -> tuple[PlanAction, ...]:
         PlanAction(
             "framework.version",
             f"{source}->{__version__}",
-            ("skill_version", "engine_version", "supported_multica_cli", "manifest_digest"),
+            (
+                "skill_version",
+                "engine_version",
+                "workflow_metadata_version",
+                "supported_multica_cli",
+                "manifest_digest",
+            ),
             action_reason(
                 "framework.version",
                 f"{source}->{__version__}",
-                ("skill_version", "engine_version", "supported_multica_cli", "manifest_digest"),
+                (
+                    "skill_version",
+                    "engine_version",
+                    "workflow_metadata_version",
+                    "supported_multica_cli",
+                    "manifest_digest",
+                ),
             ),
         ),
     )
@@ -113,6 +131,7 @@ class UpgradeService:
             version_reader=self.version_reader,
             platform_name=self.platform_name,
             python_version=self.python_version,
+            workflow_metadata_versions=frozenset({1, WORKFLOW_METADATA_VERSION}),
         )
         if not report.valid:
             raise CliError(
@@ -205,7 +224,7 @@ class MigrationExecutor:
             __version__,
             __version__,
             lock.manifest_schema_version,
-            lock.workflow_metadata_version,
+            WORKFLOW_METADATA_VERSION,
             SUPPORTED_MULTICA_CLI,
             body.manifest_digest,
             lock.resource_ids,

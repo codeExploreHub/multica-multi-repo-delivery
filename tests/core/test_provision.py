@@ -759,6 +759,38 @@ class ProvisionerTests(unittest.TestCase):
             ),
         )
 
+    def test_generated_roles_preserve_coordinator_only_fan_in_authority(self):
+        result = self.apply()
+        agent_ids = result.lock.resource_ids["agent"]
+
+        def instructions(agent_key: str) -> str:
+            return self.multica.agents[agent_ids[agent_key]].instructions
+
+        lead = instructions("delivery-lead")
+        self.assertIn("every current Gate Stage child", lead)
+        self.assertIn("terminal", lead)
+        self.assertIn("sole fan-in", lead)
+        self.assertIn("canonical FailureBundle producer", lead)
+        self.assertIn("without reconstruction", lead)
+        self.assertIn("sole Stage and child execution actor", lead)
+
+        for role in ("independent-reviewer", "integration-qa"):
+            with self.subTest(role=role):
+                verdict = instructions(role)
+                self.assertIn("structured verdict evidence", verdict)
+                self.assertIn("do not create a failurebundle", verdict.lower())
+                self.assertIn("dispatch repair", verdict.lower())
+
+        for role in ("api-engineer", "notifications-engineer", "web-engineer"):
+            with self.subTest(role=role):
+                engineer = instructions(role)
+                self.assertIn("current active implementation or repair child", engineer)
+                self.assertIn("every assigned failure-partition reference", engineer)
+
+        watcher = instructions("workflow-watcher")
+        self.assertIn("cannot create a FailureBundle", watcher)
+        self.assertIn("cannot dispatch repair", watcher)
+
     def test_actions_follow_the_fixed_phase_order(self):
         result = self.provisioner.reconcile(
             self.manifest, FrameworkLock.empty(), apply=False, secret_lookup=no_secrets

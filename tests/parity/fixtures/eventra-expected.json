@@ -26,7 +26,7 @@
     ]
   },
   "metadata": {
-    "parent": "{\"affected_repositories\":[\"frontend\",\"backend\"],\"attempt\":0,\"candidate_shas\":{},\"contract_hashes\":{},\"instance_key\":\"eventra\",\"last_action\":\"dispatch\",\"merge_plan\":[],\"merge_state\":\"pending\",\"metadata_version\":1,\"repository_dag\":{\"backend\":[],\"frontend\":[\"backend\"]},\"stage_ordinal\":0,\"workflow_version\":1}"
+    "parent": "{\"affected_repositories\":[\"frontend\",\"backend\"],\"automatic_repairs_used\":0,\"candidate_shas\":{},\"contract_hashes\":{},\"instance_key\":\"eventra\",\"last_action\":\"dispatch\",\"merge_plan\":[],\"merge_state\":\"pending\",\"metadata_version\":2,\"repair_authorization\":null,\"repair_round\":0,\"repository_dag\":{\"backend\":[],\"frontend\":[\"backend\"]},\"stage_ordinal\":0,\"workflow_version\":2}"
   },
   "provision": {
     "effective_skill_bindings": {
@@ -38,5 +38,5 @@
       "workflow-watcher": ["using-superpowers", "systematic-debugging", "verification-before-completion"]
     }
   },
-  "source_commit": "f62310731394ec27034645787d87749b1eb95d38"
+  "source_commit": "b9a325f43ab387c94ab5a64c46ac2fcf0fa9b35b"
 }

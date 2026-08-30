@@ -461,7 +461,14 @@ class Provisioner:
                 "delivery-lead",
                 f"{display} Delivery Lead",
                 f"Coordinates manifest-scoped delivery for {display}.",
-                "Coordinate parent delivery work across only the manifest Projects and repositories.",
+                (
+                    "Coordinate parent delivery work across only the manifest Projects and "
+                    "repositories. Wait for every current Gate Stage child to become terminal "
+                    "before evaluating verdicts. Core/plan-parent is the sole fan-in, canonical "
+                    "FailureBundle producer, and decision authority. Validate its canonical "
+                    "output and use the exact returned FailureBundle and digest without "
+                    "reconstruction. Delivery Lead is the sole Stage and child execution actor."
+                ),
                 bindings["delivery-lead"],
                 environment["delivery-lead"],
             ),
@@ -469,7 +476,11 @@ class Provisioner:
                 "independent-reviewer",
                 f"{display} Independent Reviewer",
                 f"Reviews exact candidate commits for {display}.",
-                "Independently review exact candidate SHAs and record evidence without implementation authority.",
+                (
+                    "Independently review exact candidate SHAs and finish with structured "
+                    "verdict evidence only. Do not implement or direct an Engineer. Do not "
+                    "create a FailureBundle or dispatch repair."
+                ),
                 bindings["independent-reviewer"],
                 environment["independent-reviewer"],
             ),
@@ -477,7 +488,11 @@ class Provisioner:
                 "integration-qa",
                 f"{display} Integration QA",
                 f"Verifies declared integration suites for {display}.",
-                "Run only manifest-declared repository and integration verification against exact candidate SHAs.",
+                (
+                    "Run only manifest-declared verification against exact candidate SHAs and "
+                    "finish with structured verdict evidence only. Do not repair or direct an "
+                    "Engineer. Do not create a FailureBundle or dispatch repair."
+                ),
                 bindings["integration-qa"],
                 environment["integration-qa"],
             ),
@@ -486,8 +501,10 @@ class Provisioner:
                 f"{display} Workflow Watcher",
                 f"Performs bounded stalled-work recovery for {display}.",
                 (
-                    "Reread workflow state and perform at most one approved recovery "
-                    "action; never implement, merge, or deploy."
+                    "Reread workflow state and perform at most one approved rerun of an "
+                    "existing current assignment. The Watcher cannot create a FailureBundle, "
+                    "cannot dispatch repair, and never implements, creates children, changes a "
+                    "repair attempt, merges, or deploys."
                 ),
                 bindings["workflow-watcher"],
                 environment["workflow-watcher"],
@@ -500,7 +517,11 @@ class Provisioner:
                 repository.description or f"Owns implementation for {repository.github}.",
                 (
                     f"Implement only repository {repository.github} in Project "
-                    f"{repository.project_title} at {repository.local_path}."
+                    f"{repository.project_title} at {repository.local_path}, and only for a "
+                    "current active implementation or repair child. A repair requires the "
+                    "exact immutable FailureBundle, an existing managed PR, and every assigned "
+                    "failure-partition reference; unresolved references require a non-PASS "
+                    "repair verdict."
                 ),
                 bindings[f"{key}-engineer"],
                 environment[f"{key}-engineer"],
@@ -513,7 +534,12 @@ class Provisioner:
             tuple(sorted(manifest.skill_registry)),
             f"{display} Delivery Squad",
             f"Manifest-scoped delivery team for {display}.",
-            "Coordinate implementation, independent review, and integration QA; deployment is forbidden.",
+            (
+                "Coordinate version-2 Stage barriers. Core/plan-parent owns complete gate "
+                "fan-in and canonical FailureBundle decisions; Delivery Lead alone executes "
+                "Stages and children. Reviewer and QA return verdict evidence only, Engineers "
+                "act only from current children, and deployment is forbidden."
+            ),
             f"{display} Workflow Watcher",
             "Run-only bounded recovery for active manifest-scoped parent delivery Issues.",
             f"{manifest.instance.key} stalled-work recovery",

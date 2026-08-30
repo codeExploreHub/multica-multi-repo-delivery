@@ -89,7 +89,7 @@ class LifecycleTests(unittest.TestCase):
         (control / "framework.lock").write_text("""skill_version: ''
 engine_version: ''
 manifest_schema_version: 1
-workflow_metadata_version: 1
+workflow_metadata_version: 2
 supported_multica_cli: ''
 manifest_digest: ''
 resource_ids: {}

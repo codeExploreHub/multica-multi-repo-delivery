@@ -80,6 +80,22 @@ class DocumentationTests(unittest.TestCase):
         for action in ("repository creation", "remote push", "v0.1.0 tag", "Eventra immutable dependency migration"):
             self.assertIn(action, text)
 
+    def test_packaged_agents_template_declares_version_two_role_authority(self):
+        template = (
+            ROOT / "src" / "multica_delivery" / "templates" / "AGENTS.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("workflow metadata version 2", template)
+        self.assertIn("Core/plan-parent", template)
+        self.assertIn("sole fan-in", template)
+        self.assertIn("canonical FailureBundle producer", template)
+        self.assertIn("without reconstruction", template)
+        self.assertIn("sole Stage and child execution actor", template)
+        self.assertIn("Reviewer and QA", template)
+        self.assertIn("verdict evidence", template)
+        self.assertIn("current active implementation or repair child", template)
+        self.assertIn("every assigned failure-partition reference", template)
+        self.assertIn("Watcher cannot create a FailureBundle or dispatch repair", template)
+
 
 if __name__ == "__main__":
     unittest.main()

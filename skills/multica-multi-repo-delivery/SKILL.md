@@ -9,7 +9,7 @@ description: Use when onboarding, validating, reconciling, diagnosing, or upgrad
 
 Drive the installed CLI through a fresh, exact plan. Complete only the explicitly authorized scope, then stop at the next authority boundary.
 
-Before any lifecycle command, run `multica-delivery --version`. Version `0.1.0` is required for this Skill. If absent or different, stop and read [troubleshooting](references/troubleshooting.md).
+Before any lifecycle command, run `multica-delivery --version`. Version `0.2.0` is required for this Skill. If absent or different, stop and read [troubleshooting](references/troubleshooting.md).
 
 ## Route the task
 
@@ -28,6 +28,12 @@ Before any lifecycle command, run `multica-delivery --version`. Version `0.1.0` 
 5. Stop before retrying when output reports expiry, drift, ambiguity, partial convergence, external failure, or human-block. A new plan requires new authorization.
 6. Use read-only `doctor` for diagnosis. `upgrade` only creates a migration plan; applying it uses the same full-hash boundary.
 
+## Workflow version 2
+
+For mutable delivery, wait for every current Gate Stage child to become terminal. Core/plan-parent is the sole fan-in, canonical FailureBundle producer, and decision authority. Delivery Lead validates its canonical result, uses the exact returned bundle and digest without reconstruction, and alone executes Stages and children. Reviewer and QA return verdict evidence only. Engineers require a current active child and every assigned bundle partition; the Watcher cannot create bundles or dispatch repair.
+
+Completed version-1 parents are readable history. An active version-1 parent requires explicit migration before any new Stage, repair, merge, or completion. Read [lifecycle](references/lifecycle.md) and [safety boundaries](references/safety-boundaries.md) before planning that migration.
+
 ## Authority contract
 
 `apply` may reconcile only its listed Multica actions. GitHub repository creation, code changes, push, merge, rollback, and every deployment are separate operations requiring separate explicit authority. Finish an authorized Multica apply, then stop before an unapproved adjacent action.
@@ -35,7 +41,7 @@ Before any lifecycle command, run `multica-delivery --version`. Version `0.1.0` 
 | Signal | Decision |
 |---|---|
 | Inferred/unknown discovery | Stop for confirmation |
-| Fresh plan, no exact approval | Show full hash and request approval |
+| Fresh plan, no exact approval | Show complete 64-character hash and request approval |
 | Fresh plan, exact approval | Apply only listed Multica actions |
 | Expiry/drift/human-block | Stop; do not bypass or retry mutation |
 
