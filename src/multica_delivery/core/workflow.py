@@ -601,7 +601,11 @@ class ChildRequest:
         if self.phase == "repair" and self.pull_request is None:
             raise WorkflowError("repair must target an existing pull request")
         if self.phase != "repair":
-            if self.failure_bundle is not None or self.failure_refs:
+            if (
+                self.failure_bundle is not None
+                or type(self.failure_refs) is not tuple
+                or self.failure_refs != ()
+            ):
                 raise WorkflowError("only repair requests can contain failure evidence")
             return
         if (

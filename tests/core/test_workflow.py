@@ -1201,6 +1201,26 @@ class WorkflowValueValidationTests(unittest.TestCase):
         with self.assertRaises(WorkflowError):
             ChildRequest("api", "api", "", "implementation", 8, 0, SHA, failure_bundle=bundle)
 
+    def test_non_repair_request_requires_an_empty_immutable_failure_ref_tuple(self):
+        request = ChildRequest(
+            "api", "api", "", "implementation", 8, 0, SHA, failure_refs=()
+        )
+
+        self.assertEqual(request.failure_refs, ())
+        for invalid_refs in ([], frozenset(), None):
+            with self.subTest(invalid_refs=type(invalid_refs).__name__):
+                with self.assertRaises(WorkflowError):
+                    ChildRequest(
+                        "api",
+                        "api",
+                        "",
+                        "implementation",
+                        8,
+                        0,
+                        SHA,
+                        failure_refs=invalid_refs,  # type: ignore[arg-type]
+                    )
+
 
 class WorkflowCompletionSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
