@@ -305,6 +305,7 @@ class FakeWorkflowStore:
         self.add_pr_evidence_after_reservation = False
         self.duplicate_repair_child_on_create = False
         self.replace_repair_digest_after_create = False
+        self.repair_failure_uuid_corruption: str | None = None
 
     def add_blank(
         self,
@@ -615,6 +616,35 @@ class FakeWorkflowStore:
                 else child
                 for child in workflow_children
             ]
+        if self.repair_failure_uuid_corruption is not None:
+            corrupted_children = []
+            for child in workflow_children:
+                if child.phase != "repair":
+                    corrupted_children.append(child)
+                    continue
+                if self.repair_failure_uuid_corruption == "subset":
+                    child = replace(
+                        child,
+                        failure_evidence_uuids=child.failure_evidence_uuids[:-1],
+                    )
+                elif self.repair_failure_uuid_corruption == "extra":
+                    child = replace(
+                        child,
+                        failure_evidence_uuids=(
+                            *child.failure_evidence_uuids,
+                            "00000000-0000-4000-8000-000000000099",
+                        ),
+                    )
+                elif self.repair_failure_uuid_corruption == "duplicate":
+                    object.__setattr__(
+                        child,
+                        "failure_evidence_uuids",
+                        (*child.failure_evidence_uuids, child.failure_evidence_uuids[-1]),
+                    )
+                else:
+                    raise AssertionError("unknown repair UUID corruption")
+                corrupted_children.append(child)
+            workflow_children = corrupted_children
         self.states[parent_identifier] = replace(
             state,
             metadata=metadata,
@@ -3229,6 +3259,46 @@ class GenericWorkflowTests(unittest.TestCase):
             if child.phase == "repair"
         )
         self.assertEqual(repair.failure_bundle_digest, "f" * 64)
+
+    def test_post_create_repair_with_any_uuid_partition_mismatch_is_not_accepted(self):
+        for corruption in ("subset", "extra", "duplicate"):
+            with self.subTest(corruption=corruption):
+                snapshot = replace(
+                    passing_snapshot(),
+                    reviews={
+                        **passing_snapshot().reviews,
+                        "api": RepositoryEvidence(SHA["api"], "pending"),
+                    },
+                )
+                child = WorkflowChild(
+                    "PRO-101-API-REVIEW", "api", "api", "", "review", 5, 0,
+                    "in_progress", "review:" + "6" * 64, True,
+                    creation_candidate_shas=snapshot.candidate_shas,
+                )
+                self.store.states.clear()
+                self.store.completions.clear()
+                self.store.events.clear()
+                self.store.add_state(
+                    "PRO-101", snapshot, children=(child,),
+                    pull_requests=pull_request_targets(),
+                )
+                self.store.repair_failure_uuid_corruption = corruption
+
+                result = self.workflow.record_phase_completion(
+                    completion_for(
+                        "api", phase="review", result="fail", comment_digit="6"
+                    )
+                )
+
+                self.assertIn(result.next_action, {"uncertain", "block"})
+                repair = next(
+                    item for item in self.store.states["PRO-101"].children
+                    if item.phase == "repair"
+                )
+                self.assertNotEqual(
+                    repair.failure_evidence_uuids,
+                    (str(uuid.UUID("6" * 32)),),
+                )
 
     def test_direct_resume_waits_for_current_stage_before_one_shared_repair(self):
         snapshot = replace(

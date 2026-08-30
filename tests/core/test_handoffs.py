@@ -19,6 +19,26 @@ API_QA_UUID = "00000000-0000-4000-8000-000000000042"
 WEB_REVIEW_UUID = "00000000-0000-4000-8000-000000000043"
 
 
+class _ForgedPartition:
+    """Yields canonical refs while validating, then a raw-evidence ref to render."""
+
+    def __init__(
+        self,
+        canonical: tuple[FailureEvidenceRef, ...],
+        rendered: tuple[FailureEvidenceRef, ...],
+    ) -> None:
+        self._canonical = canonical
+        self._rendered = rendered
+        self._iterations = 0
+
+    def __iter__(self):
+        self._iterations += 1
+        return iter(self._canonical if self._iterations == 1 else self._rendered)
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+
 def _failure(
     child_identifier: str,
     repository_key: str,
@@ -134,6 +154,23 @@ class RepairHandoffRenderingTests(unittest.TestCase):
                 with self.assertRaises(WorkflowError):
                     render_repair_handoff(request)
                 object.__setattr__(request, field_name, request.failure_bundle.for_repository("api") if field_name == "failure_refs" else _request().failure_bundle)
+
+    def test_rejects_custom_equal_partition_that_switches_to_raw_evidence(self):
+        request = _request()
+        raw_evidence = "evidence raw comment body token=leak"
+        forged = _failure("PRO-201", "api", "review", API_REVIEW_UUID)
+        object.__setattr__(forged, "evidence_comment_url", raw_evidence)
+        object.__setattr__(
+            request,
+            "failure_refs",
+            _ForgedPartition(
+                request.failure_bundle.for_repository("api"),
+                (forged, request.failure_bundle.for_repository("api")[1]),
+            ),
+        )
+
+        with self.assertRaises(WorkflowError):
+            render_repair_handoff(request)
 
 
 if __name__ == "__main__":
