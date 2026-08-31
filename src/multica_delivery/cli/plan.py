@@ -18,7 +18,7 @@ from multica_delivery.core.manifest import (
     load_manifest,
     manifest_digest,
 )
-from multica_delivery.core.model import FrameworkLock
+from multica_delivery.core.model import DeliveryManifest, FrameworkLock
 from multica_delivery.core.provision import ProvisionError, Provisioner
 
 from .clock import Clock
@@ -338,6 +338,21 @@ class PlanningService:
                 "Local delivery-control files are invalid",
                 ExitCode.VALIDATION,
             ) from None
+        reconciled = self.observe_reconciliation(manifest, lock)
+        return PlanObservation(
+            manifest.instance.key,
+            manifest_digest(manifest),
+            lock_digest(lock),
+            reconciled.state_fingerprint,
+            reconciled.actions,
+        )
+
+    def observe_reconciliation(
+        self,
+        manifest: DeliveryManifest,
+        lock: FrameworkLock,
+    ) -> PlanObservation:
+        """Observe one exact manifest/lock pair without rereading local files."""
         try:
             audit = self.contract_auditor(
                 self.provisioner.multica,

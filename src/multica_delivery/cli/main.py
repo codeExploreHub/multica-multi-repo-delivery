@@ -184,7 +184,7 @@ class DefaultServices:
             PlanStore(),
             SystemClock(),
             confirmation_reader=InteractiveConfirmationReader(),
-            migration_executor=MigrationExecutor(),
+            migration_executor=MigrationExecutor(planning),
         )
         return run_apply(
             SimpleNamespace(
@@ -220,10 +220,11 @@ class DefaultServices:
 
     def upgrade(self, args) -> Envelope:
         plan_path = args.plan_path or args.path / "plan.json"
+        planning = build_planning_service(args.path)
         return run_upgrade(
             SimpleNamespace(path=args.path, plan_path=plan_path),
             SimpleNamespace(
-                upgrade=UpgradeService(),
+                upgrade=UpgradeService(planning=planning),
                 clock=SystemClock(),
                 plan_store=PlanStore(),
             ),

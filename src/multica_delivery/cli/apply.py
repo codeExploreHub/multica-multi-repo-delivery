@@ -12,7 +12,12 @@ import yaml
 from multica_delivery import __version__
 from multica_delivery.core.manifest import ManifestError, load_lock, load_manifest, manifest_digest
 from multica_delivery.core.model import FrameworkLock
-from multica_delivery.core.provision import ProvisionError, ReconcileAction
+from multica_delivery.core.provision import (
+    SUPPORTED_MULTICA_CLI,
+    WORKFLOW_METADATA_VERSION,
+    ProvisionError,
+    ReconcileAction,
+)
 
 from .clock import Clock
 from .errors import CliError, ExitCode
@@ -72,6 +77,43 @@ def _lock_bytes(lock: FrameworkLock) -> bytes:
         },
     }
     return yaml.safe_dump(value, sort_keys=False, allow_unicode=True).encode("utf-8")
+
+
+def _provision_failure(error: ProvisionError) -> CliError:
+    message = str(error)
+    if "preconditions changed" in message:
+        exit_code = ExitCode.DRIFT
+        code = "apply.precondition_drift"
+    elif (
+        "did not converge" in message
+        or "identity changed" in message
+        or message == "provisioning mutation failed"
+        or "reconciliation failed" in message
+        or "foreign" in message
+        or "duplicate" in message
+    ):
+        exit_code = ExitCode.HUMAN_BLOCK
+        code = "apply.human_block"
+    else:
+        exit_code = ExitCode.EXTERNAL
+        code = "apply.external_failure"
+    return CliError(
+        code,
+        "Apply could not establish converged authoritative state",
+        exit_code,
+    )
+
+
+def _plan_actions(actions: tuple[ReconcileAction, ...]) -> tuple[PlanAction, ...]:
+    return tuple(
+        PlanAction(
+            action.kind,
+            action.key,
+            action.changed_fields,
+            action_reason(action.kind, action.key, action.changed_fields),
+        )
+        for action in actions
+    )
 
 
 class ApplyService:
@@ -213,9 +255,70 @@ class ApplyService:
             )
 
         if body.mode == "upgrade":
-            migrated_lock = self.migration_executor.apply(body, lock_file)
-            atomic_replace_private(lock_file, self.migration_executor.serialize(migrated_lock))
-            return ApplyResult(body.actions, body.state_fingerprint)
+            candidate = self.migration_executor.candidate_lock(body, manifest, lock)
+            if not body.actions:
+                return ApplyResult((), body.state_fingerprint)
+            provision_actions = body.actions[:-1]
+            expected_actions = tuple(
+                ReconcileAction(action.kind, action.key, action.changed_fields)
+                for action in provision_actions
+            )
+            try:
+                reconciled = self.provisioner.reconcile(
+                    manifest,
+                    candidate,
+                    apply=True,
+                    secret_lookup=secret_source.read,
+                    expected_state_fingerprint=body.state_fingerprint,
+                    expected_actions=expected_actions,
+                )
+            except ProvisionError as error:
+                raise _provision_failure(error) from None
+            if _plan_actions(reconciled.actions) != provision_actions:
+                raise CliError(
+                    "apply.action_mismatch",
+                    "Applied semantic actions differ from the approved plan",
+                    ExitCode.HUMAN_BLOCK,
+                )
+            final_lock = reconciled.lock
+            if (
+                final_lock.skill_version != __version__
+                or final_lock.engine_version != __version__
+                or final_lock.manifest_schema_version != manifest.schema_version
+                or final_lock.workflow_metadata_version != WORKFLOW_METADATA_VERSION
+                or final_lock.supported_multica_cli != SUPPORTED_MULTICA_CLI
+                or final_lock.manifest_digest != body.manifest_digest
+            ):
+                raise CliError(
+                    "apply.upgrade_nonconvergent",
+                    "Upgrade did not return an exact current framework lock",
+                    ExitCode.HUMAN_BLOCK,
+                )
+
+            def forbidden_lookup(name: str) -> str:
+                raise AssertionError("upgrade convergence verification must not read secrets")
+
+            try:
+                verified = self.provisioner.reconcile(
+                    manifest,
+                    final_lock,
+                    apply=False,
+                    secret_lookup=forbidden_lookup,
+                )
+            except ProvisionError as error:
+                raise _provision_failure(error) from None
+            if (
+                verified.actions
+                or verified.lock != final_lock
+                or verified.state_fingerprint != reconciled.state_fingerprint
+            ):
+                raise CliError(
+                    "apply.upgrade_nonconvergent",
+                    "Upgrade provisioning did not remain converged",
+                    ExitCode.HUMAN_BLOCK,
+                )
+            atomic_replace_private(lock_file, _lock_bytes(final_lock))
+            return ApplyResult(body.actions, reconciled.state_fingerprint)
 
         expected_actions = tuple(
             ReconcileAction(action.kind, action.key, action.changed_fields)
@@ -231,34 +334,9 @@ class ApplyService:
                 expected_actions=expected_actions,
             )
         except ProvisionError as error:
-            message = str(error)
-            if "preconditions changed" in message:
-                exit_code = ExitCode.DRIFT
-                code = "apply.precondition_drift"
-            elif (
-                "did not converge" in message
-                or "identity changed" in message
-                or message == "provisioning mutation failed"
-                or "reconciliation failed" in message
-                or "foreign" in message
-                or "duplicate" in message
-            ):
-                exit_code = ExitCode.HUMAN_BLOCK
-                code = "apply.human_block"
-            else:
-                exit_code = ExitCode.EXTERNAL
-                code = "apply.external_failure"
-            raise CliError(code, "Apply could not establish converged authoritative state", exit_code) from None
+            raise _provision_failure(error) from None
 
-        applied_actions = tuple(
-            PlanAction(
-                action.kind,
-                action.key,
-                action.changed_fields,
-                action_reason(action.kind, action.key, action.changed_fields),
-            )
-            for action in reconciled.actions
-        )
+        applied_actions = _plan_actions(reconciled.actions)
         if applied_actions != body.actions:
             raise CliError(
                 "apply.action_mismatch",
