@@ -842,7 +842,9 @@ class FakeWorkflowStore:
             self.parent_drift_after_completion_read = None
             state = self.states[parent_identifier]
             assert isinstance(state.metadata, ParentMetadata)
-            if drift == "metadata":
+            if drift == "read-error":
+                self.parent_read_failures_remaining = 2
+            elif drift == "metadata":
                 state = replace(
                     state,
                     metadata=replace(
@@ -856,7 +858,7 @@ class FakeWorkflowStore:
                     applied_action_keys=state.applied_action_keys
                     | {"resume:" + "f" * 64},
                 )
-            else:
+            elif drift == "children":
                 state = replace(
                     state,
                     children=state.children
@@ -876,7 +878,21 @@ class FakeWorkflowStore:
                         ),
                     ),
                 )
-            self.states[parent_identifier] = state
+            elif drift == "snapshot":
+                state = replace(
+                    state,
+                    snapshot=replace(
+                        state.snapshot,
+                        recovery_count=state.snapshot.recovery_count + 1,
+                    ),
+                )
+            elif drift == "non-state":
+                next_read = self.read_counts.get(parent_identifier, 0) + 1
+                self.read_state_override_by_count[next_read] = object()  # type: ignore[assignment]
+            elif drift != "read-error":
+                raise AssertionError("unknown parent drift")
+            if drift != "read-error":
+                self.states[parent_identifier] = state
         if value is not None and self.change_after_completion_read:
             state = self.states[parent_identifier]
             assert state.metadata is not None
@@ -2298,6 +2314,185 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                 if child.phase_result != "pass"
             ),
         )
+
+    def seed_active_parallel_repair(
+        self,
+        repair_round: int,
+    ) -> PhaseCompletion:
+        self.store.parent_read_failures_remaining = 0
+        self.store.parent_drift_after_completion_read = None
+        self.store.read_state_override_by_count.clear()
+        source = {"api": SHA["api"], "web": SHA["web"]}
+        replacements = {"api": REPLACEMENT_SHA, "web": OTHER_SHA}
+        stage_ordinal = 5 + repair_round
+        source_gates, bundle, source_actions = self.review_failure_source_stage(
+            source=source,
+            source_stage=stage_ordinal - 1,
+            source_attempt=repair_round - 1,
+            repair_round=repair_round,
+        )
+        authorization_uuid = (
+            evidence_uuid(f"record-toctou-auth-{repair_round}")
+            if repair_round == 3
+            else ""
+        )
+        action_key = coordinator_action_key(
+            workflow_version=2,
+            instance_key=self.manifest.instance.key,
+            parent_identifier="PRO-200",
+            stage_kind="repair",
+            stage_ordinal=stage_ordinal,
+            attempt=repair_round,
+            affected_repositories=frozenset(source),
+            candidate_shas=source,
+            contract_hashes={},
+            failure_bundle_digest=bundle.digest,
+            authorizing_comment_uuid=authorization_uuid,
+        )
+        repair_children = tuple(
+            WorkflowChild(
+                f"PRO-200-{repository.upper()}-REPAIR",
+                repository,
+                repository,
+                "",
+                "repair",
+                stage_ordinal,
+                repair_round,
+                "in_progress",
+                action_key,
+                True,
+                creation_candidate_shas=source,
+                failure_bundle_digest=bundle.digest,
+                failure_evidence_uuids=tuple(
+                    failure.evidence_comment_uuid
+                    for failure in bundle.for_repository(repository)
+                ),
+                authorizing_comment_uuid=authorization_uuid,
+            )
+            for repository in ("api", "web")
+        )
+        snapshot = ParentSnapshot(
+            affected_repositories=("api", "web"),
+            candidate_shas=source,
+            children={
+                repository: RepositoryEvidence(source[repository], "pending")
+                for repository in source
+            },
+            pull_requests={
+                repository: PullRequestEvidence(
+                    replacements[repository], "open", True, True
+                )
+                for repository in source
+            },
+            attempt=repair_round,
+        )
+        self.store.add_state(
+            "PRO-200",
+            snapshot,
+            children=(*source_gates, *repair_children),
+            pull_requests=pull_request_targets(),
+            stage_ordinal=stage_ordinal,
+        )
+        state = self.store.states["PRO-200"]
+        assert isinstance(state.metadata, ParentMetadata)
+        self.store.states["PRO-200"] = replace(
+            state,
+            metadata=replace(state.metadata, last_action=action_key),
+            applied_action_keys=state.applied_action_keys | source_actions,
+        )
+        self.store.events.clear()
+        return completion_for(
+            "api",
+            parent="PRO-200",
+            phase="repair",
+            attempt=repair_round,
+            sha=REPLACEMENT_SHA,
+            failure_bundle_digest=bundle.digest,
+        )
+
+    def test_repair_completion_revalidates_parent_before_first_evidence_write(self):
+        for repair_round in (1, 2, 3):
+            for drift in (
+                "metadata",
+                "actions",
+                "children",
+                "snapshot",
+                "non-state",
+                "read-error",
+            ):
+                with self.subTest(repair_round=repair_round, drift=drift):
+                    self.store.states.clear()
+                    self.store.completions.clear()
+                    completion = self.seed_active_parallel_repair(repair_round)
+                    self.store.parent_drift_after_completion_read = drift
+
+                    result = self.workflow.record_phase_completion(completion)
+
+                    self.assertEqual(result.next_action, "block", result.reason)
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(
+                            event[0] in {"write-completion", "done"}
+                            for event in self.store.events
+                        )
+                    )
+
+    def test_exact_repair_replay_revalidates_parent_after_completion_reads(self):
+        for repair_round in (1, 2, 3):
+            for drift in (
+                "metadata",
+                "actions",
+                "children",
+                "snapshot",
+                "non-state",
+                "read-error",
+            ):
+                with self.subTest(repair_round=repair_round, drift=drift):
+                    self.store.states.clear()
+                    self.store.completions.clear()
+                    completion = self.seed_active_parallel_repair(repair_round)
+                    completed = self.workflow.record_phase_completion(completion)
+                    self.assertEqual(completed.completed_child_status, "done")
+                    self.store.events.clear()
+                    self.store.parent_drift_after_completion_read = drift
+
+                    replay = self.workflow.record_phase_completion(completion)
+
+                    self.assertEqual(replay.next_action, "block", replay.reason)
+                    self.assertEqual(replay.mutation_count, 0)
+                    self.assertFalse(
+                        any(
+                            event[0] in {"write-completion", "done"}
+                            for event in self.store.events
+                        )
+                    )
+
+    def test_stable_repair_completion_and_exact_replay_remain_idempotent(self):
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                self.store.states.clear()
+                self.store.completions.clear()
+                completion = self.seed_active_parallel_repair(repair_round)
+
+                completed = self.workflow.record_phase_completion(completion)
+                completion_events = tuple(
+                    event[0]
+                    for event in self.store.events
+                    if event[0] in {"write-completion", "done"}
+                )
+                self.store.events.clear()
+                replay = self.workflow.record_phase_completion(completion)
+
+                self.assertEqual(completed.completed_child_status, "done")
+                self.assertEqual(completion_events, ("write-completion", "done"))
+                self.assertEqual(replay.next_action, "noop")
+                self.assertEqual(replay.mutation_count, 0)
+                self.assertFalse(
+                    any(
+                        event[0] in {"write-completion", "done"}
+                        for event in self.store.events
+                    )
+                )
 
     def test_current_repair_requires_authoritative_source_gate_actions(self):
         source = {"api": SHA["api"], "web": SHA["web"]}

@@ -4060,6 +4060,9 @@ class GenericWorkflow:
                 state,
                 "persisted phase evidence lacks an authoritative completion action",
             )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
         return self._result(
             state,
             "noop",
@@ -4205,6 +4208,9 @@ class GenericWorkflow:
             merge_plan=merge_plan,
             merge_state=merge_state,
         )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
         try:
             self.executor.write_phase_completion(completion, action_key=key)
         except Exception:
