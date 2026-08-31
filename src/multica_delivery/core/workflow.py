@@ -3912,7 +3912,7 @@ class GenericWorkflow:
                     "existing phase evidence could not be read authoritatively",
                 )
         if reads[0] != reads[1]:
-            return self._uncertain(
+            return self._zero_mutation_block(
                 state,
                 "existing phase evidence changed during authoritative read",
             )

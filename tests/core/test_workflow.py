@@ -2467,6 +2467,29 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                         )
                     )
 
+    def test_exact_repair_replay_blocks_changed_persisted_completion_payload(self):
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                self.store.states.clear()
+                self.store.completions.clear()
+                completion = self.seed_active_parallel_repair(repair_round)
+                completed = self.workflow.record_phase_completion(completion)
+                self.assertEqual(completed.completed_child_status, "done")
+                self.store.events.clear()
+                self.store.change_completion_after_first_read = True
+
+                replay = self.workflow.record_phase_completion(completion)
+
+                self.assertEqual(replay.next_action, "block", replay.reason)
+                self.assertEqual(replay.mutation_count, 0)
+                self.assertIn("changed", replay.reason)
+                self.assertFalse(
+                    any(
+                        event[0] in {"write-completion", "done"}
+                        for event in self.store.events
+                    )
+                )
+
     def test_stable_repair_completion_and_exact_replay_remain_idempotent(self):
         for repair_round in (1, 2, 3):
             with self.subTest(repair_round=repair_round):
