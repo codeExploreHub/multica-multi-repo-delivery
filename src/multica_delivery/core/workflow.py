@@ -4497,7 +4497,16 @@ class GenericWorkflow:
             allow_incomplete_wave=True,
         )
         authorization = read_authorization()
-        if wave_authority is None or type(authorization) is object:
+        if (
+            wave_authority is None
+            or type(authorization) is object
+            or not self._last_action_explains_wave(
+                state,
+                repair_children,
+                creation_action,
+                wave_authority,
+            )
+        ):
             return self._zero_mutation_block(state, problem)
         fan_in_problem = self._parent_fan_in_still_current(state)
         if fan_in_problem is not None:
@@ -4509,20 +4518,35 @@ class GenericWorkflow:
             repair_round=metadata.repair_round,
             source=source,
         )
-        if (
-            refreshed_bundle != bundle
-            or self._authoritative_repair_wave_completion_actions(
+        refreshed_wave_authority = (
+            self._authoritative_repair_wave_completion_actions(
                 state,
                 first,
                 allow_incomplete_wave=True,
             )
-            != wave_authority
+        )
+        if (
+            refreshed_bundle != bundle
+            or refreshed_wave_authority != wave_authority
+            or not self._last_action_explains_wave(
+                state,
+                repair_children,
+                creation_action,
+                refreshed_wave_authority,
+            )
             or read_authorization() != authorization
         ):
             return self._zero_mutation_block(state, problem)
         fan_in_problem = self._parent_fan_in_still_current(state)
         if fan_in_problem is not None:
             return fan_in_problem
+        if not self._last_action_explains_wave(
+            state,
+            repair_children,
+            creation_action,
+            refreshed_wave_authority,
+        ):
+            return self._zero_mutation_block(state, problem)
 
         requests = tuple(
             ChildRequest(
@@ -4861,6 +4885,55 @@ class GenericWorkflow:
 
         chain = visit(dict(source_candidates), frozenset(completed))
         return None if chain is None else MappingProxyType(chain)
+
+    def _last_action_explains_wave(
+        self,
+        state: WorkflowState,
+        current: tuple[WorkflowChild, ...],
+        creation_action: str,
+        authority: Mapping[str, str] | frozenset[str] | None,
+    ) -> bool:
+        """Bind parent last_action to the exact authoritative current wave."""
+
+        metadata = state.metadata
+        if type(metadata) is not ParentMetadata or authority is None:
+            return False
+        if not authority:
+            return metadata.last_action == creation_action
+        phases = {child.phase for child in current}
+        if phases == {"repair"}:
+            if not isinstance(authority, Mapping):
+                return False
+            actions = tuple(authority.values())
+            return bool(actions) and metadata.last_action == actions[-1]
+        if phases == {"implementation"}:
+            completed: dict[str, tuple[WorkflowChild, str]] = {}
+            source_candidates = dict(current[0].creation_candidate_shas)
+            for child in current:
+                if child.active or child.status in _ACTIVE_CHILD_STATUSES:
+                    continue
+                aggregate = state.snapshot.children.get(child.repository_key)
+                if aggregate is None:
+                    return False
+                completed[child.repository_key] = (
+                    child,
+                    aggregate.candidate_sha,
+                )
+            actions = self._completed_candidate_action_chain(
+                state,
+                source_candidates,
+                completed,
+            )
+            if actions is None or frozenset(actions.values()) != authority:
+                return False
+            ordered = tuple(actions.values())
+            return bool(ordered) and metadata.last_action == ordered[-1]
+        if phases <= {"review", "qa", "integration_qa"}:
+            return (
+                isinstance(authority, frozenset)
+                and metadata.last_action in authority
+            )
+        return False
 
     def _completed_sibling_candidate_changes(
         self,
@@ -5215,7 +5288,16 @@ class GenericWorkflow:
 
         wave_authority = read_wave_authority()
         authorization = read_authorization()
-        if wave_authority is None or type(authorization) is object:
+        if (
+            wave_authority is None
+            or type(authorization) is object
+            or not self._last_action_explains_wave(
+                state,
+                wave,
+                child.action_key,
+                wave_authority,
+            )
+        ):
             return self._zero_mutation_block(
                 state,
                 "persisted phase evidence lacks stable wave or authorization authority",
@@ -5223,8 +5305,15 @@ class GenericWorkflow:
         fan_in_problem = self._parent_fan_in_still_current(state)
         if fan_in_problem is not None:
             return fan_in_problem
+        refreshed_wave_authority = read_wave_authority()
         if (
-            read_wave_authority() != wave_authority
+            refreshed_wave_authority != wave_authority
+            or not self._last_action_explains_wave(
+                state,
+                wave,
+                child.action_key,
+                refreshed_wave_authority,
+            )
             or read_authorization() != authorization
         ):
             return self._zero_mutation_block(
@@ -5234,6 +5323,16 @@ class GenericWorkflow:
         fan_in_problem = self._parent_fan_in_still_current(state)
         if fan_in_problem is not None:
             return fan_in_problem
+        if not self._last_action_explains_wave(
+            state,
+            wave,
+            child.action_key,
+            refreshed_wave_authority,
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase parent action is not explained by its wave",
+            )
 
         try:
             evidence = tuple(
@@ -5256,6 +5355,16 @@ class GenericWorkflow:
         fan_in_problem = self._parent_fan_in_still_current(state)
         if fan_in_problem is not None:
             return fan_in_problem
+        if not self._last_action_explains_wave(
+            state,
+            wave,
+            child.action_key,
+            refreshed_wave_authority,
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase parent action changed before child transition",
+            )
 
         previous_candidate_sha = state.snapshot.candidate_shas.get(
             completion.repository_key

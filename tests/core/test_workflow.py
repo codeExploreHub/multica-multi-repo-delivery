@@ -3819,6 +3819,69 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                         any(event[0] == "create" for event in self.store.events)
                     )
 
+    def test_partial_repair_successor_rejects_unexplained_parent_last_action(self):
+        forged_action = "resume:" + "f" * 64
+        for repair_round in (1, 2, 3):
+            for terminal_prefix in (False, True):
+                for forged_applied in (False, True):
+                    with self.subTest(
+                        repair_round=repair_round,
+                        terminal_prefix=terminal_prefix,
+                        forged_applied=forged_applied,
+                    ):
+                        self.setUp()
+                        bundle = self.seed_repair_dispatch_source(repair_round)
+                        self.store.partial_create_limits = [1]
+                        first = self.workflow.resume_parent("PRO-200")
+                        self.assertEqual(first.next_action, "uncertain", first.reason)
+                        if terminal_prefix:
+                            state = self.store.states["PRO-200"]
+                            heads = dict(state.snapshot.pull_requests)
+                            heads["api"] = replace(
+                                heads["api"],
+                                head_sha=REPLACEMENT_SHA,
+                            )
+                            self.store.states["PRO-200"] = replace(
+                                state,
+                                snapshot=replace(
+                                    state.snapshot,
+                                    pull_requests=heads,
+                                ),
+                            )
+                            self.store._apply_concurrent_sibling_completion(
+                                completion_for(
+                                    "api",
+                                    parent="PRO-200",
+                                    phase="repair",
+                                    attempt=repair_round,
+                                    sha=REPLACEMENT_SHA,
+                                    failure_bundle_digest=bundle.digest,
+                                )
+                            )
+                        state = self.store.states["PRO-200"]
+                        assert isinstance(state.metadata, ParentMetadata)
+                        self.store.states["PRO-200"] = replace(
+                            state,
+                            metadata=replace(
+                                state.metadata,
+                                last_action=forged_action,
+                            ),
+                            applied_action_keys=(
+                                state.applied_action_keys | {forged_action}
+                                if forged_applied
+                                else state.applied_action_keys
+                            ),
+                        )
+                        self.store.events.clear()
+
+                        retry = self.workflow.resume_parent("PRO-200")
+
+                        self.assertEqual(retry.next_action, "block", retry.reason)
+                        self.assertEqual(retry.mutation_count, 0)
+                        self.assertFalse(
+                            any(event[0] == "create" for event in self.store.events)
+                        )
+
     def assert_evidence_only_transition_recovers(
         self,
         completion: PhaseCompletion,
@@ -3957,6 +4020,114 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         self.assertEqual(first.mutation_count, 1)
         self.store.events.clear()
         return completion
+
+    def assert_evidence_only_retry_rejects_unexplained_last_action(
+        self,
+        completion: PhaseCompletion,
+        sibling: PhaseCompletion,
+        *,
+        forged_applied: bool,
+    ) -> None:
+        self.store.sibling_completion_after_read = (
+            completion.evidence_comment_uuid,
+            sibling,
+        )
+        first = self.workflow.record_phase_completion(completion)
+        self.assertEqual(first.next_action, "block", first.reason)
+        self.assertEqual(first.mutation_count, 1)
+        state = self.store.states[completion.parent_identifier]
+        assert isinstance(state.metadata, ParentMetadata)
+        forged_action = "resume:" + "f" * 64
+        self.store.states[completion.parent_identifier] = replace(
+            state,
+            metadata=replace(state.metadata, last_action=forged_action),
+            applied_action_keys=(
+                state.applied_action_keys | {forged_action}
+                if forged_applied
+                else state.applied_action_keys
+            ),
+        )
+        self.store.events.clear()
+
+        retry = self.workflow.record_phase_completion(completion)
+
+        self.assertEqual(retry.next_action, "block", retry.reason)
+        self.assertEqual(retry.mutation_count, 0)
+        self.assertFalse(
+            any(
+                event[0] in {"write-completion", "done", "create"}
+                for event in self.store.events
+            )
+        )
+
+    def test_evidence_only_repair_retry_rejects_unexplained_parent_last_action(self):
+        for repair_round in (1, 2, 3):
+            for forged_applied in (False, True):
+                with self.subTest(
+                    repair_round=repair_round,
+                    forged_applied=forged_applied,
+                ):
+                    self.setUp()
+                    completion = self.seed_active_parallel_repair(repair_round)
+                    state = self.store.states["PRO-200"]
+                    sibling_child = next(
+                        child
+                        for child in state.children
+                        if child.phase == "repair"
+                        and child.repository_key == "web"
+                        and child.attempt == repair_round
+                    )
+                    self.assert_evidence_only_retry_rejects_unexplained_last_action(
+                        completion,
+                        completion_for(
+                            "web",
+                            parent="PRO-200",
+                            phase="repair",
+                            attempt=repair_round,
+                            sha=OTHER_SHA,
+                            failure_bundle_digest=(
+                                sibling_child.failure_bundle_digest
+                            ),
+                        ),
+                        forged_applied=forged_applied,
+                    )
+
+    def test_evidence_only_gate_retry_rejects_unexplained_parent_last_action(self):
+        for forged_applied in (False, True):
+            with self.subTest(forged_applied=forged_applied):
+                self.setUp()
+                self.store.add_blank("PRO-101")
+                self.workflow.handle_parent_event(
+                    "PRO-101",
+                    affected=frozenset({"api", "web"}),
+                )
+                self.workflow.record_phase_completion(completion_for("api"))
+                self.workflow.record_phase_completion(completion_for("web"))
+                self.store.events.clear()
+                self.assert_evidence_only_retry_rejects_unexplained_last_action(
+                    completion_for("api", phase="review"),
+                    completion_for("web", phase="review"),
+                    forged_applied=forged_applied,
+                )
+
+    def test_evidence_only_implementation_retry_rejects_unexplained_parent_last_action(
+        self,
+    ):
+        for forged_applied in (False, True):
+            with self.subTest(forged_applied=forged_applied):
+                self.setUp()
+                self.store.add_blank("PRO-101")
+                self.workflow.handle_parent_event(
+                    "PRO-101",
+                    affected=frozenset({"api", "web", "notifications"}),
+                )
+                self.workflow.record_phase_completion(completion_for("api"))
+                self.store.events.clear()
+                self.assert_evidence_only_retry_rejects_unexplained_last_action(
+                    completion_for("web"),
+                    completion_for("notifications"),
+                    forged_applied=forged_applied,
+                )
 
     def test_evidence_only_transition_rejects_every_authority_drift(self):
         for corruption in (
