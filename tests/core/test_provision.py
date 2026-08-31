@@ -811,6 +811,12 @@ class ProvisionerTests(unittest.TestCase):
                 self.assertIn("do not create a failurebundle", verdict.lower())
                 self.assertIn("dispatch repair", verdict.lower())
 
+        integration_qa = instructions("integration-qa")
+        self.assertIn("phase `qa`", integration_qa)
+        self.assertIn("exactly one repository candidate", integration_qa)
+        self.assertIn("phase `integration_qa`", integration_qa)
+        self.assertIn("suite's complete candidate map", integration_qa)
+
         for role in ("api-engineer", "notifications-engineer", "web-engineer"):
             with self.subTest(role=role):
                 engineer = instructions(role)

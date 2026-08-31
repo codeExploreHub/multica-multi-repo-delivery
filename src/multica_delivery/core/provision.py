@@ -490,8 +490,11 @@ class Provisioner:
                 f"Verifies declared integration suites for {display}.",
                 (
                     "Run only manifest-declared verification against exact candidate SHAs and "
-                    "finish with structured verdict evidence only. Do not repair or direct an "
-                    "Engineer. Do not create a FailureBundle or dispatch repair."
+                    "finish with structured verdict evidence only. For a repository child, use "
+                    "phase `qa` and exactly one repository candidate. For an integration-suite "
+                    "child, use phase `integration_qa` and the suite's complete candidate map. "
+                    "Never mix the two child types or their candidate scopes. Do not repair or "
+                    "direct an Engineer. Do not create a FailureBundle or dispatch repair."
                 ),
                 bindings["integration-qa"],
                 environment["integration-qa"],
