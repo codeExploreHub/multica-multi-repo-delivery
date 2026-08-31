@@ -552,6 +552,40 @@ class FakeWorkflowStore:
                     )
                 except WorkflowError:
                     pass
+                try:
+                    pull_request = (pull_requests or {})[child.repository_key]
+                    completion = PhaseCompletion(
+                        parent_identifier=identifier,
+                        repository_key=child.repository_key,
+                        phase=child.phase,
+                        result=child.phase_result,
+                        attempt=child.attempt,
+                        candidate_sha=child.creation_candidate_shas[
+                            child.repository_key
+                        ],
+                        pull_request_url=pull_request.url,
+                        evidence_comment_uuid=child.evidence_comment_uuid,
+                        evidence_comment_url=child.evidence_comment_url,
+                        suite_key=child.suite_key,
+                        candidate_shas=(
+                            child.creation_candidate_shas
+                            if child.phase == "integration_qa"
+                            else {}
+                        ),
+                        responsible_repositories=child.responsible_repositories,
+                    )
+                    if (
+                        _phase_completion_schema_problem(
+                            completion,
+                            manifest=self.manifest,
+                        )
+                        is None
+                    ):
+                        self.completions[
+                            (identifier, child.evidence_comment_uuid)
+                        ] = completion
+                except (KeyError, TypeError, ValueError, WorkflowError):
+                    pass
         self.states[identifier] = WorkflowState(
             parent_identifier=identifier,
             parent_status=status,
@@ -1580,7 +1614,6 @@ class TaskFourWorkflowFixture:
     ) -> FailureBundle:
         state = self.add_failed_review_state()
         self.store.authorizing_comments.clear()
-        self.store.completions.clear()
         decision = ParentDecision(
             DecisionKind.REPAIR,
             "authorized repair",
@@ -2154,6 +2187,38 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             completion_actions | {creation_action},
         )
 
+    @staticmethod
+    def rebuild_source_gate_bundle(
+        *,
+        gates: tuple[WorkflowChild, ...],
+        source: dict[str, str],
+        source_stage: int,
+        repair_round: int,
+    ) -> FailureBundle:
+        return FailureBundle.build(
+            "PRO-200",
+            2,
+            source_stage,
+            repair_round,
+            source,
+            tuple(
+                FailureEvidenceRef(
+                    child_identifier=child.identifier,
+                    phase=child.phase,
+                    result=child.phase_result,
+                    stage_ordinal=source_stage,
+                    repair_round=child.attempt,
+                    candidate_shas=source,
+                    responsible_repositories=child.responsible_repositories,
+                    evidence_comment_uuid=child.evidence_comment_uuid,
+                    evidence_comment_url=child.evidence_comment_url,
+                    suite_key=child.suite_key,
+                )
+                for child in gates
+                if child.phase_result != "pass"
+            ),
+        )
+
     def test_current_repair_requires_authoritative_source_gate_actions(self):
         source = {"api": SHA["api"], "web": SHA["web"]}
         for repair_round in (1, 2, 3):
@@ -2290,6 +2355,280 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                     self.assertFalse(
                         any(event[0] == "create" for event in self.store.events)
                     )
+
+    def test_current_repair_requires_exact_authoritative_source_gate_completions(self):
+        source = {"api": SHA["api"], "web": SHA["web"]}
+
+        def repair_wave(
+            *,
+            gates: tuple[WorkflowChild, ...],
+            bundle: FailureBundle,
+            repair_round: int,
+            terminal: bool,
+        ) -> tuple[tuple[WorkflowChild, ...], str, frozenset[str], str]:
+            repair_stage = 5 + repair_round
+            authorization_uuid = (
+                evidence_uuid(f"authoritative-source-auth-{repair_round}")
+                if repair_round == 3
+                else ""
+            )
+            action = coordinator_action_key(
+                workflow_version=2,
+                instance_key=self.manifest.instance.key,
+                parent_identifier="PRO-200",
+                stage_kind="repair",
+                stage_ordinal=repair_stage,
+                attempt=repair_round,
+                affected_repositories=frozenset(source),
+                candidate_shas=source,
+                contract_hashes={},
+                failure_bundle_digest=bundle.digest,
+                authorizing_comment_uuid=authorization_uuid,
+            )
+            owners = tuple(
+                sorted(
+                    {
+                        repository
+                        for failure in bundle.failures
+                        for repository in failure.responsible_repositories
+                    }
+                )
+            )
+            children: list[WorkflowChild] = []
+            completion_actions: set[str] = set()
+            last_action = action
+            replacements = {"api": REPLACEMENT_SHA, "web": OTHER_SHA}
+            for repository in owners:
+                completion_uuid = evidence_uuid(
+                    f"authoritative-source-repair-{repair_round}-{repository}"
+                )
+                children.append(
+                    WorkflowChild(
+                        f"PRO-200-{repository.upper()}-REPAIR",
+                        repository,
+                        repository,
+                        "",
+                        "repair",
+                        repair_stage,
+                        repair_round,
+                        "done" if terminal else "in_progress",
+                        action,
+                        not terminal,
+                        evidence_comment_uuid=completion_uuid if terminal else "",
+                        creation_candidate_shas=source,
+                        phase_result="pass" if terminal else "",
+                        evidence_comment_url=(
+                            f"https://example.test/evidence/{completion_uuid}"
+                            if terminal
+                            else ""
+                        ),
+                        failure_bundle_digest=bundle.digest,
+                        failure_evidence_uuids=tuple(
+                            failure.evidence_comment_uuid
+                            for failure in bundle.for_repository(repository)
+                        ),
+                        authorizing_comment_uuid=authorization_uuid,
+                    )
+                )
+                if terminal:
+                    for action_candidates in (
+                        {**source, repository: replacements[repository]},
+                        replacements,
+                    ):
+                        last_action = coordinator_action_key(
+                            workflow_version=2,
+                            instance_key=self.manifest.instance.key,
+                            parent_identifier="PRO-200",
+                            stage_kind=f"repair:{repository}",
+                            stage_ordinal=repair_stage,
+                            attempt=repair_round,
+                            affected_repositories=frozenset(source),
+                            candidate_shas=action_candidates,
+                            contract_hashes={},
+                            failure_bundle_digest=bundle.digest,
+                            authorizing_comment_uuid=authorization_uuid,
+                        )
+                        completion_actions.add(last_action)
+            return tuple(children), action, frozenset(completion_actions), last_action
+
+        for repair_round in (1, 2, 3):
+            for terminal in (False, True):
+                for corruption in (
+                    "missing-record",
+                    "evidence",
+                    "result",
+                    "output",
+                    "responsibility",
+                ):
+                    with self.subTest(
+                        repair_round=repair_round,
+                        terminal=terminal,
+                        corruption=corruption,
+                    ):
+                        repair_stage = 5 + repair_round
+                        gates, bundle, source_actions = self.review_failure_source_stage(
+                            source=source,
+                            source_stage=repair_stage - 1,
+                            source_attempt=repair_round - 1,
+                            repair_round=repair_round,
+                        )
+                        if corruption == "responsibility":
+                            gates = tuple(
+                                replace(
+                                    child,
+                                    phase_result="fail",
+                                    responsible_repositories=("api",),
+                                )
+                                if child.phase == "integration_qa"
+                                else child
+                                for child in gates
+                            )
+                            bundle = self.rebuild_source_gate_bundle(
+                                gates=gates,
+                                source=source,
+                                source_stage=repair_stage - 1,
+                                repair_round=repair_round,
+                            )
+                        repair_children, repair_action, completion_actions, last_action = (
+                            repair_wave(
+                                gates=gates,
+                                bundle=bundle,
+                                repair_round=repair_round,
+                                terminal=terminal,
+                            )
+                        )
+                        current_candidates = (
+                            {"api": REPLACEMENT_SHA, "web": OTHER_SHA}
+                            if terminal
+                            else source
+                        )
+                        snapshot = ParentSnapshot(
+                            affected_repositories=("api", "web"),
+                            candidate_shas=current_candidates,
+                            children={
+                                repository: RepositoryEvidence(
+                                    current_candidates[repository],
+                                    "pass" if terminal else "pending",
+                                )
+                                for repository in source
+                            },
+                            pull_requests={
+                                repository: PullRequestEvidence(
+                                    current_candidates[repository],
+                                    "open",
+                                    True,
+                                    True,
+                                )
+                                for repository in source
+                            },
+                            attempt=repair_round,
+                        )
+                        self.store.add_state(
+                            "PRO-200",
+                            snapshot,
+                            children=(*gates, *repair_children),
+                            pull_requests=pull_request_targets(),
+                            stage_ordinal=repair_stage,
+                        )
+                        state = self.store.states["PRO-200"]
+                        assert isinstance(state.metadata, ParentMetadata)
+                        self.store.states["PRO-200"] = replace(
+                            state,
+                            metadata=replace(state.metadata, last_action=last_action),
+                            applied_action_keys=(
+                                state.applied_action_keys
+                                | source_actions
+                                | completion_actions
+                            ),
+                        )
+
+                        forged_gates = gates
+                        first_gate = gates[0]
+                        if corruption == "missing-record":
+                            del self.store.completions[
+                                ("PRO-200", first_gate.evidence_comment_uuid)
+                            ]
+                        elif corruption == "evidence":
+                            forged_uuid = evidence_uuid(
+                                f"forged-source-evidence-{repair_round}-{terminal}"
+                            )
+                            forged_gates = (
+                                replace(
+                                    first_gate,
+                                    evidence_comment_uuid=forged_uuid,
+                                    evidence_comment_url=(
+                                        f"https://example.test/evidence/{forged_uuid}"
+                                    ),
+                                ),
+                                *gates[1:],
+                            )
+                        elif corruption == "result":
+                            forged_gates = tuple(
+                                replace(
+                                    child,
+                                    phase_result="fail",
+                                    responsible_repositories=(child.repository_key,),
+                                )
+                                if child.phase == "qa" and child.repository_key == "api"
+                                else child
+                                for child in gates
+                            )
+                        elif corruption == "output":
+                            key = ("PRO-200", first_gate.evidence_comment_uuid)
+                            self.store.completions[key] = replace(
+                                self.store.completions[key],
+                                candidate_sha=OTHER_SHA,
+                            )
+                        else:
+                            forged_gates = tuple(
+                                replace(child, responsible_repositories=("web",))
+                                if child.phase == "integration_qa"
+                                else child
+                                for child in gates
+                            )
+
+                        if forged_gates != gates:
+                            forged_bundle = self.rebuild_source_gate_bundle(
+                                gates=forged_gates,
+                                source=source,
+                                source_stage=repair_stage - 1,
+                                repair_round=repair_round,
+                            )
+                            (
+                                forged_repairs,
+                                forged_action,
+                                forged_completion_actions,
+                                forged_last_action,
+                            ) = repair_wave(
+                                gates=forged_gates,
+                                bundle=forged_bundle,
+                                repair_round=repair_round,
+                                terminal=terminal,
+                            )
+                            state = self.store.states["PRO-200"]
+                            assert isinstance(state.metadata, ParentMetadata)
+                            self.store.states["PRO-200"] = replace(
+                                state,
+                                children=(*forged_gates, *forged_repairs),
+                                metadata=replace(
+                                    state.metadata,
+                                    last_action=forged_last_action,
+                                ),
+                                applied_action_keys=(
+                                    state.applied_action_keys
+                                    | {forged_action}
+                                    | forged_completion_actions
+                                ),
+                            )
+                        self.store.events.clear()
+
+                        result = self.workflow.resume_parent("PRO-200")
+
+                        self.assertEqual(result.next_action, "block", result.reason)
+                        self.assertEqual(result.mutation_count, 0)
+                        self.assertFalse(
+                            any(event[0] == "create" for event in self.store.events)
+                        )
 
     def add_three_repository_implementation_wave(
         self,

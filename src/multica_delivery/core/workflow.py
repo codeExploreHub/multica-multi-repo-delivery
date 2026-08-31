@@ -2189,6 +2189,46 @@ class GenericWorkflow:
                 or expected_completion_action not in state.applied_action_keys
             ):
                 return None
+            pull_request = state.pull_requests.get(child.repository_key)
+            if pull_request is None:
+                return None
+            expected_completion = PhaseCompletion(
+                parent_identifier=state.parent_identifier,
+                repository_key=child.repository_key,
+                phase=child.phase,
+                result=child.phase_result,
+                attempt=source_attempt,
+                candidate_sha=source[child.repository_key],
+                pull_request_url=pull_request.url,
+                evidence_comment_uuid=child.evidence_comment_uuid,
+                evidence_comment_url=child.evidence_comment_url,
+                suite_key=child.suite_key,
+                candidate_shas=(source if child.phase == "integration_qa" else {}),
+                responsible_repositories=child.responsible_repositories,
+            )
+            if (
+                _phase_completion_schema_problem(
+                    expected_completion,
+                    manifest=self.manifest,
+                )
+                is not None
+            ):
+                return None
+            try:
+                observed_completions = tuple(
+                    self.snapshot_reader.read_phase_completion(
+                        state.parent_identifier,
+                        child.evidence_comment_uuid,
+                    )
+                    for _ in range(2)
+                )
+            except Exception:
+                return None
+            if any(
+                observed != expected_completion
+                for observed in observed_completions
+            ):
+                return None
             evidence_uuids.add(child.evidence_comment_uuid)
             if child.phase in {"review", "qa"}:
                 expected_owners = (
