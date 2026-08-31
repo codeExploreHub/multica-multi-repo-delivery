@@ -2151,6 +2151,18 @@ class GenericWorkflow:
             or set(identities) != expected_identities
         ):
             return None
+        expected_creation_action = self._action_key(
+            state,
+            "gates",
+            source_stage,
+            attempt=source_attempt,
+            candidate_shas=source,
+        )
+        if (
+            expected_creation_action not in state.applied_action_keys
+            or any(child.action_key != expected_creation_action for child in gates)
+        ):
+            return None
 
         failures: list[FailureEvidenceRef] = []
         evidence_uuids: set[str] = set()
@@ -2163,6 +2175,18 @@ class GenericWorkflow:
                 or not _canonical_uuid(child.evidence_comment_uuid)
                 or not _https_evidence_url(child.evidence_comment_url)
                 or child.evidence_comment_uuid in evidence_uuids
+            ):
+                return None
+            expected_completion_action = self._action_key(
+                state,
+                f"{child.phase}:{child.target_key}",
+                source_stage,
+                attempt=source_attempt,
+                candidate_shas=source,
+            )
+            if (
+                expected_completion_action == expected_creation_action
+                or expected_completion_action not in state.applied_action_keys
             ):
                 return None
             evidence_uuids.add(child.evidence_comment_uuid)
