@@ -4191,6 +4191,21 @@ class GenericWorkflow:
         fan_in_problem = self._parent_fan_in_still_current(state)
         if fan_in_problem is not None:
             return fan_in_problem
+        if completion.phase == "repair":
+            refreshed_repair_actions = (
+                self._authoritative_repair_wave_completion_actions(
+                    state,
+                    completed[0],
+                )
+            )
+            if refreshed_repair_actions != repair_completion_actions:
+                return self._zero_mutation_block(
+                    state,
+                    "repair replay provenance changed after parent fan-in",
+                )
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
         return self._result(
             state,
             "noop",
@@ -4206,6 +4221,26 @@ class GenericWorkflow:
     ) -> Mapping[str, str] | None:
         """Prove one Repair wave's incremental completion-action chain."""
 
+        source_bundle = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=replayed.stage_ordinal - 1,
+            source_attempt=replayed.attempt - 1,
+            repair_round=replayed.attempt,
+            source=replayed.creation_candidate_shas,
+        )
+        if (
+            type(source_bundle) is not FailureBundle
+            or source_bundle.digest != replayed.failure_bundle_digest
+        ):
+            return None
+        expected_partitions = {
+            repository: _failure_uuid_partition(
+                source_bundle.for_repository(repository)
+            )
+            for repository in replayed.creation_candidate_shas
+            if source_bundle.for_repository(repository)
+        }
+
         wave = tuple(
             child
             for child in state.children
@@ -4217,6 +4252,7 @@ class GenericWorkflow:
         if (
             not wave
             or len(repositories) != len(set(repositories))
+            or set(repositories) != set(expected_partitions)
             or any(
                 child.action_key != replayed.action_key
                 or child.creation_candidate_shas
@@ -4225,6 +4261,8 @@ class GenericWorkflow:
                 != replayed.failure_bundle_digest
                 or child.authorizing_comment_uuid
                 != replayed.authorizing_comment_uuid
+                or child.failure_evidence_uuids
+                != expected_partitions.get(child.repository_key)
                 or child.target_key != child.repository_key
                 or child.suite_key
                 for child in wave

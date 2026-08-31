@@ -3575,6 +3575,158 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                             ("block", 0),
                             forged_replay.reason,
                         )
+                repair_by_repository = {
+                    child.repository_key: child
+                    for child in current.children
+                    if child.phase == "repair"
+                }
+                for forged_repository, replay_repository, replay_sha in (
+                    ("web", "api", REPLACEMENT_SHA),
+                    ("api", "web", OTHER_SHA),
+                ):
+                    with self.subTest(
+                        repair_round=repair_round,
+                        forged_partition=forged_repository,
+                    ):
+                        forged_uuid = evidence_uuid(
+                            f"forged-owner-partition-{repair_round}-{forged_repository}"
+                        )
+                        forged_children = tuple(
+                            replace(
+                                child,
+                                failure_evidence_uuids=(forged_uuid,),
+                            )
+                            if child.phase == "repair"
+                            and child.repository_key == forged_repository
+                            else child
+                            for child in current.children
+                        )
+                        self.store.states["PRO-200"] = replace(
+                            current,
+                            children=forged_children,
+                        )
+                        forged_partition_replay = (
+                            self.workflow.record_phase_completion(
+                                completion_for(
+                                    replay_repository,
+                                    parent="PRO-200",
+                                    phase="repair",
+                                    attempt=repair_round,
+                                    sha=replay_sha,
+                                    failure_bundle_digest=bundle_digest,
+                                )
+                            )
+                        )
+                        self.assertEqual(
+                            (
+                                forged_partition_replay.next_action,
+                                forged_partition_replay.mutation_count,
+                            ),
+                            ("block", 0),
+                            forged_partition_replay.reason,
+                        )
+                extra_uuid = evidence_uuid(
+                    f"extra-owner-partition-{repair_round}"
+                )
+                api_repair = repair_by_repository["api"]
+                web_repair = repair_by_repository["web"]
+                partition_corruptions = {
+                    "missing": tuple(
+                        replace(child, failure_evidence_uuids=())
+                        if child is web_repair
+                        else child
+                        for child in current.children
+                    ),
+                    "extra": tuple(
+                        replace(
+                            child,
+                            failure_evidence_uuids=tuple(
+                                sorted((*web_repair.failure_evidence_uuids, extra_uuid))
+                            ),
+                        )
+                        if child is web_repair
+                        else child
+                        for child in current.children
+                    ),
+                    "swap": tuple(
+                        replace(
+                            child,
+                            failure_evidence_uuids=(
+                                web_repair.failure_evidence_uuids
+                                if child is api_repair
+                                else api_repair.failure_evidence_uuids
+                            ),
+                        )
+                        if child is api_repair or child is web_repair
+                        else child
+                        for child in current.children
+                    ),
+                    "duplicate owner": current.children
+                    + (
+                        replace(
+                            web_repair,
+                            identifier=f"{web_repair.identifier}-DUPLICATE",
+                        ),
+                    ),
+                }
+                for corruption, corrupted_children in partition_corruptions.items():
+                    with self.subTest(
+                        repair_round=repair_round,
+                        owner_partition=corruption,
+                    ):
+                        self.store.states["PRO-200"] = replace(
+                            current,
+                            children=corrupted_children,
+                        )
+                        corrupted_partition_replay = (
+                            self.workflow.record_phase_completion(
+                                completion_for(
+                                    "api",
+                                    parent="PRO-200",
+                                    phase="repair",
+                                    attempt=repair_round,
+                                    sha=REPLACEMENT_SHA,
+                                    failure_bundle_digest=bundle_digest,
+                                )
+                            )
+                        )
+                        self.assertEqual(
+                            (
+                                corrupted_partition_replay.next_action,
+                                corrupted_partition_replay.mutation_count,
+                            ),
+                            ("block", 0),
+                            corrupted_partition_replay.reason,
+                        )
+                source_completion_key = (
+                    "PRO-200",
+                    source_gates[0].evidence_comment_uuid,
+                )
+                source_completion = self.store.completions[source_completion_key]
+                self.store.states["PRO-200"] = current
+                self.store.completion_drift_after_parent_reread = (
+                    source_gates[0].evidence_comment_uuid
+                )
+                source_drift_replay = self.workflow.record_phase_completion(
+                    completion_for(
+                        "api",
+                        parent="PRO-200",
+                        phase="repair",
+                        attempt=repair_round,
+                        sha=REPLACEMENT_SHA,
+                        failure_bundle_digest=bundle_digest,
+                    )
+                )
+                self.assertEqual(
+                    (
+                        source_drift_replay.next_action,
+                        source_drift_replay.mutation_count,
+                    ),
+                    ("block", 0),
+                    source_drift_replay.reason,
+                )
+                self.store.completions[source_completion_key] = source_completion
+                self.store.completion_drift_after_parent_reread = None
                 self.store.states["PRO-200"] = replace(
                     current,
                     snapshot=replace(
