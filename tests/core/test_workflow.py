@@ -278,6 +278,8 @@ class FakeWorkflowStore:
         self.corrupt_completion_read = False
         self.change_completion_after_first_read = False
         self.change_after_completion_read = False
+        self.parent_drift_after_completion_read: str | None = None
+        self.parent_drift_after_authorizing_comment = False
         self.completion_read_failures_remaining = 0
         self.retain_gates_on_replacement = False
         self.change_on_recovery_reread = False
@@ -352,9 +354,21 @@ class FakeWorkflowStore:
     ) -> AuthorizingComment:
         self.events.append(("read-authorizing-comment", parent_identifier, comment_uuid))
         try:
-            return self.authorizing_comments[(parent_identifier, comment_uuid)]
+            comment = self.authorizing_comments[(parent_identifier, comment_uuid)]
         except KeyError as error:
             raise RuntimeError("authorizing comment read is unavailable") from error
+        if self.parent_drift_after_authorizing_comment:
+            self.parent_drift_after_authorizing_comment = False
+            state = self.states[parent_identifier]
+            assert isinstance(state.metadata, ParentMetadata)
+            self.states[parent_identifier] = replace(
+                state,
+                metadata=replace(
+                    state.metadata,
+                    stage_ordinal=state.metadata.stage_ordinal + 1,
+                ),
+            )
+        return comment
 
     def candidate_sha(self, repository_key: str, parent_identifier: str = "PRO-200") -> str:
         return self.states[parent_identifier].snapshot.candidate_shas[repository_key]
@@ -823,6 +837,46 @@ class FakeWorkflowStore:
                 result="blocked" if value.result != "blocked" else "fail",
             )
             return value
+        if value is not None and self.parent_drift_after_completion_read is not None:
+            drift = self.parent_drift_after_completion_read
+            self.parent_drift_after_completion_read = None
+            state = self.states[parent_identifier]
+            assert isinstance(state.metadata, ParentMetadata)
+            if drift == "metadata":
+                state = replace(
+                    state,
+                    metadata=replace(
+                        state.metadata,
+                        stage_ordinal=state.metadata.stage_ordinal + 1,
+                    ),
+                )
+            elif drift == "actions":
+                state = replace(
+                    state,
+                    applied_action_keys=state.applied_action_keys
+                    | {"resume:" + "f" * 64},
+                )
+            else:
+                state = replace(
+                    state,
+                    children=state.children
+                    + (
+                        WorkflowChild(
+                            f"{parent_identifier}-DRIFT",
+                            "api",
+                            "api",
+                            "",
+                            "implementation",
+                            1,
+                            0,
+                            "in_progress",
+                            "dispatch:" + "f" * 64,
+                            True,
+                            creation_candidate_shas={},
+                        ),
+                    ),
+                )
+            self.states[parent_identifier] = state
         if value is not None and self.change_after_completion_read:
             state = self.states[parent_identifier]
             assert state.metadata is not None
@@ -1897,6 +1951,25 @@ class WorkflowPullRequestDriftTests(TaskFourWorkflowFixture, unittest.TestCase):
 
 
 class WorkflowRepairAuthorizationTests(TaskFourWorkflowFixture, unittest.TestCase):
+    def test_parent_drift_after_authorization_comment_blocks_repair_dispatch(self):
+        self.authorize_extra_round()
+        before = self.store.states["PRO-200"]
+        assert isinstance(before.metadata, ParentMetadata)
+        self.store.parent_drift_after_authorizing_comment = True
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-200")
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
+        after = self.store.states["PRO-200"]
+        assert isinstance(after.metadata, ParentMetadata)
+        self.assertEqual(
+            after.metadata.stage_ordinal,
+            before.metadata.stage_ordinal + 1,
+        )
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
     def test_automatic_rounds_one_and_two_increment_only_automatic_count(self):
         for current_round, expected_round in ((0, 1), (1, 2)):
             with self.subTest(current_round=current_round):
@@ -2467,6 +2540,9 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                     "output",
                     "responsibility",
                     "read-drift",
+                    "parent-metadata",
+                    "parent-actions",
+                    "parent-children",
                 ):
                     with self.subTest(
                         repair_round=repair_round,
@@ -2589,6 +2665,10 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                             )
                         elif corruption == "read-drift":
                             self.store.change_completion_after_first_read = True
+                        elif corruption.startswith("parent-"):
+                            self.store.parent_drift_after_completion_read = (
+                                corruption.removeprefix("parent-")
+                            )
                         else:
                             forged_gates = tuple(
                                 replace(child, responsible_repositories=("web",))

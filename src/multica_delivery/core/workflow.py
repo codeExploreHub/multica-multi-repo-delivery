@@ -1455,6 +1455,26 @@ class GenericWorkflow:
                 continue
         return None
 
+    def _parent_fan_in_still_current(
+        self,
+        state: WorkflowState,
+    ) -> WorkflowResult | None:
+        """Fail closed if external evidence reads raced a parent-state change."""
+
+        try:
+            observed = self.snapshot_reader.read(state.parent_identifier)
+        except Exception:
+            return self._zero_mutation_block(
+                state,
+                "parent could not be authoritatively reread after evidence fan-in",
+            )
+        if type(observed) is not WorkflowState or observed != state:
+            return self._zero_mutation_block(
+                state,
+                "parent changed during authoritative evidence fan-in",
+            )
+        return None
+
     def _action_key(
         self,
         state: WorkflowState,
@@ -3251,6 +3271,9 @@ class GenericWorkflow:
             stage_kind = "repair"
             attempt = decision.next_attempt
             next_action = "repair"
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
         else:
             if decision.dispatch_kind is DispatchKind.GATES:
                 requests = self._gate_requests(state, ordinal)
@@ -3449,6 +3472,10 @@ class GenericWorkflow:
                 state,
                 "out-of-band pull-request head change",
             )
+        if repair_stage:
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
         assert state.metadata is not None
         automatic_limit = self.manifest.policy.max_repair_attempts
         if state.metadata.repair_round == automatic_limit + 1:
