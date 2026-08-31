@@ -3490,14 +3490,6 @@ class GenericWorkflow:
             return None
         if not open_reservation:
             return None
-        if (
-            action_key not in state.applied_action_keys
-            and metadata.last_action != action_key
-        ):
-            return self._zero_mutation_block(
-                state,
-                "non-repair successor reservation lacks its canonical creation action",
-            )
         missing = wanted - observed
         missing_counts = Counter(missing)
         missing_requests: list[ChildRequest] = []
