@@ -2497,6 +2497,9 @@ class GenericWorkflow:
     def _terminal_repair_wave_authority_problem(
         self,
         state: WorkflowState,
+        *,
+        stage_ordinal: int | None = None,
+        attempt: int | None = None,
     ) -> WorkflowResult | None:
         """Require a stable authoritative whole-wave barrier before fresh Gates."""
 
@@ -2505,11 +2508,21 @@ class GenericWorkflow:
                 state,
                 "terminal Repair Stage authority is unavailable",
             )
+        repair_stage = (
+            state.metadata.stage_ordinal
+            if stage_ordinal is None
+            else stage_ordinal
+        )
+        repair_attempt = (
+            state.metadata.repair_round
+            if attempt is None
+            else attempt
+        )
         current = tuple(
             child
             for child in state.children
-            if child.stage_ordinal == state.metadata.stage_ordinal
-            and child.attempt == state.metadata.repair_round
+            if child.stage_ordinal == repair_stage
+            and child.attempt == repair_attempt
         )
         repositories = tuple(child.repository_key for child in current)
         if (
@@ -3829,6 +3842,27 @@ class GenericWorkflow:
                 state,
                 "non-repair successor reservation conflicts with its exact intended membership",
             )
+        if phases <= {"review", "qa", "integration_qa"}:
+            predecessor = tuple(
+                child
+                for child in state.children
+                if child.stage_ordinal == metadata.stage_ordinal - 1
+                and child.attempt == metadata.repair_round
+            )
+            predecessor_phases = {child.phase for child in predecessor}
+            if "repair" in predecessor_phases:
+                if predecessor_phases != {"repair"}:
+                    return self._zero_mutation_block(
+                        state,
+                        "Gate successor has a mixed predecessor Stage",
+                    )
+                repair_problem = self._terminal_repair_wave_authority_problem(
+                    state,
+                    stage_ordinal=metadata.stage_ordinal - 1,
+                    attempt=metadata.repair_round,
+                )
+                if repair_problem is not None:
+                    return repair_problem
         if observed == wanted and action_key in state.applied_action_keys:
             if terminal_actions:
                 head_problem = self._nonrepair_successor_heads_still_current(
