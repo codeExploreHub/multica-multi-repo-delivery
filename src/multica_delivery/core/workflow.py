@@ -1800,7 +1800,6 @@ class GenericWorkflow:
                         child.action_key not in state.applied_action_keys
                         and not (
                             type(metadata) is ParentMetadata
-                            and child.phase != "repair"
                             and child.active
                             and child.status in _ACTIVE_CHILD_STATUSES
                             and child.stage_ordinal == metadata.stage_ordinal
@@ -4313,6 +4312,296 @@ class GenericWorkflow:
             mutation_count=1,
         )
 
+    def _reconcile_repair_successor(
+        self,
+        state: WorkflowState,
+    ) -> WorkflowResult | None:
+        """Complete one exact partially-created current Repair reservation."""
+
+        metadata = state.metadata
+        if type(metadata) is not ParentMetadata or metadata.repair_round < 1:
+            return None
+        stage_children = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == metadata.stage_ordinal
+        )
+        problem = "partial Repair successor reservation is conflicting"
+        repair_children = tuple(
+            child for child in stage_children if child.phase == "repair"
+        )
+        if not repair_children:
+            if any(
+                child.phase == "repair"
+                and child.attempt == metadata.repair_round
+                for child in state.children
+            ):
+                return self._zero_mutation_block(state, problem)
+            return None
+        if (
+            any(child.phase != "repair" for child in stage_children)
+            or any(child.attempt != metadata.repair_round for child in stage_children)
+            or any(
+                child.phase == "repair"
+                and child.attempt == metadata.repair_round
+                and child.stage_ordinal != metadata.stage_ordinal
+                for child in state.children
+            )
+        ):
+            return self._zero_mutation_block(state, problem)
+
+        first = repair_children[0]
+        source = dict(first.creation_candidate_shas)
+        affected = set(state.snapshot.affected_repositories)
+        if (
+            not source
+            or set(source) != affected
+            or set(state.snapshot.candidate_shas) != affected
+            or set(state.snapshot.pull_requests) != affected
+            or set(state.pull_requests) != affected
+        ):
+            return self._zero_mutation_block(state, problem)
+        bundle = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=metadata.stage_ordinal - 1,
+            source_attempt=metadata.repair_round - 1,
+            repair_round=metadata.repair_round,
+            source=source,
+        )
+        if type(bundle) is not FailureBundle:
+            return self._zero_mutation_block(state, problem)
+        owners = frozenset(
+            repository
+            for failure in bundle.failures
+            for repository in failure.responsible_repositories
+        )
+        authorization_uuid = first.authorizing_comment_uuid
+        creation_action = self._action_key(
+            state,
+            "repair",
+            metadata.stage_ordinal,
+            attempt=metadata.repair_round,
+            candidate_shas=source,
+            failure_bundle_digest=bundle.digest,
+            authorizing_comment_uuid=authorization_uuid,
+        )
+        if (
+            not owners
+            or any(
+                child.action_key != creation_action
+                or child.creation_candidate_shas != first.creation_candidate_shas
+                or child.failure_bundle_digest != bundle.digest
+                or child.authorizing_comment_uuid != authorization_uuid
+                or child.failure_evidence_uuids
+                != _failure_uuid_partition(
+                    bundle.for_repository(child.repository_key)
+                )
+                or child.repository_key not in owners
+                or child.target_key != child.repository_key
+                or child.suite_key
+                for child in repair_children
+            )
+        ):
+            return self._zero_mutation_block(state, problem)
+        observed = Counter(child.repository_key for child in repair_children)
+        if any(count != 1 for count in observed.values()) or not set(observed) <= owners:
+            return self._zero_mutation_block(state, problem)
+        if set(observed) == owners and creation_action in state.applied_action_keys:
+            # A complete reservation belongs to the normal current-Repair
+            # validator and terminal fan-in barrier.  This recovery path only
+            # owns committed prefixes or an unrecorded creation action.
+            return None
+
+        expected_candidates = dict(source)
+        for repository in affected:
+            child = next(
+                (
+                    item
+                    for item in repair_children
+                    if item.repository_key == repository
+                ),
+                None,
+            )
+            aggregate = state.snapshot.children.get(repository)
+            pull_request = state.snapshot.pull_requests[repository]
+            if child is None:
+                if (
+                    repository in owners
+                    and (
+                        state.snapshot.candidate_shas[repository]
+                        != source[repository]
+                        or pull_request.head_sha != source[repository]
+                        or aggregate is None
+                        or aggregate.result != "pass"
+                        or aggregate.candidate_sha != source[repository]
+                    )
+                ):
+                    return self._zero_mutation_block(state, problem)
+                if repository not in owners and (
+                    state.snapshot.candidate_shas[repository]
+                    != source[repository]
+                    or pull_request.head_sha != source[repository]
+                ):
+                    return self._zero_mutation_block(state, problem)
+                continue
+            if child.active and child.status in _ACTIVE_CHILD_STATUSES:
+                if (
+                    state.snapshot.candidate_shas[repository]
+                    != source[repository]
+                    or aggregate is None
+                    or aggregate.result != "pending"
+                    or aggregate.candidate_sha not in {"", source[repository]}
+                ):
+                    return self._zero_mutation_block(state, problem)
+                continue
+            if (
+                child.status != "done"
+                or child.active
+                or child.phase_result != "pass"
+                or aggregate is None
+                or aggregate.result != "pass"
+                or aggregate.candidate_sha
+                != state.snapshot.candidate_shas[repository]
+                or state.snapshot.candidate_shas[repository] == source[repository]
+                or pull_request.head_sha
+                != state.snapshot.candidate_shas[repository]
+            ):
+                return self._zero_mutation_block(state, problem)
+            expected_candidates[repository] = state.snapshot.candidate_shas[repository]
+        if dict(state.snapshot.candidate_shas) != expected_candidates:
+            return self._zero_mutation_block(state, problem)
+
+        def read_authorization() -> AuthorizingComment | None | object:
+            if metadata.repair_round <= self.manifest.policy.max_repair_attempts:
+                return None if not authorization_uuid else object()
+            if not authorization_uuid:
+                return object()
+            try:
+                comment = self.snapshot_reader.read_authorizing_comment(
+                    state.parent_identifier,
+                    authorization_uuid,
+                )
+            except Exception:
+                return object()
+            return (
+                comment
+                if type(comment) is AuthorizingComment
+                and comment.comment_uuid == authorization_uuid
+                and comment.author_type == "member"
+                else object()
+            )
+
+        wave_authority = self._authoritative_repair_wave_completion_actions(
+            state,
+            first,
+            allow_incomplete_wave=True,
+        )
+        authorization = read_authorization()
+        if wave_authority is None or type(authorization) is object:
+            return self._zero_mutation_block(state, problem)
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        refreshed_bundle = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=metadata.stage_ordinal - 1,
+            source_attempt=metadata.repair_round - 1,
+            repair_round=metadata.repair_round,
+            source=source,
+        )
+        if (
+            refreshed_bundle != bundle
+            or self._authoritative_repair_wave_completion_actions(
+                state,
+                first,
+                allow_incomplete_wave=True,
+            )
+            != wave_authority
+            or read_authorization() != authorization
+        ):
+            return self._zero_mutation_block(state, problem)
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+
+        requests = tuple(
+            ChildRequest(
+                target_key=repository,
+                repository_key=repository,
+                suite_key="",
+                phase="repair",
+                stage_ordinal=metadata.stage_ordinal,
+                attempt=metadata.repair_round,
+                candidate_shas=source,
+                pull_request=state.pull_requests[repository],
+                failure_bundle=bundle,
+                failure_refs=bundle.for_repository(repository),
+                authorizing_comment_uuid=authorization_uuid,
+            )
+            for repository in metadata.affected_repositories
+            if repository in owners
+        )
+        wanted = Counter(
+            self._successor_request_identity(request, creation_action)
+            for request in requests
+        )
+        observed_identities = Counter(
+            self._successor_child_identity(child) for child in repair_children
+        )
+        if observed_identities - wanted:
+            return self._zero_mutation_block(state, problem)
+        missing = tuple(
+            request
+            for request in requests
+            if self._successor_request_identity(request, creation_action)
+            not in observed_identities
+        )
+        if not missing and creation_action in state.applied_action_keys:
+            return None
+        try:
+            self.executor.create_children(
+                state.parent_identifier,
+                missing,
+                metadata,
+                action_key=creation_action,
+            )
+        except Exception:
+            pass
+
+        def reservation_complete(current: WorkflowState) -> bool:
+            return (
+                current.parent_identifier == state.parent_identifier
+                and current.metadata == metadata
+                and creation_action in current.applied_action_keys
+                and Counter(
+                    self._successor_child_identity(child)
+                    for child in current.children
+                    if child.stage_ordinal == metadata.stage_ordinal
+                    and child.attempt == metadata.repair_round
+                )
+                == wanted
+            )
+
+        current = self._reconcile_parent(
+            state.parent_identifier,
+            reservation_complete,
+        )
+        if current is None:
+            return self._uncertain(
+                state,
+                "Repair successor reservation is not yet authoritatively complete",
+                action_key=creation_action,
+                mutation_count=1,
+            )
+        return self._result(
+            current,
+            "repair",
+            "completed the exact partial Repair successor reservation",
+            created=tuple((request.target_key, request.phase) for request in missing),
+            action_key=creation_action,
+            mutation_count=1,
+        )
+
     def resume_parent(self, parent_identifier: str) -> WorkflowResult:
         try:
             state = self.snapshot_reader.read(parent_identifier)
@@ -4351,6 +4640,9 @@ class GenericWorkflow:
         nonrepair_successor = self._reconcile_nonrepair_successor(state)
         if nonrepair_successor is not None:
             return nonrepair_successor
+        repair_successor = self._reconcile_repair_successor(state)
+        if repair_successor is not None:
+            return repair_successor
         repair_stage, repair_head_problem = self._current_repair_head_problem(state)
         if repair_head_problem is not None:
             return self._zero_mutation_block(state, repair_head_problem)
@@ -5370,6 +5662,8 @@ class GenericWorkflow:
         self,
         state: WorkflowState,
         replayed: WorkflowChild,
+        *,
+        allow_incomplete_wave: bool = False,
     ) -> Mapping[str, str] | None:
         """Prove one Repair wave's incremental completion-action chain."""
 
@@ -5404,7 +5698,11 @@ class GenericWorkflow:
         if (
             not wave
             or len(repositories) != len(set(repositories))
-            or set(repositories) != set(expected_partitions)
+            or (
+                not set(repositories) <= set(expected_partitions)
+                if allow_incomplete_wave
+                else set(repositories) != set(expected_partitions)
+            )
             or any(
                 child.action_key != replayed.action_key
                 or child.creation_candidate_shas
