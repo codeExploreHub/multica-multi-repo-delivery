@@ -182,6 +182,30 @@ class MulticaClientTests(unittest.TestCase):
                     invoke(MulticaClient(runner))
                 self.assertEqual(len(runner.calls), 1)
 
+    def test_skill_reads_reject_source_url_only_legacy_fake_origin(self):
+        runner = FakeRunner(
+            {"data": {"skills": [{"id": "skill-1", "name": "using-superpowers"}]}},
+            {
+                "data": {
+                    "skill": {
+                        "id": "skill-1",
+                        "name": "using-superpowers",
+                        "config": {
+                            "origin": {
+                                "source_url": (
+                                    "https://github.com/obra/superpowers/tree/"
+                                    "main/skills/using-superpowers"
+                                )
+                            }
+                        },
+                    }
+                }
+            },
+        )
+
+        with self.assertRaisesRegex(MulticaContractError, "skill get"):
+            MulticaClient(runner).list_skills()
+
     def test_server_derived_resource_and_binding_ids_are_strict(self):
         cases = (
             (

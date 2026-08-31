@@ -9,6 +9,7 @@ import sys
 
 STATE = Path(os.environ["MULTICA_FAKE_STATE"])
 ARGS = sys.argv[1:]
+RESOLVED_SKILL_REF = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
 
 
 def load():
@@ -44,13 +45,33 @@ def mutate(state, event):
     state["events"].append(event)
 
 
+def resolved_skill_origin(url):
+    parts = url.split("/")
+    ref = parts[6]
+    if not (
+        len(ref) == 40
+        and all(character in "0123456789abcdef" for character in ref)
+    ):
+        ref = RESOLVED_SKILL_REF
+        parts[6] = ref
+        url = "/".join(parts)
+    return {
+        "type": "github",
+        "owner": parts[3],
+        "repo": parts[4],
+        "ref": ref,
+        "path": "/".join(parts[7:]),
+        "source_url": url,
+    }
+
+
 state = load()
 
 if ARGS == ["--version"]:
-    print("multica 0.4.33")
+    print("multica 0.4.36")
     raise SystemExit(0)
 if ARGS == ["version", "--output", "json"]:
-    emit({"version": "0.4.33"})
+    emit({"version": "0.4.36"})
 if ARGS == ["runtime", "list", "--output", "json"]:
     emit({"runtimes": [state["runtime"]]})
 if ARGS == ["project", "list", "--output", "json"]:
@@ -91,7 +112,11 @@ if ARGS == ["capability", "get", "skill-import", "--output", "json"]:
 if ARGS[:2] == ["skill", "import"]:
     url = option("--url")
     identifier = next_id(state, "skill")
-    record = {"id": identifier, "name": url.rstrip("/").split("/")[-1], "config": {"origin": {"source_url": url}}}
+    record = {
+        "id": identifier,
+        "name": url.rstrip("/").split("/")[-1],
+        "config": {"origin": resolved_skill_origin(url)},
+    }
     state["skills"][identifier] = record
     mutate(state, "skill.import")
     save(state)

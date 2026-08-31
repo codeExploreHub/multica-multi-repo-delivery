@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _GITHUB_COMPONENT = re.compile(r"[A-Za-z0-9._-]+\Z")
 _COMMIT_REF = re.compile(r"[0-9a-f]{40}\Z")
-_CASE_INSENSITIVE_COMMIT_REF = re.compile(r"[0-9A-Fa-f]{40}\Z")
+_COMMIT_LIKE_REF = re.compile(r"[0-9A-Fa-f]{4,}\Z")
 
 
 def parse_github_skill_url(value: Any) -> dict[str, str]:
@@ -40,7 +40,7 @@ def parse_github_skill_url(value: Any) -> dict[str, str]:
     owner, repo, ref = parts[1], parts[2], parts[4]
     path = "/".join(parts[5:])
     if (
-        _CASE_INSENSITIVE_COMMIT_REF.fullmatch(ref) is not None
+        _COMMIT_LIKE_REF.fullmatch(ref) is not None
         and _COMMIT_REF.fullmatch(ref) is None
     ):
         raise ValueError("Skill URL must be a canonical public GitHub tree URL")
