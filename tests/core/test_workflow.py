@@ -78,6 +78,27 @@ SMOKE_OBSERVATION = {
     "second": "smoke:" + "2" * 64,
     "third": "smoke:" + "3" * 64,
 }
+
+
+def implementation_creation_action(
+    *,
+    parent_identifier: str = "PRO-101",
+    stage_ordinal: int = 1,
+    attempt: int = 0,
+    affected_repositories: frozenset[str] = frozenset({"api"}),
+    candidate_shas: dict[str, str] | None = None,
+) -> str:
+    return coordinator_action_key(
+        workflow_version=2,
+        instance_key="sample-commerce",
+        parent_identifier=parent_identifier,
+        stage_kind="implementation",
+        stage_ordinal=stage_ordinal,
+        attempt=attempt,
+        affected_repositories=affected_repositories,
+        candidate_shas=candidate_shas or {},
+        contract_hashes={},
+    )
 _PROCESS_TEMPORARIES: list[TemporaryDirectory[str]] = []
 
 
@@ -289,6 +310,7 @@ class FakeWorkflowStore:
         self.retain_gates_on_replacement = False
         self.change_on_recovery_reread = False
         self.activate_on_rerun = False
+        self.rerun_child_changes: dict[str, object] = {}
         self.mutate_gate_on_rerun = False
         self.fail_reads_after_first_merge_progress = 0
         self.failed_merge_progress_read = False
@@ -1451,7 +1473,7 @@ class FakeWorkflowStore:
         self.events.append(("rerun", parent_identifier, child_identifier, action_key))
         state = self.states[parent_identifier]
         children = tuple(
-            replace(child, active=True)
+            replace(child, active=True, **self.rerun_child_changes)
             if self.activate_on_rerun and child.identifier == child_identifier
             else child
             for child in state.children
@@ -2024,6 +2046,48 @@ class TaskFourWorkflowFixture:
 
 
 class WorkflowCompletionImmutabilityTests(TaskFourWorkflowFixture, unittest.TestCase):
+    def test_watcher_repair_preflight_requires_exact_current_wave_and_round_three_comment(self):
+        for comment_present, expected_action in ((True, "resume"), (False, "block")):
+            with self.subTest(comment_present=comment_present):
+                self.dispatch_authorized_repair()
+                state = self.store.states["PRO-200"]
+                current_repair = tuple(
+                    child
+                    for child in state.children
+                    if child.phase == "repair"
+                    and child.stage_ordinal == state.metadata.stage_ordinal
+                )
+                stalled = replace(
+                    state,
+                    snapshot=replace(
+                        state.snapshot,
+                        stalled=True,
+                        stalled_repository="api",
+                    ),
+                    children=tuple(
+                        replace(child, active=False)
+                        if child in current_repair
+                        else child
+                        for child in state.children
+                    ),
+                    active_work=False,
+                )
+                self.store.states["PRO-200"] = stalled
+                if not comment_present:
+                    self.store.authorizing_comments.clear()
+                self.store.activate_on_rerun = True
+                self.store.events.clear()
+
+                result = self.workflow.recover_stalled_parent("PRO-200")
+
+                self.assertEqual(result.next_action, expected_action)
+                if not comment_present:
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertEqual(self.store.states["PRO-200"], stalled)
+                    self.assertFalse(
+                        any(event[0] == "rerun" for event in self.store.events)
+                    )
+
     def test_completed_repair_cannot_submit_a_second_replacement_sha(self):
         bundle = self.dispatch_authorized_repair()
         state = self.store.states["PRO-200"]
@@ -10395,7 +10459,7 @@ class GenericWorkflowTests(unittest.TestCase):
             1,
             0,
             "in_progress",
-            "dispatch:" + "3" * 64,
+            implementation_creation_action(),
             False,
         )
         snapshot = ParentSnapshot(
@@ -10494,6 +10558,140 @@ class GenericWorkflowTests(unittest.TestCase):
             )
         )
 
+    def test_watcher_preflight_rejects_noncurrent_child_creation_provenance(self):
+        variants = {
+            "arbitrary applied action": None,
+            "coherent wrong creation candidates": {"api": SHA["api"]},
+        }
+        for label, creation_candidates in variants.items():
+            with self.subTest(label=label):
+                self.store.states.clear()
+                self.store.events.clear()
+                self.store.read_counts.clear()
+                self.store.add_blank("PRO-101")
+                self.workflow.handle_parent_event(
+                    "PRO-101", affected=frozenset({"api"})
+                )
+                created = self.store.states["PRO-101"]
+                child = created.children[0]
+                if creation_candidates is None:
+                    forged_action = "dispatch:" + "f" * 64
+                    forged_candidates = dict(child.creation_candidate_shas)
+                else:
+                    forged_candidates = creation_candidates
+                    forged_action = coordinator_action_key(
+                        workflow_version=2,
+                        instance_key="sample-commerce",
+                        parent_identifier="PRO-101",
+                        stage_kind="implementation",
+                        stage_ordinal=child.stage_ordinal,
+                        attempt=child.attempt,
+                        affected_repositories=frozenset({"api"}),
+                        candidate_shas=forged_candidates,
+                        contract_hashes={},
+                    )
+                forged = replace(
+                    child,
+                    active=False,
+                    action_key=forged_action,
+                    creation_candidate_shas=forged_candidates,
+                )
+                stalled = replace(
+                    created,
+                    snapshot=replace(
+                        created.snapshot,
+                        stalled=True,
+                        stalled_repository="api",
+                    ),
+                    children=(forged,),
+                    active_work=False,
+                    applied_action_keys=created.applied_action_keys
+                    | {forged_action},
+                )
+                self.store.states["PRO-101"] = stalled
+                self.store.activate_on_rerun = True
+                self.store.events.clear()
+
+                result = self.workflow.recover_stalled_parent("PRO-101")
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertEqual(self.store.states["PRO-101"], stalled)
+                self.assertFalse(
+                    any(event[0] == "rerun" for event in self.store.events)
+                )
+
+    def test_watcher_post_effect_rejects_every_immutable_child_provenance_change(self):
+        drift_uuid = evidence_uuid("watcher-rerun-provenance-drift")
+        variants = {
+            "target": {"target_key": "web"},
+            "repository": {"repository_key": "web"},
+            "suite": {"suite_key": "forged-suite"},
+            "phase": {"phase": "review"},
+            "stage": {"stage_ordinal": 0},
+            "attempt": {"attempt": 1},
+            "creation action": {"action_key": "dispatch:" + "f" * 64},
+            "creation candidates": {"creation_candidate_shas": {"api": SHA["api"]}},
+            "completion identity": {
+                "evidence_comment_uuid": drift_uuid,
+                "phase_result": "pass",
+                "evidence_comment_url": f"https://example.test/evidence/{drift_uuid}",
+            },
+            "responsible owners": {"responsible_repositories": ("api",)},
+            "failure bundle": {"failure_bundle_digest": "f" * 64},
+            "failure partition": {"failure_evidence_uuids": (drift_uuid,)},
+            "authorization": {"authorizing_comment_uuid": drift_uuid},
+        }
+        for label, changes in variants.items():
+            with self.subTest(label=label):
+                self.store.states.clear()
+                self.store.events.clear()
+                self.store.read_counts.clear()
+                self.store.add_blank("PRO-101")
+                self.workflow.handle_parent_event(
+                    "PRO-101", affected=frozenset({"api"})
+                )
+                created = self.store.states["PRO-101"]
+                child = created.children[0]
+                stalled = replace(
+                    created,
+                    snapshot=replace(
+                        created.snapshot,
+                        stalled=True,
+                        stalled_repository="api",
+                    ),
+                    children=(replace(child, active=False),),
+                    active_work=False,
+                )
+                self.store.states["PRO-101"] = stalled
+                self.store.activate_on_rerun = True
+                self.store.rerun_child_changes = changes
+                parent_authority = (
+                    stalled.parent_status,
+                    stalled.metadata,
+                    stalled.applied_action_keys,
+                    stalled.pull_requests,
+                )
+                self.store.events.clear()
+
+                result = self.workflow.recover_stalled_parent("PRO-101")
+
+                after = self.store.states["PRO-101"]
+                self.assertEqual(result.next_action, "block")
+                self.assertNotEqual(result.next_action, "resume")
+                self.assertEqual(
+                    (
+                        after.parent_status,
+                        after.metadata,
+                        after.applied_action_keys,
+                        after.pull_requests,
+                    ),
+                    parent_authority,
+                )
+                self.assertFalse(
+                    any(event[0] in {"status", "create"} for event in self.store.events)
+                )
+
     def test_watcher_entrypoints_fail_closed_without_mutation_for_future_child_relationship(self):
         future_child = WorkflowChild(
             "PRO-101-FUTURE", "api", "api", "", "implementation", 6, 0,
@@ -10530,7 +10728,7 @@ class GenericWorkflowTests(unittest.TestCase):
     def test_watcher_does_not_accept_metadata_only_rerun_as_recovery(self):
         child = WorkflowChild(
             "PRO-101-API", "api", "api", "", "implementation", 1, 0,
-            "in_progress", "dispatch:" + "b" * 64, False,
+            "in_progress", implementation_creation_action(), False,
         )
         snapshot = ParentSnapshot(
             affected_repositories=("api",),
@@ -10555,7 +10753,7 @@ class GenericWorkflowTests(unittest.TestCase):
             1,
             0,
             "in_progress",
-            "dispatch:" + "3" * 64,
+            implementation_creation_action(),
             False,
         )
         snapshot = ParentSnapshot(
@@ -10619,7 +10817,7 @@ class GenericWorkflowTests(unittest.TestCase):
     def test_direct_recovery_reread_scope_mismatch_uses_last_trusted_requested_state(self):
         child = WorkflowChild(
             "PRO-101-API", "api", "api", "", "implementation", 1, 0,
-            "in_progress", "dispatch:" + "3" * 64, False,
+            "in_progress", implementation_creation_action(), False,
         )
         snapshot = ParentSnapshot(
             affected_repositories=("api",),
@@ -10670,7 +10868,7 @@ class GenericWorkflowTests(unittest.TestCase):
             1,
             0,
             "in_progress",
-            "dispatch:" + "3" * 64,
+            implementation_creation_action(),
             False,
         )
         snapshot = ParentSnapshot(
@@ -10711,7 +10909,7 @@ class GenericWorkflowTests(unittest.TestCase):
             1,
             0,
             "in_progress",
-            "dispatch:" + "3" * 64,
+            implementation_creation_action(),
             False,
         )
         snapshot = ParentSnapshot(
@@ -10771,7 +10969,7 @@ class GenericWorkflowTests(unittest.TestCase):
             1,
             0,
             "in_progress",
-            "dispatch:" + "5" * 64,
+            implementation_creation_action(),
             False,
         )
         snapshot = ParentSnapshot(
@@ -10825,7 +11023,7 @@ class GenericWorkflowTests(unittest.TestCase):
             1,
             0,
             "in_progress",
-            "dispatch:" + "9" * 64,
+            implementation_creation_action(),
             False,
         )
         snapshot = ParentSnapshot(
@@ -10853,7 +11051,7 @@ class GenericWorkflowTests(unittest.TestCase):
             1,
             0,
             "in_progress",
-            "dispatch:" + "a" * 64,
+            implementation_creation_action(),
             False,
         )
         snapshot = ParentSnapshot(
@@ -10880,7 +11078,7 @@ class GenericWorkflowTests(unittest.TestCase):
             1,
             0,
             "in_progress",
-            "dispatch:" + "6" * 64,
+            implementation_creation_action(),
             False,
         )
         snapshot = ParentSnapshot(
@@ -11290,7 +11488,7 @@ class GenericWorkflowTests(unittest.TestCase):
             historical,
             identifier="PRO-101-CURRENT",
             stage_ordinal=5,
-            action_key="dispatch:" + "2" * 64,
+            action_key=implementation_creation_action(stage_ordinal=5),
         )
         self.store.add_state("PRO-101", snapshot, children=(historical, current))
         state = self.store.states["PRO-101"]

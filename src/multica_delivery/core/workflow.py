@@ -5008,6 +5008,118 @@ class GenericWorkflow:
         expected.update(sibling_changes)
         return expected == current
 
+    def _child_creation_provenance_problem(
+        self,
+        state: WorkflowState,
+        child: WorkflowChild,
+    ) -> str | None:
+        """Bind one child to its canonical current creation transition."""
+
+        creation_stage_kind = (
+            "gates"
+            if child.phase in {"review", "qa", "integration_qa"}
+            else child.phase
+        )
+        expected_creation_key = self._action_key(
+            state,
+            creation_stage_kind,
+            child.stage_ordinal,
+            attempt=child.attempt,
+            candidate_shas=child.creation_candidate_shas,
+            failure_bundle_digest=(
+                child.failure_bundle_digest
+                if child.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                child.authorizing_comment_uuid
+                if child.phase == "repair"
+                else ""
+            ),
+        )
+        if (
+            child.action_key != expected_creation_key
+            or expected_creation_key not in state.applied_action_keys
+            or not self._creation_candidates_match(state, child)
+        ):
+            return "phase child creation provenance is not current"
+        return None
+
+    def _watcher_child_creation_provenance_problem(
+        self,
+        state: WorkflowState,
+        child: WorkflowChild,
+    ) -> str | None:
+        problem = self._child_creation_provenance_problem(state, child)
+        if problem is not None or child.phase != "repair":
+            return problem
+        # The Repair validator expects an active current executor.  Reconstruct
+        # only that liveness bit for the exact stalled child; every immutable
+        # field and all sibling/source authority still come from the reread.
+        repair_authority_state = replace(
+            state,
+            children=tuple(
+                replace(item, active=True)
+                if item.identifier == child.identifier
+                else item
+                for item in state.children
+            ),
+            active_work=True,
+        )
+        repair_stage, repair_problem = self._current_repair_head_problem(
+            repair_authority_state
+        )
+        if not repair_stage or repair_problem is not None:
+            return repair_problem or "current Repair Stage provenance is unavailable"
+        if child.attempt <= self.manifest.policy.max_repair_attempts:
+            return (
+                None
+                if not child.authorizing_comment_uuid
+                else "automatic Repair child has unexpected authorization"
+            )
+        if not child.authorizing_comment_uuid:
+            return "member-authorized Repair child lacks authorization"
+        try:
+            comments = tuple(
+                self.snapshot_reader.read_authorizing_comment(
+                    state.parent_identifier,
+                    child.authorizing_comment_uuid,
+                )
+                for _ in range(2)
+            )
+        except Exception:
+            return "member-authorized Repair comment is unavailable"
+        if (
+            comments[0] != comments[1]
+            or type(comments[0]) is not AuthorizingComment
+            or comments[0].comment_uuid != child.authorizing_comment_uuid
+            or comments[0].author_type != "member"
+        ):
+            return "member-authorized Repair comment is not authoritative"
+        return None
+
+    @staticmethod
+    def _rerun_child_immutable_provenance(
+        child: WorkflowChild,
+    ) -> tuple[object, ...]:
+        return (
+            child.target_key,
+            child.repository_key,
+            child.suite_key,
+            child.phase,
+            child.stage_ordinal,
+            child.attempt,
+            child.action_key,
+            child.evidence_comment_uuid,
+            tuple(child.creation_candidate_shas.items()),
+            child.phase_result,
+            child.evidence_comment_url,
+            child.responsible_repositories,
+            child.failure_bundle_digest,
+            child.failure_evidence_uuids,
+            child.authorizing_comment_uuid,
+        )
+
     def _completion_problem(
         self,
         state: WorkflowState,
@@ -5125,33 +5237,7 @@ class GenericWorkflow:
         ):
             return "repair completion failure bundle digest does not match assigned child", None
         child = matching[0]
-        creation_stage_kind = (
-            "gates"
-            if completion.phase in {"review", "qa", "integration_qa"}
-            else completion.phase
-        )
-        expected_creation_key = self._action_key(
-            state,
-            creation_stage_kind,
-            child.stage_ordinal,
-            attempt=child.attempt,
-            candidate_shas=child.creation_candidate_shas,
-            failure_bundle_digest=(
-                child.failure_bundle_digest
-                if completion.phase == "repair"
-                else ""
-            ),
-            authorizing_comment_uuid=(
-                child.authorizing_comment_uuid
-                if completion.phase == "repair"
-                else ""
-            ),
-        )
-        if (
-            child.action_key != expected_creation_key
-            or expected_creation_key not in state.applied_action_keys
-            or not self._creation_candidates_match(state, child)
-        ):
+        if self._child_creation_provenance_problem(state, child) is not None:
             return "phase completion child creation provenance is not current", None
         return None, child
 
@@ -7424,6 +7510,12 @@ class GenericWorkflow:
         )
         if len(candidates) != 1:
             return self._result(initial, "noop", "watcher cannot identify one existing stalled child")
+        creation_problem = self._watcher_child_creation_provenance_problem(
+            initial,
+            candidates[0],
+        )
+        if creation_problem is not None:
+            return self._zero_mutation_block(initial, creation_problem)
 
         try:
             fresh = self.snapshot_reader.read(parent_identifier)
@@ -7456,6 +7548,12 @@ class GenericWorkflow:
             or self._parent_decision(fresh) != decision
         ):
             return self._result(fresh, "noop", "workflow changed before recovery")
+        creation_problem = self._watcher_child_creation_provenance_problem(
+            fresh,
+            candidates[0],
+        )
+        if creation_problem is not None:
+            return self._zero_mutation_block(fresh, creation_problem)
         assert fresh.metadata is not None
         key = self._action_key(
             fresh,
@@ -7469,20 +7567,6 @@ class GenericWorkflow:
             )
         before_children = fresh.children
         target_identifier = candidates[0].identifier
-
-        def child_identity(child: WorkflowChild) -> tuple[object, ...]:
-            return (
-                child.identifier,
-                child.target_key,
-                child.repository_key,
-                child.suite_key,
-                child.phase,
-                child.stage_ordinal,
-                child.attempt,
-                child.action_key,
-                child.evidence_comment_uuid,
-                tuple(child.creation_candidate_shas.items()),
-            )
 
         try:
             self.executor.rerun_child(
@@ -7528,22 +7612,18 @@ class GenericWorkflow:
             same_target is not None
             and not before_target.active
             and same_target.active
+            and same_target.status in _ACTIVE_CHILD_STATUSES
+            and self._rerun_child_immutable_provenance(same_target)
+            == self._rerun_child_immutable_provenance(before_target)
         )
         replacement_targets = tuple(
             child
             for child in observed.children
             if child.identifier != target_identifier
-            and child.repository_key == before_target.repository_key
-            and child.target_key == before_target.target_key
-            and child.suite_key == before_target.suite_key
-            and child.phase == before_target.phase
-            and child.stage_ordinal == before_target.stage_ordinal
-            and child.attempt == before_target.attempt
-            and child.action_key == before_target.action_key
-            and child.creation_candidate_shas
-            == before_target.creation_candidate_shas
             and child.active
-            and child_identity(child) != child_identity(before_target)
+            and child.status in _ACTIVE_CHILD_STATUSES
+            and self._rerun_child_immutable_provenance(child)
+            == self._rerun_child_immutable_provenance(before_target)
         )
         target_has_new_run = target_reactivated or len(replacement_targets) == 1
         if target_reactivated:
@@ -7557,6 +7637,11 @@ class GenericWorkflow:
             }
         else:
             allowed_after_identifiers = set()
+        old_target_is_unchanged_or_reactivated = (
+            same_target is None
+            or same_target == before_target
+            or target_reactivated
+        )
         unchanged_other_children = all(
             after_by_id.get(identifier) == before
             for identifier, before in before_by_id.items()
@@ -7570,6 +7655,7 @@ class GenericWorkflow:
             or observed.snapshot.recovery_count != fresh.snapshot.recovery_count + 1
             or normalized_observed_snapshot != fresh.snapshot
             or not target_has_new_run
+            or not old_target_is_unchanged_or_reactivated
             or not observed.active_work
             or frozenset(after_by_id) not in allowed_after_identifiers
             or not unchanged_other_children
