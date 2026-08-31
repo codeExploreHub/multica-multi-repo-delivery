@@ -4216,33 +4216,31 @@ class GenericWorkflow:
         except Exception:
             # Reconcile because the effect may have committed before failing.
             pass
-        observed: PhaseCompletion | None = None
-        evidence_read_succeeded = False
+        observations: list[PhaseCompletion | None] = []
+        evidence_read_failed = False
         for _ in range(2):
             try:
-                candidate = self.snapshot_reader.read_phase_completion(
-                    parent_identifier,
-                    completion.evidence_comment_uuid,
+                observations.append(
+                    self.snapshot_reader.read_phase_completion(
+                        parent_identifier,
+                        completion.evidence_comment_uuid,
+                    )
                 )
             except Exception:
-                continue
-            evidence_read_succeeded = True
-            if candidate == completion:
-                observed = candidate
-                break
-        if observed is None:
-            if evidence_read_succeeded:
-                return WorkflowResult(
-                    parent_identifier,
-                    "blocked",
-                    "block",
-                    "phase completion evidence reread did not match",
-                    action_key=key,
-                    mutation_count=1,
-                )
+                evidence_read_failed = True
+        if evidence_read_failed:
             return self._uncertain(
                 state,
                 "phase completion evidence is not yet authoritatively observable",
+                action_key=key,
+                mutation_count=1,
+            )
+        if observations != [completion, completion]:
+            return WorkflowResult(
+                parent_identifier,
+                "blocked",
+                "block",
+                "phase completion evidence reread did not match",
                 action_key=key,
                 mutation_count=1,
             )

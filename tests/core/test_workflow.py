@@ -277,6 +277,9 @@ class FakeWorkflowStore:
         self.rollback_calls: list[object] = []
         self.corrupt_completion_read = False
         self.change_completion_after_first_read = False
+        self.change_completion_after_first_post_write_read = False
+        self.completion_read_failures_after_write = 0
+        self.drop_completion_after_write = False
         self.change_after_completion_read = False
         self.parent_drift_after_completion_read: str | None = None
         self.parent_drift_after_authorizing_comment = False
@@ -817,6 +820,20 @@ class FakeWorkflowStore:
     ) -> None:
         self.events.append(("write-completion", completion.evidence_comment_uuid, action_key))
         self.completions[(completion.parent_identifier, completion.evidence_comment_uuid)] = completion
+        if self.change_completion_after_first_post_write_read:
+            self.change_completion_after_first_post_write_read = False
+            self.change_completion_after_first_read = True
+        if self.completion_read_failures_after_write:
+            self.completion_read_failures_remaining = (
+                self.completion_read_failures_after_write
+            )
+            self.completion_read_failures_after_write = 0
+        if self.drop_completion_after_write:
+            self.drop_completion_after_write = False
+            self.completions.pop(
+                (completion.parent_identifier, completion.evidence_comment_uuid),
+                None,
+            )
 
     def read_phase_completion(
         self,
@@ -2490,6 +2507,34 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                     )
                 )
 
+    def test_repair_post_write_completion_reads_must_be_stable_before_done(self):
+        for repair_round in (1, 2, 3):
+            for corruption in ("changed", "missing", "read-error"):
+                with self.subTest(
+                    repair_round=repair_round,
+                    corruption=corruption,
+                ):
+                    self.store.states.clear()
+                    self.store.completions.clear()
+                    completion = self.seed_active_parallel_repair(repair_round)
+                    if corruption == "changed":
+                        self.store.change_completion_after_first_post_write_read = True
+                    elif corruption == "missing":
+                        self.store.drop_completion_after_write = True
+                    else:
+                        self.store.completion_read_failures_after_write = 1
+
+                    result = self.workflow.record_phase_completion(completion)
+
+                    self.assertIn(result.next_action, {"block", "uncertain"})
+                    self.assertEqual(result.mutation_count, 1)
+                    self.assertFalse(
+                        any(
+                            event[0] in {"done", "create"}
+                            for event in self.store.events
+                        )
+                    )
+
     def test_stable_repair_completion_and_exact_replay_remain_idempotent(self):
         for repair_round in (1, 2, 3):
             with self.subTest(repair_round=repair_round):
@@ -2503,11 +2548,18 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                     for event in self.store.events
                     if event[0] in {"write-completion", "done"}
                 )
+                event_names = tuple(event[0] for event in self.store.events)
+                write_index = event_names.index("write-completion")
+                done_index = event_names.index("done")
+                stable_post_write_reads = event_names[
+                    write_index + 1:done_index
+                ].count("read-completion")
                 self.store.events.clear()
                 replay = self.workflow.record_phase_completion(completion)
 
                 self.assertEqual(completed.completed_child_status, "done")
                 self.assertEqual(completion_events, ("write-completion", "done"))
+                self.assertEqual(stable_post_write_reads, 2)
                 self.assertEqual(replay.next_action, "noop")
                 self.assertEqual(replay.mutation_count, 0)
                 self.assertFalse(
@@ -4195,7 +4247,58 @@ class GenericWorkflowTests(unittest.TestCase):
         self.assertLess(read_positions[0], order.index("write-completion"))
         self.assertLess(order.index("write-completion"), read_positions[-1])
         self.assertLess(read_positions[-1], order.index("done"))
+        self.assertEqual(
+            order[order.index("write-completion") + 1:order.index("done")].count(
+                "read-completion"
+            ),
+            2,
+        )
         self.assertLess(order.index("done"), order.index("create"))
+
+    def test_gate_post_write_completion_reads_must_be_stable_before_done(self):
+        for parent, corruption in zip(
+            ("PRO-101", "PRO-102", "PRO-103"),
+            ("changed", "missing", "read-error"),
+            strict=True,
+        ):
+            with self.subTest(corruption=corruption):
+                self.store.change_completion_after_first_read = False
+                self.store.change_completion_after_first_post_write_read = False
+                self.store.completion_read_failures_remaining = 0
+                self.store.completion_read_failures_after_write = 0
+                self.store.drop_completion_after_write = False
+                self.workflow.handle_parent_event(
+                    parent,
+                    affected=frozenset({"api"}),
+                )
+                implemented = self.workflow.record_phase_completion(
+                    completion_for("api", parent=parent)
+                )
+                self.assertEqual(
+                    implemented.completed_child_status,
+                    "done",
+                    implemented.reason,
+                )
+                self.store.events.clear()
+                if corruption == "changed":
+                    self.store.change_completion_after_first_post_write_read = True
+                elif corruption == "missing":
+                    self.store.drop_completion_after_write = True
+                else:
+                    self.store.completion_read_failures_after_write = 1
+
+                result = self.workflow.record_phase_completion(
+                    completion_for("api", phase="review", parent=parent)
+                )
+
+                self.assertIn(result.next_action, {"block", "uncertain"})
+                self.assertEqual(result.mutation_count, 1)
+                self.assertFalse(
+                    any(
+                        event[0] in {"done", "create"}
+                        for event in self.store.events
+                    )
+                )
 
     def test_gate_stage_has_independent_repository_and_integration_children(self):
         self.workflow.handle_parent_event("PRO-101", affected=frozenset({"api", "web"}))
