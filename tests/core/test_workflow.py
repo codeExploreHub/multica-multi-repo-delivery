@@ -283,6 +283,8 @@ class FakeWorkflowStore:
         self.change_after_completion_read = False
         self.parent_drift_after_completion_read: str | None = None
         self.parent_drift_after_authorizing_comment = False
+        self.completion_drift_after_parent_reread: str | None = None
+        self.delete_authorization_after_parent_reread: tuple[str, str] | None = None
         self.completion_read_failures_remaining = 0
         self.retain_gates_on_replacement = False
         self.change_on_recovery_reread = False
@@ -639,6 +641,29 @@ class FakeWorkflowStore:
                 state,
                 parent_identifier=self.read_parent_identifier_override,
             )
+        completion_uuid = self.completion_drift_after_parent_reread
+        completion_key = (parent_identifier, completion_uuid or "")
+        if (
+            completion_uuid is not None
+            and completion_key in self.completions
+            and any(event[0] == "read-completion" for event in self.events[:-1])
+        ):
+            self.completion_drift_after_parent_reread = None
+            self.completions[completion_key] = replace(
+                self.completions[completion_key],
+                result="blocked",
+            )
+        authorization_key = self.delete_authorization_after_parent_reread
+        if (
+            authorization_key is not None
+            and authorization_key in self.authorizing_comments
+            and any(
+                event[0] == "read-authorizing-comment"
+                for event in self.events[:-1]
+            )
+        ):
+            self.delete_authorization_after_parent_reread = None
+            del self.authorizing_comments[authorization_key]
         return state
 
     def list_active_parents(
@@ -2006,6 +2031,21 @@ class WorkflowRepairAuthorizationTests(TaskFourWorkflowFixture, unittest.TestCas
         )
         self.assertFalse(any(event[0] == "create" for event in self.store.events))
 
+    def test_authorization_deleted_after_parent_reread_blocks_repair_dispatch(self):
+        self.authorize_extra_round()
+        authorization_key = (
+            "PRO-200",
+            "00000000-0000-4000-8000-000000000021",
+        )
+        self.store.delete_authorization_after_parent_reread = authorization_key
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-200")
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
     def test_automatic_rounds_one_and_two_increment_only_automatic_count(self):
         for current_round, expected_round in ((0, 1), (1, 2)):
             with self.subTest(current_round=current_round):
@@ -2036,7 +2076,7 @@ class WorkflowRepairAuthorizationTests(TaskFourWorkflowFixture, unittest.TestCas
         self.assertIsNone(metadata.repair_authorization)
         self.assertEqual(
             len([event for event in self.store.events if event[0] == "read-authorizing-comment"]),
-            1,
+            2,
         )
         self.assertEqual(
             len([event for event in self.store.events if event[0] == "create"]),
@@ -2538,6 +2578,27 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                         )
                     )
 
+    def test_repair_completion_rereads_evidence_after_parent_fan_in(self):
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                self.store.states.clear()
+                self.store.completions.clear()
+                completion = self.seed_active_parallel_repair(repair_round)
+                self.store.completion_drift_after_parent_reread = (
+                    completion.evidence_comment_uuid
+                )
+
+                result = self.workflow.record_phase_completion(completion)
+
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.mutation_count, 1)
+                self.assertFalse(
+                    any(
+                        event[0] in {"done", "create"}
+                        for event in self.store.events
+                    )
+                )
+
     def test_stable_repair_completion_and_exact_replay_remain_idempotent(self):
         for repair_round in (1, 2, 3):
             with self.subTest(repair_round=repair_round):
@@ -2562,7 +2623,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
 
                 self.assertEqual(completed.completed_child_status, "done")
                 self.assertEqual(completion_events, ("write-completion", "done"))
-                self.assertEqual(stable_post_write_reads, 2)
+                self.assertEqual(stable_post_write_reads, 4)
                 self.assertEqual(replay.next_action, "noop")
                 self.assertEqual(replay.mutation_count, 0)
                 self.assertFalse(
@@ -4396,7 +4457,7 @@ class GenericWorkflowTests(unittest.TestCase):
             order[order.index("write-completion") + 1:order.index("done")].count(
                 "read-completion"
             ),
-            2,
+            4,
         )
         self.assertLess(order.index("done"), order.index("create"))
 
@@ -5086,9 +5147,9 @@ class GenericWorkflowTests(unittest.TestCase):
         ]
         self.assertEqual(result.next_action, "repair", result.reason)
         self.assertEqual(result.created_children, (("api", "repair"),))
-        self.assertEqual(len(reads), len(gates) * 2)
+        self.assertEqual(len(reads), len(gates) * 4)
         self.assertTrue(
-            all(reads.count(child.evidence_comment_uuid) == 2 for child in gates)
+            all(reads.count(child.evidence_comment_uuid) == 4 for child in gates)
         )
 
     def test_initial_gate_failure_rereads_parent_after_completion_fan_in(self):
@@ -5104,6 +5165,18 @@ class GenericWorkflowTests(unittest.TestCase):
                 self.assertFalse(
                     any(event[0] == "create" for event in self.store.events)
                 )
+
+    def test_initial_gate_failure_rereads_completion_after_parent_fan_in(self):
+        _, gates = self.seed_authoritative_terminal_gate_failure()
+        self.store.completion_drift_after_parent_reread = (
+            gates[0].evidence_comment_uuid
+        )
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
 
     def test_failure_bundle_rejects_duplicate_current_gate_identity(self):
         snapshot = replace(

@@ -3327,6 +3327,44 @@ class GenericWorkflow:
             fan_in_problem = self._parent_fan_in_still_current(state)
             if fan_in_problem is not None:
                 return fan_in_problem
+            refreshed_bundle = self._authoritative_source_gate_failure_bundle(
+                state,
+                source_stage=state.metadata.stage_ordinal,
+                source_attempt=state.snapshot.attempt,
+                repair_round=decision.next_attempt,
+                source=state.snapshot.candidate_shas,
+            )
+            if refreshed_bundle != bundle:
+                return self._zero_mutation_block(
+                    state,
+                    "repair source Gate evidence changed after parent fan-in",
+                )
+            if automatic_repair is False:
+                authorization = state.metadata.repair_authorization
+                try:
+                    comment = self.snapshot_reader.read_authorizing_comment(
+                        state.parent_identifier,
+                        authorizing_comment_uuid,
+                    )
+                except Exception:
+                    return self._zero_mutation_block(
+                        state,
+                        "repair authorization changed after parent fan-in",
+                    )
+                if (
+                    authorization is None
+                    or type(comment) is not AuthorizingComment
+                    or comment.comment_uuid != authorization.comment_uuid
+                    or comment.comment_url != authorization.comment_url
+                    or comment.author_type != "member"
+                ):
+                    return self._zero_mutation_block(
+                        state,
+                        "repair authorization changed after parent fan-in",
+                    )
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
         else:
             if decision.dispatch_kind is DispatchKind.GATES:
                 requests = self._gate_requests(state, ordinal)
@@ -4417,6 +4455,49 @@ class GenericWorkflow:
                 "blocked",
                 "block",
                 "parent metadata changed before phase child completion",
+                action_key=key,
+                mutation_count=1,
+            )
+        final_observations: list[PhaseCompletion | None] = []
+        try:
+            for _ in range(2):
+                final_observations.append(
+                    self.snapshot_reader.read_phase_completion(
+                        parent_identifier,
+                        completion.evidence_comment_uuid,
+                    )
+                )
+        except Exception:
+            return self._uncertain(
+                state,
+                "phase completion evidence changed after parent fan-in",
+                action_key=key,
+                mutation_count=1,
+            )
+        if final_observations != [completion, completion]:
+            return WorkflowResult(
+                parent_identifier,
+                "blocked",
+                "block",
+                "phase completion evidence changed after parent fan-in",
+                action_key=key,
+                mutation_count=1,
+            )
+        try:
+            final_parent = self.snapshot_reader.read(parent_identifier)
+        except Exception:
+            return self._uncertain(
+                state,
+                "parent metadata changed after phase evidence recheck",
+                action_key=key,
+                mutation_count=1,
+            )
+        if type(final_parent) is not WorkflowState or final_parent != state:
+            return WorkflowResult(
+                parent_identifier,
+                "blocked",
+                "block",
+                "parent metadata changed after phase evidence recheck",
                 action_key=key,
                 mutation_count=1,
             )
