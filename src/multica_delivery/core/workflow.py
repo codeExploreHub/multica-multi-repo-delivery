@@ -2107,6 +2107,127 @@ class GenericWorkflow:
             for repository, pull_request in state.snapshot.pull_requests.items()
         )
 
+    def _current_repair_failure_bundle(
+        self,
+        state: WorkflowState,
+        current: tuple[WorkflowChild, ...],
+        source: Mapping[str, str],
+    ) -> FailureBundle | None:
+        """Rebuild the immutable current Repair owner set from its source Gates."""
+
+        if state.metadata is None or not current:
+            return None
+        source_stage = state.metadata.stage_ordinal - 1
+        source_attempt = state.metadata.repair_round - 1
+        affected = frozenset(state.snapshot.affected_repositories)
+        applicable_suites = {
+            suite.key: suite
+            for suite in self.manifest.integration_suites
+            if set(suite.repositories) <= affected
+        }
+        gates = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == source_stage
+            and child.attempt == source_attempt
+        )
+        expected_identities = {
+            (phase, repository, "")
+            for repository in affected
+            for phase in ("review", "qa")
+        }
+        expected_identities.update(
+            ("integration_qa", suite_key, suite_key)
+            for suite_key in applicable_suites
+        )
+        identities = tuple(
+            (child.phase, child.target_key, child.suite_key)
+            for child in gates
+        )
+        if (
+            source_stage < 0
+            or not gates
+            or len(identities) != len(set(identities))
+            or set(identities) != expected_identities
+        ):
+            return None
+
+        failures: list[FailureEvidenceRef] = []
+        evidence_uuids: set[str] = set()
+        for child in gates:
+            if (
+                child.status != "done"
+                or child.active
+                or child.phase_result not in _PHASE_RESULTS
+                or dict(child.creation_candidate_shas) != dict(source)
+                or not _canonical_uuid(child.evidence_comment_uuid)
+                or not _https_evidence_url(child.evidence_comment_url)
+                or child.evidence_comment_uuid in evidence_uuids
+            ):
+                return None
+            evidence_uuids.add(child.evidence_comment_uuid)
+            if child.phase in {"review", "qa"}:
+                expected_owners = (
+                    (child.repository_key,)
+                    if child.phase_result != "pass"
+                    else ()
+                )
+                if (
+                    child.target_key != child.repository_key
+                    or child.repository_key not in affected
+                    or child.suite_key
+                    or child.responsible_repositories != expected_owners
+                ):
+                    return None
+            else:
+                suite = applicable_suites.get(child.suite_key)
+                if (
+                    suite is None
+                    or child.target_key != suite.key
+                    or child.repository_key != suite.command_repository
+                    or (
+                        child.phase_result == "pass"
+                        and child.responsible_repositories
+                    )
+                    or (
+                        child.phase_result != "pass"
+                        and (
+                            not child.responsible_repositories
+                            or not set(child.responsible_repositories)
+                            <= set(suite.repositories)
+                        )
+                    )
+                ):
+                    return None
+            if child.phase_result != "pass":
+                failures.append(
+                    FailureEvidenceRef(
+                        child_identifier=child.identifier,
+                        phase=child.phase,
+                        result=child.phase_result,
+                        stage_ordinal=source_stage,
+                        repair_round=source_attempt,
+                        candidate_shas=source,
+                        responsible_repositories=child.responsible_repositories,
+                        evidence_comment_uuid=child.evidence_comment_uuid,
+                        evidence_comment_url=child.evidence_comment_url,
+                        suite_key=child.suite_key,
+                    )
+                )
+        if not failures:
+            return None
+        try:
+            return FailureBundle.build(
+                state.parent_identifier,
+                state.metadata.workflow_version,
+                source_stage,
+                state.metadata.repair_round,
+                source,
+                tuple(failures),
+            )
+        except (TypeError, ValueError, WorkflowError):
+            return None
+
     def _current_repair_head_problem(
         self,
         state: WorkflowState,
@@ -2146,10 +2267,22 @@ class GenericWorkflow:
             failure_bundle_digest=current[0].failure_bundle_digest,
             authorizing_comment_uuid=current[0].authorizing_comment_uuid,
         )
+        bundle = self._current_repair_failure_bundle(state, current, source)
         owners = Counter(child.repository_key for child in current)
+        expected_owners = (
+            frozenset(
+                repository
+                for failure in bundle.failures
+                for repository in failure.responsible_repositories
+            )
+            if bundle is not None
+            else frozenset()
+        )
         if (
-            any(count != 1 for count in owners.values())
-            or not set(owners) <= affected
+            bundle is None
+            or bundle.digest != current[0].failure_bundle_digest
+            or any(count != 1 for count in owners.values())
+            or set(owners) != expected_owners
             or any(
                 child.target_key != child.repository_key
                 or child.suite_key
@@ -2158,6 +2291,11 @@ class GenericWorkflow:
                 or child.failure_bundle_digest != current[0].failure_bundle_digest
                 or child.authorizing_comment_uuid
                 != current[0].authorizing_comment_uuid
+                or child.failure_evidence_uuids
+                != tuple(sorted(
+                    failure.evidence_comment_uuid
+                    for failure in bundle.for_repository(child.repository_key)
+                ))
                 for child in current
             )
             or expected_action not in state.applied_action_keys

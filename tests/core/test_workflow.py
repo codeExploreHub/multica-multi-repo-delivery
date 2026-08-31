@@ -2014,6 +2014,90 @@ class WorkflowLegacyCompletionTests(TaskFourWorkflowFixture, unittest.TestCase):
 
 
 class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCase):
+    def review_failure_source_stage(
+        self,
+        *,
+        source: dict[str, str],
+        source_stage: int,
+        source_attempt: int,
+        repair_round: int,
+    ) -> tuple[tuple[WorkflowChild, ...], FailureBundle]:
+        gates: list[WorkflowChild] = []
+        failures: list[FailureEvidenceRef] = []
+        index = 0
+        for repository in source:
+            for phase_name in ("review", "qa"):
+                index += 1
+                failed = phase_name == "review"
+                comment_uuid = evidence_uuid(
+                    f"repair-source-{repair_round}-{phase_name}-{repository}"
+                )
+                child = WorkflowChild(
+                    f"PRO-200-SOURCE-{index}",
+                    repository,
+                    repository,
+                    "",
+                    phase_name,
+                    source_stage,
+                    source_attempt,
+                    "done",
+                    "stage:" + str(index) * 64,
+                    False,
+                    evidence_comment_uuid=comment_uuid,
+                    creation_candidate_shas=source,
+                    phase_result="fail" if failed else "pass",
+                    evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+                    responsible_repositories=(repository,) if failed else (),
+                )
+                gates.append(child)
+                if failed:
+                    failures.append(
+                        FailureEvidenceRef(
+                            child_identifier=child.identifier,
+                            phase=phase_name,
+                            result="fail",
+                            stage_ordinal=source_stage,
+                            repair_round=source_attempt,
+                            candidate_shas=source,
+                            responsible_repositories=(repository,),
+                            evidence_comment_uuid=comment_uuid,
+                            evidence_comment_url=child.evidence_comment_url,
+                        )
+                    )
+        for suite in self.manifest.integration_suites:
+            if not set(suite.repositories) <= set(source):
+                continue
+            index += 1
+            comment_uuid = evidence_uuid(
+                f"repair-source-{repair_round}-integration-{suite.key}"
+            )
+            gates.append(
+                WorkflowChild(
+                    f"PRO-200-SOURCE-{index}",
+                    suite.key,
+                    suite.command_repository,
+                    suite.key,
+                    "integration_qa",
+                    source_stage,
+                    source_attempt,
+                    "done",
+                    "stage:" + str(index) * 64,
+                    False,
+                    evidence_comment_uuid=comment_uuid,
+                    creation_candidate_shas=source,
+                    phase_result="pass",
+                    evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+                )
+            )
+        return tuple(gates), FailureBundle.build(
+            "PRO-200",
+            2,
+            source_stage,
+            repair_round,
+            source,
+            tuple(failures),
+        )
+
     def add_three_repository_implementation_wave(
         self,
         *,
@@ -2229,7 +2313,13 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
 
     def test_multi_repository_repair_wave_accepts_completed_sibling_increment(self):
         base = {"api": SHA["api"], "web": SHA["web"]}
-        bundle_digest = "f" * 64
+        source_gates, bundle = self.review_failure_source_stage(
+            source=base,
+            source_stage=5,
+            source_attempt=0,
+            repair_round=1,
+        )
+        bundle_digest = bundle.digest
         action_key = coordinator_action_key(
             workflow_version=2,
             instance_key=self.manifest.instance.key,
@@ -2242,23 +2332,28 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             contract_hashes={},
             failure_bundle_digest=bundle_digest,
         )
-        api_failure_uuid = evidence_uuid("multi-repair-api-failure")
-        web_failure_uuid = evidence_uuid("multi-repair-web-failure")
         api_evidence = evidence_uuid("multi-repair-api-completion")
         children = (
+            *source_gates,
             WorkflowChild(
                 "PRO-200-API-REPAIR", "api", "api", "", "repair", 6, 1,
                 "done", action_key, False, evidence_comment_uuid=api_evidence,
                 creation_candidate_shas=base, phase_result="pass",
                 evidence_comment_url=f"https://example.test/evidence/{api_evidence}",
                 failure_bundle_digest=bundle_digest,
-                failure_evidence_uuids=(api_failure_uuid,),
+                failure_evidence_uuids=tuple(
+                    failure.evidence_comment_uuid
+                    for failure in bundle.for_repository("api")
+                ),
             ),
             WorkflowChild(
                 "PRO-200-WEB-REPAIR", "web", "web", "", "repair", 6, 1,
                 "in_progress", action_key, True, creation_candidate_shas=base,
                 failure_bundle_digest=bundle_digest,
-                failure_evidence_uuids=(web_failure_uuid,),
+                failure_evidence_uuids=tuple(
+                    failure.evidence_comment_uuid
+                    for failure in bundle.for_repository("web")
+                ),
             ),
         )
         snapshot = ParentSnapshot(
@@ -2317,10 +2412,16 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
     def test_parallel_repair_wave_allows_first_owner_while_active_sibling_head_moves(self):
         source = {"api": SHA["api"], "web": SHA["web"]}
         replacements = {"api": REPLACEMENT_SHA, "web": OTHER_SHA}
-        bundle_digest = "f" * 64
         for repair_round in (1, 2, 3):
             with self.subTest(repair_round=repair_round):
                 stage_ordinal = 5 + repair_round
+                source_gates, bundle = self.review_failure_source_stage(
+                    source=source,
+                    source_stage=stage_ordinal - 1,
+                    source_attempt=repair_round - 1,
+                    repair_round=repair_round,
+                )
+                bundle_digest = bundle.digest
                 authorization_uuid = (
                     evidence_uuid(f"parallel-repair-auth-{repair_round}")
                     if repair_round == 3
@@ -2339,7 +2440,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                     failure_bundle_digest=bundle_digest,
                     authorizing_comment_uuid=authorization_uuid,
                 )
-                children = tuple(
+                repair_children = tuple(
                     WorkflowChild(
                         f"PRO-200-{repository.upper()}-REPAIR",
                         repository,
@@ -2353,13 +2454,15 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                         True,
                         creation_candidate_shas=source,
                         failure_bundle_digest=bundle_digest,
-                        failure_evidence_uuids=(
-                            evidence_uuid(f"parallel-repair-{repository}-failure"),
+                        failure_evidence_uuids=tuple(
+                            failure.evidence_comment_uuid
+                            for failure in bundle.for_repository(repository)
                         ),
                         authorizing_comment_uuid=authorization_uuid,
                     )
                     for repository in ("api", "web")
                 )
+                children = (*source_gates, *repair_children)
                 snapshot = ParentSnapshot(
                     affected_repositories=("api", "web"),
                     candidate_shas=source,
@@ -2420,6 +2523,261 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                 )
                 self.assertEqual(self.store.candidate_sha("api"), REPLACEMENT_SHA)
                 self.assertEqual(self.store.candidate_sha("web"), SHA["web"])
+
+    def test_current_repair_requires_exact_failure_bundle_owner_multiset(self):
+        source = {"api": SHA["api"], "web": SHA["web"]}
+
+        def seed(
+            *,
+            repair_round: int,
+            expected_owners: tuple[str, ...],
+            api_done: bool,
+        ) -> None:
+            repair_stage = 5 + repair_round
+            source_stage = repair_stage - 1
+            source_attempt = repair_round - 1
+            authorization_uuid = (
+                evidence_uuid(f"owner-multiset-auth-{repair_round}")
+                if repair_round == 3
+                else ""
+            )
+            gate_specs = (
+                ("review", "api", "", "api" in expected_owners, ("api",)),
+                ("qa", "api", "", False, ()),
+                ("review", "web", "", "web" in expected_owners, ("web",)),
+                ("qa", "web", "", False, ()),
+                (
+                    "integration_qa",
+                    "web-api",
+                    "web-api",
+                    expected_owners == ("api",),
+                    ("api",),
+                ),
+            )
+            gates: list[WorkflowChild] = []
+            failures: list[FailureEvidenceRef] = []
+            for index, (phase_name, target, suite, failed, owners) in enumerate(
+                gate_specs,
+                start=1,
+            ):
+                result = "fail" if failed else "pass"
+                repository = "web" if phase_name == "integration_qa" else target
+                comment_uuid = evidence_uuid(
+                    f"owner-multiset-{repair_round}-{phase_name}-{target}"
+                )
+                responsible = owners if failed else ()
+                child = WorkflowChild(
+                    f"PRO-200-SOURCE-{index}",
+                    target,
+                    repository,
+                    suite,
+                    phase_name,
+                    source_stage,
+                    source_attempt,
+                    "done",
+                    ("qa:" if phase_name in {"qa", "integration_qa"} else "review:")
+                    + str(index) * 64,
+                    False,
+                    evidence_comment_uuid=comment_uuid,
+                    creation_candidate_shas=source,
+                    phase_result=result,
+                    evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+                    responsible_repositories=responsible,
+                )
+                gates.append(child)
+                if failed:
+                    failures.append(
+                        FailureEvidenceRef(
+                            child_identifier=child.identifier,
+                            phase=phase_name,
+                            result=result,
+                            stage_ordinal=source_stage,
+                            repair_round=source_attempt,
+                            candidate_shas=source,
+                            responsible_repositories=responsible,
+                            evidence_comment_uuid=comment_uuid,
+                            evidence_comment_url=child.evidence_comment_url,
+                            suite_key=suite,
+                        )
+                    )
+            bundle = FailureBundle.build(
+                "PRO-200",
+                2,
+                source_stage,
+                repair_round,
+                source,
+                tuple(failures),
+            )
+            action_key = coordinator_action_key(
+                workflow_version=2,
+                instance_key=self.manifest.instance.key,
+                parent_identifier="PRO-200",
+                stage_kind="repair",
+                stage_ordinal=repair_stage,
+                attempt=repair_round,
+                affected_repositories=frozenset(source),
+                candidate_shas=source,
+                contract_hashes={},
+                failure_bundle_digest=bundle.digest,
+                authorizing_comment_uuid=authorization_uuid,
+            )
+            api_evidence_uuid = evidence_uuid(
+                f"owner-multiset-api-completion-{repair_round}"
+            )
+            api_child = WorkflowChild(
+                "PRO-200-API-REPAIR",
+                "api",
+                "api",
+                "",
+                "repair",
+                repair_stage,
+                repair_round,
+                "done" if api_done else "in_progress",
+                action_key,
+                not api_done,
+                evidence_comment_uuid=api_evidence_uuid if api_done else "",
+                creation_candidate_shas=source,
+                phase_result="pass" if api_done else "",
+                evidence_comment_url=(
+                    f"https://example.test/evidence/{api_evidence_uuid}"
+                    if api_done
+                    else ""
+                ),
+                failure_bundle_digest=bundle.digest,
+                failure_evidence_uuids=tuple(
+                    failure.evidence_comment_uuid
+                    for failure in bundle.for_repository("api")
+                ),
+                authorizing_comment_uuid=authorization_uuid,
+            )
+            candidates = {
+                "api": REPLACEMENT_SHA if api_done else source["api"],
+                "web": source["web"],
+            }
+            snapshot = ParentSnapshot(
+                affected_repositories=("api", "web"),
+                candidate_shas=candidates,
+                children={
+                    "api": RepositoryEvidence(
+                        candidates["api"], "pass" if api_done else "pending"
+                    ),
+                    "web": RepositoryEvidence(source["web"], "pass"),
+                },
+                pull_requests={
+                    "api": PullRequestEvidence(candidates["api"], "open", True, True),
+                    "web": PullRequestEvidence(source["web"], "open", True, True),
+                },
+                reviews={} if api_done else {
+                    "api": RepositoryEvidence(
+                        source["api"],
+                        "fail" if "api" in expected_owners else "pass",
+                    ),
+                    "web": RepositoryEvidence(
+                        source["web"],
+                        "fail" if "web" in expected_owners else "pass",
+                    ),
+                },
+                qa={} if api_done else {
+                    "api": RepositoryEvidence(source["api"], "pass"),
+                    "web": RepositoryEvidence(source["web"], "pass"),
+                },
+                integration_qa={} if api_done else {
+                    "web-api": GateEvidence(
+                        source,
+                        "fail" if expected_owners == ("api",) else "pass",
+                        ("api",) if expected_owners == ("api",) else (),
+                    ),
+                },
+                attempt=repair_round,
+            )
+            self.store.add_state(
+                "PRO-200",
+                snapshot,
+                children=(*gates, api_child),
+                pull_requests=pull_request_targets(),
+                stage_ordinal=repair_stage,
+            )
+            state = self.store.states["PRO-200"]
+            assert isinstance(state.metadata, ParentMetadata)
+            applied = state.applied_action_keys
+            last_action = action_key
+            if api_done:
+                completion_action = coordinator_action_key(
+                    workflow_version=2,
+                    instance_key=self.manifest.instance.key,
+                    parent_identifier="PRO-200",
+                    stage_kind="repair:api",
+                    stage_ordinal=repair_stage,
+                    attempt=repair_round,
+                    affected_repositories=frozenset(source),
+                    candidate_shas=candidates,
+                    contract_hashes={},
+                    failure_bundle_digest=bundle.digest,
+                    authorizing_comment_uuid=authorization_uuid,
+                )
+                applied = applied | {completion_action}
+                last_action = completion_action
+            self.store.states["PRO-200"] = replace(
+                state,
+                metadata=replace(state.metadata, last_action=last_action),
+                applied_action_keys=applied,
+            )
+            stored = self.store.states["PRO-200"]
+            current = tuple(
+                child
+                for child in stored.children
+                if child.stage_ordinal == repair_stage
+                and child.attempt == repair_round
+            )
+            rebuilt = self.workflow._current_repair_failure_bundle(
+                stored,
+                current,
+                source,
+            )
+            self.assertIsNotNone(rebuilt, f"round {repair_round} bundle rebuild")
+            assert rebuilt is not None
+            self.assertEqual(rebuilt.digest, bundle.digest)
+            self.store.events.clear()
+
+        for repair_round in (1, 2, 3):
+            for api_done in (False, True):
+                with self.subTest(
+                    repair_round=repair_round,
+                    api_done=api_done,
+                    expected_owners="api+web",
+                ):
+                    seed(
+                        repair_round=repair_round,
+                        expected_owners=("api", "web"),
+                        api_done=api_done,
+                    )
+
+                    result = self.workflow.resume_parent("PRO-200")
+
+                    self.assertEqual(result.next_action, "block")
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(event[0] == "create" for event in self.store.events)
+                    )
+
+            with self.subTest(
+                repair_round=repair_round,
+                expected_owners="integration subset api",
+            ):
+                seed(
+                    repair_round=repair_round,
+                    expected_owners=("api",),
+                    api_done=False,
+                )
+
+                result = self.workflow.resume_parent("PRO-200")
+
+                self.assertIn(
+                    result.next_action,
+                    {"wait", "noop"},
+                    result.reason,
+                )
+                self.assertEqual(result.mutation_count, 0)
 
     def test_repair_head_validation_rejects_missing_owner_and_non_done_pass(self):
         source = {"api": SHA["api"], "web": SHA["web"]}
