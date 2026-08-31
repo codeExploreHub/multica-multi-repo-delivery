@@ -315,6 +315,7 @@ class FakeWorkflowStore:
         self.replace_repair_digest_after_create = False
         self.repair_failure_uuid_corruption: str | None = None
         self.partial_create_limits: list[int] = []
+        self.sibling_completion_after_read: tuple[str, PhaseCompletion] | None = None
 
     def add_blank(
         self,
@@ -1106,7 +1107,92 @@ class FakeWorkflowStore:
                     stage_ordinal=state.metadata.stage_ordinal + 1,
                 ),
             )
+        concurrent = self.sibling_completion_after_read
+        if (
+            value is not None
+            and concurrent is not None
+            and concurrent[0] == evidence_comment_uuid
+        ):
+            self.sibling_completion_after_read = None
+            self._apply_concurrent_sibling_completion(concurrent[1])
         return value
+
+    def _apply_concurrent_sibling_completion(
+        self,
+        completion: PhaseCompletion,
+    ) -> None:
+        state = self.states[completion.parent_identifier]
+        assert isinstance(state.metadata, ParentMetadata)
+        child = next(
+            item
+            for item in state.children
+            if item.phase == completion.phase
+            and item.attempt == completion.attempt
+            and item.repository_key == completion.repository_key
+            and item.active
+            and item.status in {"backlog", "todo", "in_progress", "in_review"}
+        )
+        action_candidates = (
+            completion.candidate_shas
+            if completion.phase == "integration_qa"
+            else {
+                **state.snapshot.candidate_shas,
+                completion.repository_key: completion.candidate_sha,
+            }
+        )
+        action_key = coordinator_action_key(
+            workflow_version=state.metadata.workflow_version,
+            instance_key=state.metadata.instance_key,
+            parent_identifier=state.parent_identifier,
+            stage_kind=f"{completion.phase}:{child.target_key}",
+            stage_ordinal=child.stage_ordinal,
+            attempt=child.attempt,
+            affected_repositories=frozenset(
+                state.snapshot.affected_repositories
+            ),
+            candidate_shas=action_candidates,
+            contract_hashes=state.metadata.contract_hashes,
+            failure_bundle_digest=(
+                child.failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                child.authorizing_comment_uuid
+                if completion.phase == "repair"
+                else ""
+            ),
+        )
+        candidates = dict(state.snapshot.candidate_shas)
+        if (
+            completion.phase in {"implementation", "repair"}
+            and completion.result == "pass"
+        ):
+            candidates[completion.repository_key] = completion.candidate_sha
+        metadata = replace(
+            state.metadata,
+            candidate_shas=candidates,
+            merge_plan=(
+                ()
+                if candidates != dict(state.snapshot.candidate_shas)
+                else state.metadata.merge_plan
+            ),
+            merge_state=(
+                "pending"
+                if candidates != dict(state.snapshot.candidate_shas)
+                else state.metadata.merge_state
+            ),
+            last_action=action_key,
+        )
+        self.completions[
+            (completion.parent_identifier, completion.evidence_comment_uuid)
+        ] = completion
+        self.mark_child_done(
+            completion.parent_identifier,
+            completion,
+            metadata,
+            action_key=action_key,
+        )
 
     def mark_child_done(
         self,
@@ -1395,11 +1481,11 @@ class FakeWorkflowStore:
 
 class FakeGitHub:
     def __init__(self, event_log: list[tuple[object, ...]] | None = None) -> None:
-        self.heads = {"api": SHA["api"], "web": SHA["web"]}
-        self.mergeable = {"api": True, "web": True}
-        self.checks = {"api": True, "web": True}
+        self.heads = dict(SHA)
+        self.mergeable = {repository: True for repository in SHA}
+        self.checks = {repository: True for repository in SHA}
         self.merged: list[tuple[str, int]] = []
-        self.merged_shas = {"api": SHA["api"], "web": SHA["web"]}
+        self.merged_shas = dict(SHA)
         self.fail_on: str | None = None
         self.commit_then_error_on: str | None = None
         self.malformed_ack_on: str | None = None
@@ -3365,6 +3451,17 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         )
         state = self.store.states["PRO-200"]
         assert isinstance(state.metadata, ParentMetadata)
+        if repair_round == 3:
+            authorization_url = (
+                f"https://example.test/evidence/{authorization_uuid}"
+            )
+            self.store.authorizing_comments[
+                ("PRO-200", authorization_uuid)
+            ] = AuthorizingComment(
+                authorization_uuid,
+                authorization_url,
+                "member",
+            )
         self.store.states["PRO-200"] = replace(
             state,
             metadata=replace(state.metadata, last_action=action_key),
@@ -3379,6 +3476,245 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             sha=REPLACEMENT_SHA,
             failure_bundle_digest=bundle.digest,
         )
+
+    def assert_evidence_only_transition_recovers(
+        self,
+        completion: PhaseCompletion,
+        sibling: PhaseCompletion,
+    ) -> None:
+        self.store.sibling_completion_after_read = (
+            completion.evidence_comment_uuid,
+            sibling,
+        )
+
+        first = self.workflow.record_phase_completion(completion)
+
+        state = self.store.states[completion.parent_identifier]
+        target = next(
+            child
+            for child in state.children
+            if child.phase == completion.phase
+            and child.repository_key == completion.repository_key
+            and child.attempt == completion.attempt
+        )
+        self.assertEqual(first.next_action, "block", first.reason)
+        self.assertEqual(first.mutation_count, 1)
+        self.assertTrue(target.active)
+        self.assertNotEqual(target.status, "done")
+        self.assertEqual(
+            self.store.completions[
+                (completion.parent_identifier, completion.evidence_comment_uuid)
+            ],
+            completion,
+        )
+        self.store.events.clear()
+
+        retry = self.workflow.record_phase_completion(completion)
+
+        final = self.store.states[completion.parent_identifier]
+        transitioned = tuple(
+            child
+            for child in final.children
+            if child.evidence_comment_uuid == completion.evidence_comment_uuid
+            and child.status == "done"
+            and not child.active
+        )
+        self.assertIn(
+            retry.next_action,
+            {"wait", "dispatch", "noop"},
+            (retry.reason, self.store.events),
+        )
+        self.assertEqual(len(transitioned), 1)
+        self.assertFalse(
+            any(event[0] == "write-completion" for event in self.store.events)
+        )
+
+    def test_evidence_only_repair_transition_recovers_after_sibling_completion(self):
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                self.setUp()
+                completion = self.seed_active_parallel_repair(repair_round)
+                state = self.store.states["PRO-200"]
+                sibling_child = next(
+                    child
+                    for child in state.children
+                    if child.phase == "repair"
+                    and child.repository_key == "web"
+                    and child.attempt == repair_round
+                )
+                sibling = completion_for(
+                    "web",
+                    parent="PRO-200",
+                    phase="repair",
+                    attempt=repair_round,
+                    sha=OTHER_SHA,
+                    failure_bundle_digest=sibling_child.failure_bundle_digest,
+                )
+
+                self.assert_evidence_only_transition_recovers(
+                    completion,
+                    sibling,
+                )
+
+    def test_evidence_only_gate_transition_recovers_after_sibling_completion(self):
+        self.store.add_blank("PRO-101")
+        self.workflow.handle_parent_event(
+            "PRO-101",
+            affected=frozenset({"api", "web"}),
+        )
+        self.workflow.record_phase_completion(completion_for("api"))
+        self.workflow.record_phase_completion(completion_for("web"))
+        self.store.events.clear()
+
+        self.assert_evidence_only_transition_recovers(
+            completion_for("api", phase="review"),
+            completion_for("web", phase="review"),
+        )
+
+    def test_evidence_only_parallel_implementation_recovers_after_sibling_completion(self):
+        self.store.add_blank("PRO-101")
+        self.workflow.handle_parent_event(
+            "PRO-101",
+            affected=frozenset({"api", "web", "notifications"}),
+        )
+        self.workflow.record_phase_completion(completion_for("api"))
+        self.store.events.clear()
+
+        self.assert_evidence_only_transition_recovers(
+            completion_for("web"),
+            completion_for("notifications"),
+        )
+
+    def seed_evidence_only_repair_after_sibling(
+        self,
+        repair_round: int,
+    ) -> PhaseCompletion:
+        completion = self.seed_active_parallel_repair(repair_round)
+        state = self.store.states["PRO-200"]
+        sibling_child = next(
+            child
+            for child in state.children
+            if child.phase == "repair"
+            and child.repository_key == "web"
+            and child.attempt == repair_round
+        )
+        sibling = completion_for(
+            "web",
+            parent="PRO-200",
+            phase="repair",
+            attempt=repair_round,
+            sha=OTHER_SHA,
+            failure_bundle_digest=sibling_child.failure_bundle_digest,
+        )
+        self.store.sibling_completion_after_read = (
+            completion.evidence_comment_uuid,
+            sibling,
+        )
+        first = self.workflow.record_phase_completion(completion)
+        self.assertEqual(first.next_action, "block", first.reason)
+        self.assertEqual(first.mutation_count, 1)
+        self.store.events.clear()
+        return completion
+
+    def test_evidence_only_transition_rejects_every_authority_drift(self):
+        for corruption in (
+            "record",
+            "child",
+            "head",
+            "wave action",
+            "partition",
+            "parent drift",
+            "evidence read",
+            "authorization",
+        ):
+            with self.subTest(corruption=corruption):
+                self.setUp()
+                repair_round = 3 if corruption == "authorization" else 2
+                completion = self.seed_evidence_only_repair_after_sibling(
+                    repair_round
+                )
+                state = self.store.states["PRO-200"]
+                assert isinstance(state.metadata, ParentMetadata)
+                target = next(
+                    child
+                    for child in state.children
+                    if child.phase == "repair"
+                    and child.repository_key == "api"
+                    and child.attempt == repair_round
+                )
+                sibling = next(
+                    child
+                    for child in state.children
+                    if child.phase == "repair"
+                    and child.repository_key == "web"
+                    and child.attempt == repair_round
+                )
+                if corruption == "record":
+                    key = ("PRO-200", completion.evidence_comment_uuid)
+                    self.store.completions[key] = replace(
+                        self.store.completions[key],
+                        result="blocked",
+                    )
+                elif corruption == "child":
+                    self.store.states["PRO-200"] = replace(
+                        state,
+                        children=tuple(
+                            replace(child, action_key="repair:" + "f" * 64)
+                            if child.identifier == target.identifier
+                            else child
+                            for child in state.children
+                        ),
+                        applied_action_keys=state.applied_action_keys
+                        | {"repair:" + "f" * 64},
+                    )
+                elif corruption == "head":
+                    evidence = dict(state.snapshot.pull_requests)
+                    evidence["api"] = replace(
+                        evidence["api"],
+                        head_sha=SHA["api"],
+                    )
+                    self.store.states["PRO-200"] = replace(
+                        state,
+                        snapshot=replace(
+                            state.snapshot,
+                            pull_requests=evidence,
+                        ),
+                    )
+                elif corruption == "wave action":
+                    self.store.states["PRO-200"] = replace(
+                        state,
+                        applied_action_keys=(
+                            state.applied_action_keys - {state.metadata.last_action}
+                        ),
+                    )
+                elif corruption == "partition":
+                    self.store.states["PRO-200"] = replace(
+                        state,
+                        children=tuple(
+                            replace(child, failure_evidence_uuids=())
+                            if child.identifier == sibling.identifier
+                            else child
+                            for child in state.children
+                        ),
+                    )
+                elif corruption == "parent drift":
+                    self.store.parent_drift_after_completion_read = "metadata"
+                elif corruption == "evidence read":
+                    self.store.completion_read_failures_remaining = 1
+                else:
+                    self.store.authorizing_comments.clear()
+
+                result = self.workflow.record_phase_completion(completion)
+
+                expected = "uncertain" if corruption == "evidence read" else "block"
+                self.assertEqual(result.next_action, expected, result.reason)
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(
+                    any(
+                        event[0] in {"write-completion", "done", "create"}
+                        for event in self.store.events
+                    )
+                )
 
     def test_repair_completion_revalidates_parent_before_first_evidence_write(self):
         for repair_round in (1, 2, 3):

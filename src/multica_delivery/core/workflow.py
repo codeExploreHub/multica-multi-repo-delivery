@@ -3427,6 +3427,10 @@ class GenericWorkflow:
 
         actions: set[str] = set()
         evidence_uuids: set[str] = set()
+        completed_implementations: dict[
+            str,
+            tuple[WorkflowChild, str],
+        ] = {}
         applicable_suites = {
             suite.key: suite
             for suite in self.manifest.integration_suites
@@ -3565,6 +3569,12 @@ class GenericWorkflow:
                 or observed != expected
             ):
                 return None
+            if child.phase == "implementation":
+                completed_implementations[child.repository_key] = (
+                    child,
+                    candidate_sha,
+                )
+                continue
             action_candidates = (
                 completion_candidates
                 if child.phase == "integration_qa"
@@ -3586,6 +3596,15 @@ class GenericWorkflow:
             ):
                 return None
             actions.add(completion_action)
+        if completed_implementations:
+            implementation_actions = self._completed_candidate_action_chain(
+                state,
+                source_candidates,
+                completed_implementations,
+            )
+            if implementation_actions is None:
+                return None
+            actions.update(implementation_actions.values())
         return frozenset(actions)
 
     def _nonrepair_successor_heads_still_current(
@@ -4769,6 +4788,351 @@ class GenericWorkflow:
             return "phase completion child creation provenance is not current", None
         return None, child
 
+    def _recover_persisted_phase_transition(
+        self,
+        state: WorkflowState,
+        completion: PhaseCompletion,
+    ) -> WorkflowResult:
+        """Finish one exact current child transition whose evidence already exists."""
+
+        if (
+            state.parent_status not in _ACTIVE_PARENT_STATUSES
+            or state.metadata is None
+            or state.snapshot.merged_shas
+            or state.snapshot.merge_state
+            not in {"pending", "not_ready", "ready", "blocked"}
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence is not attached to an active pre-merge parent",
+            )
+        if set(state.pull_requests) - set(state.snapshot.pull_requests):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence lacks managed pull-request head authority",
+            )
+        repair_stage, repair_head_problem = self._current_repair_head_problem(
+            state,
+            completion,
+        )
+        if repair_head_problem is not None:
+            return self._zero_mutation_block(state, repair_head_problem)
+        mismatched_heads = {
+            repository
+            for repository, pull_request in state.snapshot.pull_requests.items()
+            if state.snapshot.candidate_shas.get(repository) != pull_request.head_sha
+        }
+        if not repair_stage and mismatched_heads and (
+            completion.phase not in {"implementation", "repair"}
+            or completion.result != "pass"
+            or mismatched_heads != {completion.repository_key}
+            or state.snapshot.pull_requests[completion.repository_key].head_sha
+            != completion.candidate_sha
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence conflicts with current pull-request heads",
+            )
+        if (
+            completion.phase in {"implementation", "repair"}
+            and completion.result != "pass"
+            and state.snapshot.candidate_shas.get(completion.repository_key)
+            != completion.candidate_sha
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted non-PASS evidence cannot replace a candidate SHA",
+            )
+        completion_problem, child = self._completion_problem(state, completion)
+        if completion_problem is not None or child is None:
+            return self._zero_mutation_block(
+                state,
+                completion_problem
+                or "persisted phase evidence lacks one exact active current child",
+            )
+
+        wave = tuple(
+            item
+            for item in state.children
+            if item.stage_ordinal == child.stage_ordinal
+            and item.attempt == child.attempt
+        )
+        if completion.phase == "repair":
+            if any(item.phase != "repair" for item in wave):
+                return self._zero_mutation_block(
+                    state,
+                    "persisted Repair evidence has conflicting current-wave membership",
+                )
+
+            def read_wave_authority() -> object:
+                return self._authoritative_repair_wave_completion_actions(
+                    state,
+                    child,
+                )
+
+        else:
+            expected_phases = (
+                {"review", "qa", "integration_qa"}
+                if completion.phase in {"review", "qa", "integration_qa"}
+                else {"implementation"}
+            )
+            if (
+                not wave
+                or any(
+                    item.phase not in expected_phases
+                    or item.action_key != child.action_key
+                    or item.creation_candidate_shas
+                    != child.creation_candidate_shas
+                    for item in wave
+                )
+            ):
+                return self._zero_mutation_block(
+                    state,
+                    "persisted phase evidence has conflicting current-wave provenance",
+                )
+
+            def read_wave_authority() -> object:
+                return self._authoritative_terminal_successor_actions(
+                    state,
+                    wave,
+                    child.creation_candidate_shas,
+                    child.action_key,
+                )
+
+        def read_authorization() -> AuthorizingComment | None | object:
+            if completion.phase != "repair":
+                return None
+            if child.attempt <= self.manifest.policy.max_repair_attempts:
+                return None if not child.authorizing_comment_uuid else object()
+            if not child.authorizing_comment_uuid:
+                return object()
+            try:
+                observed = self.snapshot_reader.read_authorizing_comment(
+                    state.parent_identifier,
+                    child.authorizing_comment_uuid,
+                )
+            except Exception:
+                return object()
+            return (
+                observed
+                if type(observed) is AuthorizingComment
+                and observed.comment_uuid == child.authorizing_comment_uuid
+                and observed.author_type == "member"
+                else object()
+            )
+
+        wave_authority = read_wave_authority()
+        authorization = read_authorization()
+        if wave_authority is None or type(authorization) is object:
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence lacks stable wave or authorization authority",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        if (
+            read_wave_authority() != wave_authority
+            or read_authorization() != authorization
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase wave authority changed after parent fan-in",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+
+        try:
+            evidence = tuple(
+                self.snapshot_reader.read_phase_completion(
+                    state.parent_identifier,
+                    completion.evidence_comment_uuid,
+                )
+                for _ in range(2)
+            )
+        except Exception:
+            return self._uncertain(
+                state,
+                "persisted phase evidence could not be revalidated before transition",
+            )
+        if evidence != (completion, completion):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence changed before child transition",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+
+        previous_candidate_sha = state.snapshot.candidate_shas.get(
+            completion.repository_key
+        )
+        candidate_shas = dict(state.snapshot.candidate_shas)
+        if (
+            completion.phase in {"implementation", "repair"}
+            and completion.result == "pass"
+        ):
+            candidate_shas[completion.repository_key] = completion.candidate_sha
+        action_candidates = (
+            completion.candidate_shas
+            if completion.phase == "integration_qa"
+            else {
+                **state.snapshot.candidate_shas,
+                completion.repository_key: completion.candidate_sha,
+            }
+        )
+        key = self._action_key(
+            state,
+            f"{completion.phase}:{child.target_key}",
+            child.stage_ordinal,
+            attempt=completion.attempt,
+            candidate_shas=action_candidates,
+            failure_bundle_digest=(
+                completion.failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                child.authorizing_comment_uuid
+                if completion.phase == "repair"
+                else ""
+            ),
+        )
+        metadata = self._metadata(
+            state,
+            action_key=key,
+            candidate_shas=candidate_shas,
+            merge_plan=(
+                ()
+                if candidate_shas != dict(state.snapshot.candidate_shas)
+                else state.metadata.merge_plan
+            ),
+            merge_state=(
+                "pending"
+                if candidate_shas != dict(state.snapshot.candidate_shas)
+                else state.metadata.merge_state
+            ),
+        )
+        try:
+            self.executor.mark_child_done(
+                state.parent_identifier,
+                completion,
+                metadata,
+                action_key=key,
+            )
+        except Exception:
+            pass
+        done_state = self._reconcile_parent(
+            state.parent_identifier,
+            lambda current: (
+                isinstance(current, WorkflowState)
+                and current.parent_identifier == state.parent_identifier
+                and current.metadata == metadata
+                and dict(current.snapshot.candidate_shas) == candidate_shas
+                and key in current.applied_action_keys
+                and len(
+                    tuple(
+                        item
+                        for item in current.children
+                        if item.evidence_comment_uuid
+                        == completion.evidence_comment_uuid
+                        and item.status == "done"
+                        and not item.active
+                    )
+                )
+                == 1
+            ),
+        )
+        if done_state is None:
+            return self._uncertain(
+                state,
+                "persisted phase child transition is not yet authoritative",
+                action_key=key,
+                mutation_count=1,
+            )
+        try:
+            final_evidence = tuple(
+                self.snapshot_reader.read_phase_completion(
+                    state.parent_identifier,
+                    completion.evidence_comment_uuid,
+                )
+                for _ in range(2)
+            )
+        except Exception:
+            return self._uncertain(
+                done_state,
+                "persisted phase evidence is unavailable after child transition",
+                action_key=key,
+                mutation_count=1,
+            )
+        if final_evidence != (completion, completion):
+            return self._block(
+                done_state,
+                "persisted phase evidence changed after child transition",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(done_state)
+        if fan_in_problem is not None:
+            return replace(
+                fan_in_problem,
+                completed_child_status="done",
+                mutation_count=1,
+            )
+
+        replacement = (
+            completion.phase in {"implementation", "repair"}
+            and completion.result == "pass"
+            and previous_candidate_sha is not None
+            and previous_candidate_sha != completion.candidate_sha
+        )
+        if replacement:
+            previous_target = state.pull_requests.get(completion.repository_key)
+            current_target = done_state.pull_requests.get(completion.repository_key)
+            pull_request = done_state.snapshot.pull_requests.get(
+                completion.repository_key
+            )
+            if (
+                dict(done_state.snapshot.candidate_shas) != candidate_shas
+                or done_state.snapshot.reviews
+                or done_state.snapshot.qa
+                or done_state.snapshot.integration_qa
+                or done_state.snapshot.smoke_reads
+                or pull_request is None
+                or pull_request.head_sha != completion.candidate_sha
+                or (
+                    completion.phase == "repair"
+                    and (previous_target is None or current_target != previous_target)
+                )
+            ):
+                blocked = self._block(
+                    done_state,
+                    "replacement SHA did not authoritatively invalidate every gate",
+                )
+                return replace(blocked, completed_child_status="done")
+        unfinished = tuple(
+            item
+            for item in done_state.children
+            if item.identifier != child.identifier
+            and item.stage_ordinal == child.stage_ordinal
+            and item.attempt == child.attempt
+            and item.status not in _TERMINAL_CHILD_STATUSES
+        )
+        if unfinished:
+            return self._result(
+                done_state,
+                "wait",
+                "current Stage still has non-terminal sibling work",
+                completed_child_status="done",
+                action_key=key,
+                mutation_count=1,
+            )
+        resumed = self.resume_parent(state.parent_identifier)
+        return replace(
+            resumed,
+            completed_child_status="done",
+            mutation_count=resumed.mutation_count + 1,
+        )
+
     @staticmethod
     def _zero_mutation_block(
         state: WorkflowState,
@@ -4853,6 +5217,11 @@ class GenericWorkflow:
             and child.attempt == completion.attempt
             and child.action_key in state.applied_action_keys
         )
+        if not completed:
+            return self._recover_persisted_phase_transition(
+                state,
+                completion,
+            )
         if len(completed) != 1:
             return self._zero_mutation_block(
                 state,
