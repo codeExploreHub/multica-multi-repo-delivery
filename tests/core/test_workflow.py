@@ -399,6 +399,7 @@ class FakeWorkflowStore:
         workflow_version: int = 2,
         project_key: str | None = None,
         stage_ordinal: int | None = None,
+        hydrate_current_gate_passes: bool = True,
     ) -> None:
         latest_child_stage = max(
             (child.stage_ordinal for child in children),
@@ -412,6 +413,76 @@ class FakeWorkflowStore:
                 else 5
             ),
         )
+        if hydrate_current_gate_passes and any(
+            child.stage_ordinal == metadata.stage_ordinal
+            and child.attempt == snapshot.attempt
+            and child.phase in {"review", "qa", "integration_qa"}
+            for child in children
+        ):
+            observed = {
+                (child.phase, child.target_key, child.suite_key)
+                for child in children
+                if child.stage_ordinal == metadata.stage_ordinal
+                and child.attempt == snapshot.attempt
+            }
+            additions: list[WorkflowChild] = []
+            for phase_name, evidence_by_repository in (
+                ("review", snapshot.reviews),
+                ("qa", snapshot.qa),
+            ):
+                for repository, evidence in evidence_by_repository.items():
+                    identity = (phase_name, repository, "")
+                    if identity in observed or evidence.result != "pass":
+                        continue
+                    comment_uuid = evidence_uuid(
+                        f"{identifier}-{metadata.stage_ordinal}-{phase_name}-{repository}-pass"
+                    )
+                    additions.append(
+                        WorkflowChild(
+                            f"{identifier}-{metadata.stage_ordinal}-{phase_name.upper()}-{repository.upper()}-PASS",
+                            repository,
+                            repository,
+                            "",
+                            phase_name,
+                            metadata.stage_ordinal,
+                            snapshot.attempt,
+                            "done",
+                            ("review:" if phase_name == "review" else "qa:")
+                            + "e" * 64,
+                            False,
+                            evidence_comment_uuid=comment_uuid,
+                            creation_candidate_shas=snapshot.candidate_shas,
+                            phase_result="pass",
+                            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+                        )
+                    )
+            for suite in self.manifest.integration_suites:
+                evidence = snapshot.integration_qa.get(suite.key)
+                identity = ("integration_qa", suite.key, suite.key)
+                if identity in observed or evidence is None or evidence.result != "pass":
+                    continue
+                comment_uuid = evidence_uuid(
+                    f"{identifier}-{metadata.stage_ordinal}-integration-qa-{suite.key}-pass"
+                )
+                additions.append(
+                    WorkflowChild(
+                        f"{identifier}-{metadata.stage_ordinal}-INTEGRATION-QA-{suite.key.upper()}-PASS",
+                        suite.key,
+                        suite.command_repository,
+                        suite.key,
+                        "integration_qa",
+                        metadata.stage_ordinal,
+                        snapshot.attempt,
+                        "done",
+                        "qa:" + "d" * 64,
+                        False,
+                        evidence_comment_uuid=comment_uuid,
+                        creation_candidate_shas=snapshot.candidate_shas,
+                        phase_result="pass",
+                        evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+                    )
+                )
+            children = children + tuple(additions)
         if workflow_version != metadata.workflow_version:
             if workflow_version != 1:
                 raise ValueError("test store only models workflow versions one and two")
@@ -2994,6 +3065,151 @@ class GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(result.mutation_count, 0)
         self.assertFalse(any(event[0] == "create" for event in self.store.events))
 
+    def test_current_gate_stage_requires_exact_complete_expected_membership(self):
+        snapshot = replace(
+            passing_snapshot(),
+            qa={
+                **passing_snapshot().qa,
+                "api": RepositoryEvidence(SHA["api"], "fail"),
+            },
+        )
+
+        def gate_child(
+            identifier: str,
+            target: str,
+            repository: str,
+            phase_name: str,
+            digit: str,
+            *,
+            suite: str = "",
+            result: str = "pass",
+            active: bool = False,
+        ) -> WorkflowChild:
+            comment_uuid = str(uuid.UUID(digit * 32))
+            return WorkflowChild(
+                identifier,
+                target,
+                repository,
+                suite,
+                phase_name,
+                5,
+                0,
+                "in_progress" if active else "done",
+                ("qa:" if phase_name in {"qa", "integration_qa"} else "review:")
+                + digit * 64,
+                active,
+                evidence_comment_uuid="" if active else comment_uuid,
+                creation_candidate_shas=snapshot.candidate_shas,
+                phase_result="" if active else result,
+                evidence_comment_url=(
+                    ""
+                    if active
+                    else f"https://example.test/evidence/{comment_uuid}"
+                ),
+                responsible_repositories=("api",) if result == "fail" else (),
+            )
+
+        complete = (
+            gate_child("PRO-101-API-REVIEW", "api", "api", "review", "1"),
+            gate_child("PRO-101-API-QA", "api", "api", "qa", "2", result="fail"),
+            gate_child("PRO-101-WEB-REVIEW", "web", "web", "review", "3"),
+            gate_child("PRO-101-WEB-QA", "web", "web", "qa", "4"),
+            gate_child(
+                "PRO-101-WEB-API-QA",
+                "web-api",
+                "web",
+                "integration_qa",
+                "5",
+                suite="web-api",
+            ),
+        )
+        cases = {
+            "missing repository review": complete[1:],
+            "missing repository QA": complete[:1] + complete[2:],
+            "missing integration suite": complete[:-1],
+            "active sibling": (
+                complete[0],
+                complete[1],
+                complete[2],
+                replace(
+                    complete[3],
+                    status="in_progress",
+                    active=True,
+                    evidence_comment_uuid="",
+                    phase_result="",
+                    evidence_comment_url="",
+                ),
+                complete[4],
+            ),
+            "duplicate gate": complete + (
+                replace(
+                    complete[0],
+                    identifier="PRO-101-API-REVIEW-DUPLICATE",
+                    evidence_comment_uuid=str(uuid.UUID("6" * 32)),
+                    evidence_comment_url=(
+                        "https://example.test/evidence/"
+                        + str(uuid.UUID("6" * 32))
+                    ),
+                ),
+            ),
+            "unexpected current child": complete + (
+                WorkflowChild(
+                    "PRO-101-UNEXPECTED",
+                    "api",
+                    "api",
+                    "",
+                    "implementation",
+                    5,
+                    0,
+                    "done",
+                    "dispatch:" + "7" * 64,
+                    False,
+                    evidence_comment_uuid=str(uuid.UUID("7" * 32)),
+                    creation_candidate_shas=snapshot.candidate_shas,
+                    phase_result="pass",
+                    evidence_comment_url=(
+                        "https://example.test/evidence/"
+                        + str(uuid.UUID("7" * 32))
+                    ),
+                ),
+            ),
+        }
+
+        for label, children in cases.items():
+            with self.subTest(label=label):
+                self.store.add_state(
+                    "PRO-101",
+                    snapshot,
+                    children=children,
+                    pull_requests=pull_request_targets(),
+                    stage_ordinal=5,
+                    hydrate_current_gate_passes=False,
+                )
+                self.store.events.clear()
+
+                result = self.workflow.resume_parent("PRO-101")
+
+                self.assertIn(result.next_action, {"wait", "block"})
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(
+                    any(event[0] == "create" for event in self.store.events)
+                )
+
+        self.store.add_state(
+            "PRO-101",
+            snapshot,
+            children=complete,
+            pull_requests=pull_request_targets(),
+            stage_ordinal=5,
+            hydrate_current_gate_passes=False,
+        )
+        self.store.events.clear()
+
+        complete_result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(complete_result.next_action, "repair")
+        self.assertEqual(complete_result.created_children, (("api", "repair"),))
+
     def test_failure_bundle_rejects_duplicate_current_gate_identity(self):
         snapshot = replace(
             passing_snapshot(),
@@ -3357,6 +3573,7 @@ class GenericWorkflowTests(unittest.TestCase):
                     phase_result="pass",
                     evidence_comment_url="https://example.test/evidence/22222222-2222-2222-2222-222222222222",
                 ),
+                *state.children[2:],
             ),
         )
         repaired = self.workflow.resume_parent("PRO-101")

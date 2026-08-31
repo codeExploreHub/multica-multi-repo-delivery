@@ -2665,8 +2665,22 @@ class GenericWorkflow:
             (child.phase, child.target_key, child.suite_key)
             for child in current
         )
-        if len(set(current_identities)) != len(current_identities):
-            raise WorkflowError("repair bundle source Stage repeats a gate identity")
+        expected_identities = {
+            (phase, repository, "")
+            for repository in affected
+            for phase in ("review", "qa")
+        }
+        expected_identities.update(
+            ("integration_qa", suite_key, suite_key)
+            for suite_key in applicable_suites
+        )
+        if (
+            len(set(current_identities)) != len(current_identities)
+            or set(current_identities) != expected_identities
+        ):
+            raise WorkflowError(
+                "repair bundle source Stage gate membership is incomplete or conflicting"
+            )
         expected_nonpass = {
             (phase, repository, "")
             for phase, evidence_by_repository in (

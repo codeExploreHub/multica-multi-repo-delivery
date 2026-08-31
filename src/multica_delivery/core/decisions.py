@@ -623,6 +623,26 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
 
     if pending_reason is not None:
         return _decision(DecisionKind.WAIT, pending_reason)
+    if missing_gate_repositories or missing_suites:
+        if all_merged:
+            return _decision(
+                DecisionKind.BLOCK,
+                "merged work lacks complete pre-merge review, QA, or integration evidence; human action is required",
+            )
+        if snapshot.reviews or snapshot.qa or snapshot.integration_qa:
+            return _decision(
+                DecisionKind.WAIT,
+                "required exact-SHA gate membership or evidence is incomplete",
+            )
+        dispatch = set(missing_gate_repositories)
+        for suite in missing_suites:
+            dispatch.update(suites[suite])
+        return _decision(
+            DecisionKind.DISPATCH,
+            "dispatch missing exact-SHA review and QA gates",
+            _ordered(manifest, dispatch),
+            dispatch_kind=DispatchKind.GATES,
+        )
 
     for repository in _ordered(manifest, affected):
         pull_request = snapshot.pull_requests[repository]
@@ -646,12 +666,7 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
                 if pending_reason is None:
                     pending_reason = f"{repository} merge preflight evidence is incomplete"
 
-    if all_merged and (
-        missing_gate_repositories
-        or missing_suites
-        or repair_repositories
-        or pending_reason is not None
-    ):
+    if all_merged and (repair_repositories or pending_reason is not None):
         return _decision(
             DecisionKind.BLOCK,
             "merged work lacks complete pre-merge review, QA, or integration evidence; human action is required",
@@ -665,16 +680,6 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
         )
     if pending_reason is not None:
         return _wait_or_recover(manifest, snapshot, pending_reason)
-    if missing_gate_repositories or missing_suites:
-        dispatch = set(missing_gate_repositories)
-        for suite in missing_suites:
-            dispatch.update(suites[suite])
-        return _decision(
-            DecisionKind.DISPATCH,
-            "dispatch missing exact-SHA review and QA gates",
-            _ordered(manifest, dispatch),
-            dispatch_kind=DispatchKind.GATES,
-        )
     if all_merged:
         return _smoke_decision(manifest, snapshot, affected, suites)
     if snapshot.merge_state == "merging":

@@ -445,6 +445,52 @@ class ParentDecisionTests(unittest.TestCase):
         self.assertEqual(decision.kind, DecisionKind.WAIT)
         self.assertEqual(decision.repositories, ())
 
+    def test_gate_failure_waits_until_every_required_gate_identity_is_present(self):
+        snapshot = passing_snapshot()
+        failed_review = {
+            **snapshot.reviews,
+            "api": gate_for("api", result="fail"),
+        }
+        incomplete = {
+            "missing repository review": replace(
+                snapshot,
+                reviews={"api": failed_review["api"]},
+            ),
+            "missing repository QA": replace(
+                snapshot,
+                reviews=failed_review,
+                qa={"api": snapshot.qa["api"]},
+            ),
+            "missing integration suite": replace(
+                snapshot,
+                reviews=failed_review,
+                integration_qa={},
+            ),
+        }
+
+        for label, value in incomplete.items():
+            with self.subTest(label=label):
+                decision = decide_parent_action(self.manifest, value)
+
+                self.assertEqual(decision.kind, DecisionKind.WAIT)
+                self.assertEqual(decision.repositories, ())
+                self.assertIsNone(decision.next_attempt)
+
+    def test_complete_pass_and_failure_gate_membership_still_repairs(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            qa={
+                **snapshot.qa,
+                "api": gate_for("api", result="fail"),
+            },
+        )
+
+        decision = decide_parent_action(self.manifest, snapshot)
+
+        self.assertEqual(decision.kind, DecisionKind.REPAIR)
+        self.assertEqual(decision.repositories, ("api",))
+
     def test_stalled_parent_still_waits_while_gate_evidence_is_pending(self):
         snapshot = passing_snapshot()
         snapshot = replace(
