@@ -3945,6 +3945,70 @@ class GenericWorkflowTests(unittest.TestCase):
         )
         return workflow, manager, backend
 
+    def seed_authoritative_terminal_gate_failure(
+        self,
+        parent_identifier: str = "PRO-101",
+    ) -> tuple[WorkflowState, tuple[WorkflowChild, ...]]:
+        snapshot = replace(
+            passing_snapshot(),
+            reviews={
+                **passing_snapshot().reviews,
+                "api": RepositoryEvidence(SHA["api"], "fail"),
+            },
+        )
+        specifications = (
+            ("api", "api", "", "review", "fail", "1"),
+            ("api", "api", "", "qa", "pass", "2"),
+            ("web", "web", "", "review", "pass", "3"),
+            ("web", "web", "", "qa", "pass", "4"),
+            ("web-api", "web", "web-api", "integration_qa", "pass", "5"),
+        )
+        gates = tuple(
+            WorkflowChild(
+                f"{parent_identifier}-GATE-{index}",
+                target,
+                repository,
+                suite,
+                phase_name,
+                5,
+                0,
+                "done",
+                ("review:" if phase_name == "review" else "qa:") + digit * 64,
+                False,
+                evidence_comment_uuid=str(uuid.UUID(digit * 32)),
+                creation_candidate_shas=snapshot.candidate_shas,
+                phase_result=result,
+                evidence_comment_url=(
+                    f"https://example.test/evidence/{str(uuid.UUID(digit * 32))}"
+                ),
+                responsible_repositories=("api",) if result == "fail" else (),
+            )
+            for index, (
+                target,
+                repository,
+                suite,
+                phase_name,
+                result,
+                digit,
+            ) in enumerate(specifications, start=1)
+        )
+        self.store.add_state(
+            parent_identifier,
+            snapshot,
+            children=gates,
+            pull_requests=pull_request_targets(),
+            stage_ordinal=5,
+            hydrate_current_gate_passes=False,
+        )
+        state = self.store.states[parent_identifier]
+        current = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == 5 and child.attempt == 0
+        )
+        self.store.events.clear()
+        return state, current
+
     def test_parent_intake_dispatches_only_first_topological_wave(self):
         result = self.workflow.handle_parent_event(
             "PRO-101",
@@ -4825,6 +4889,141 @@ class GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(complete_result.next_action, "repair")
         self.assertEqual(complete_result.created_children, (("api", "repair"),))
 
+    def test_initial_gate_failure_requires_exact_authoritative_completion_chain(self):
+        corruptions = (
+            "missing record",
+            "forged record",
+            "changed record",
+            "read error",
+            "wrong child creation action",
+            "missing creation action",
+            "missing completion action",
+            "wrong completion action",
+            "blocked pseudo-terminal",
+            "cancelled pseudo-terminal",
+        )
+        for corruption in corruptions:
+            with self.subTest(corruption=corruption):
+                state, gates = self.seed_authoritative_terminal_gate_failure()
+                first = gates[0]
+                completion_key = ("PRO-101", first.evidence_comment_uuid)
+                creation_action = gates[0].action_key
+                completion_action = coordinator_action_key(
+                    workflow_version=2,
+                    instance_key=self.manifest.instance.key,
+                    parent_identifier="PRO-101",
+                    stage_kind=f"{first.phase}:{first.target_key}",
+                    stage_ordinal=first.stage_ordinal,
+                    attempt=first.attempt,
+                    affected_repositories=frozenset(
+                        state.snapshot.affected_repositories
+                    ),
+                    candidate_shas=state.snapshot.candidate_shas,
+                    contract_hashes=state.metadata.contract_hashes,
+                )
+                changed = state
+                if corruption == "missing record":
+                    del self.store.completions[completion_key]
+                elif corruption == "forged record":
+                    self.store.completions[completion_key] = replace(
+                        self.store.completions[completion_key],
+                        result="blocked",
+                    )
+                elif corruption == "changed record":
+                    self.store.change_completion_after_first_read = True
+                elif corruption == "read error":
+                    self.store.completion_read_failures_remaining = 1
+                elif corruption == "wrong child creation action":
+                    changed = replace(
+                        state,
+                        children=(
+                            replace(first, action_key="stage:" + "9" * 64),
+                            *gates[1:],
+                        ),
+                    )
+                elif corruption == "missing creation action":
+                    changed = replace(
+                        state,
+                        applied_action_keys=(
+                            state.applied_action_keys - {creation_action}
+                        ),
+                    )
+                elif corruption == "missing completion action":
+                    changed = replace(
+                        state,
+                        applied_action_keys=(
+                            state.applied_action_keys - {completion_action}
+                        ),
+                    )
+                elif corruption == "wrong completion action":
+                    changed = replace(
+                        state,
+                        applied_action_keys=(
+                            state.applied_action_keys - {completion_action}
+                        )
+                        | {"stage:" + "8" * 64},
+                    )
+                else:
+                    changed = replace(
+                        state,
+                        children=(
+                            replace(
+                                first,
+                                status=(
+                                    "blocked"
+                                    if corruption == "blocked pseudo-terminal"
+                                    else "cancelled"
+                                ),
+                            ),
+                            *gates[1:],
+                        ),
+                    )
+                self.store.states["PRO-101"] = changed
+                self.store.events.clear()
+
+                result = self.workflow.resume_parent("PRO-101")
+
+                self.assertIn(result.next_action, {"block", "uncertain"})
+                self.assertEqual(result.mutation_count, 0)
+                self.assertEqual(
+                    self.store.states["PRO-101"].metadata.repair_round,
+                    0,
+                )
+                self.assertFalse(
+                    any(event[0] == "create" for event in self.store.events)
+                )
+
+    def test_initial_gate_failure_double_reads_every_exact_completion_before_repair(self):
+        _, gates = self.seed_authoritative_terminal_gate_failure()
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        reads = [
+            event[1]
+            for event in self.store.events
+            if event[0] == "read-completion"
+        ]
+        self.assertEqual(result.next_action, "repair", result.reason)
+        self.assertEqual(result.created_children, (("api", "repair"),))
+        self.assertEqual(len(reads), len(gates) * 2)
+        self.assertTrue(
+            all(reads.count(child.evidence_comment_uuid) == 2 for child in gates)
+        )
+
+    def test_initial_gate_failure_rereads_parent_after_completion_fan_in(self):
+        for drift in ("metadata", "actions", "children", "snapshot"):
+            with self.subTest(drift=drift):
+                self.seed_authoritative_terminal_gate_failure()
+                self.store.parent_drift_after_completion_read = drift
+
+                result = self.workflow.resume_parent("PRO-101")
+
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(
+                    any(event[0] == "create" for event in self.store.events)
+                )
+
     def test_failure_bundle_rejects_duplicate_current_gate_identity(self):
         snapshot = replace(
             passing_snapshot(),
@@ -5176,6 +5375,26 @@ class GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(self.store.states["PRO-101"].snapshot.attempt, 0)
 
         state = self.store.states["PRO-101"]
+        api_completion = completion_for(
+            "api",
+            phase="review",
+            result="pass",
+            comment_digit="2",
+        )
+        api_completion_action = coordinator_action_key(
+            workflow_version=2,
+            instance_key=self.manifest.instance.key,
+            parent_identifier="PRO-101",
+            stage_kind="review:api",
+            stage_ordinal=5,
+            attempt=0,
+            affected_repositories=frozenset(snapshot.affected_repositories),
+            candidate_shas=snapshot.candidate_shas,
+            contract_hashes=state.metadata.contract_hashes,
+        )
+        self.store.completions[
+            ("PRO-101", api_completion.evidence_comment_uuid)
+        ] = api_completion
         self.store.states["PRO-101"] = replace(
             state,
             children=(
@@ -5189,6 +5408,9 @@ class GenericWorkflowTests(unittest.TestCase):
                     evidence_comment_url="https://example.test/evidence/22222222-2222-2222-2222-222222222222",
                 ),
                 *state.children[2:],
+            ),
+            applied_action_keys=(
+                state.applied_action_keys | {api_completion_action}
             ),
         )
         repaired = self.workflow.resume_parent("PRO-101")

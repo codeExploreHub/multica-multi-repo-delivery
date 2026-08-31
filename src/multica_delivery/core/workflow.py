@@ -2127,18 +2127,19 @@ class GenericWorkflow:
             for repository, pull_request in state.snapshot.pull_requests.items()
         )
 
-    def _current_repair_failure_bundle(
+    def _authoritative_source_gate_failure_bundle(
         self,
         state: WorkflowState,
-        current: tuple[WorkflowChild, ...],
+        *,
+        source_stage: int,
+        source_attempt: int,
+        repair_round: int,
         source: Mapping[str, str],
     ) -> FailureBundle | None:
-        """Rebuild the immutable current Repair owner set from its source Gates."""
+        """Rebuild one immutable failure bundle from exact source Gate authority."""
 
-        if state.metadata is None or not current:
+        if state.metadata is None:
             return None
-        source_stage = state.metadata.stage_ordinal - 1
-        source_attempt = state.metadata.repair_round - 1
         affected = frozenset(state.snapshot.affected_repositories)
         applicable_suites = {
             suite.key: suite
@@ -2310,12 +2311,30 @@ class GenericWorkflow:
                 state.parent_identifier,
                 state.metadata.workflow_version,
                 source_stage,
-                state.metadata.repair_round,
+                repair_round,
                 source,
                 tuple(failures),
             )
         except (TypeError, ValueError, WorkflowError):
             return None
+
+    def _current_repair_failure_bundle(
+        self,
+        state: WorkflowState,
+        current: tuple[WorkflowChild, ...],
+        source: Mapping[str, str],
+    ) -> FailureBundle | None:
+        """Rebuild the immutable current Repair owner set from its source Gates."""
+
+        if state.metadata is None or not current:
+            return None
+        return self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=state.metadata.stage_ordinal - 1,
+            source_attempt=state.metadata.repair_round - 1,
+            repair_round=state.metadata.repair_round,
+            source=source,
+        )
 
     def _current_repair_head_problem(
         self,
@@ -3020,6 +3039,17 @@ class GenericWorkflow:
             raise WorkflowError(
                 "repair bundle source Stage gate membership is incomplete or conflicting"
             )
+        authoritative_bundle = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=state.metadata.stage_ordinal,
+            source_attempt=state.snapshot.attempt,
+            repair_round=decision.next_attempt,
+            source=state.snapshot.candidate_shas,
+        )
+        if authoritative_bundle is None:
+            raise WorkflowError(
+                "repair bundle source Gate authority is incomplete or conflicting"
+            )
         expected_nonpass = {
             (phase, repository, "")
             for phase, evidence_by_repository in (
@@ -3117,7 +3147,7 @@ class GenericWorkflow:
         )
         if not failures or owners != frozenset(decision.repositories):
             raise WorkflowError("repair decision disagrees with complete failure ownership")
-        return FailureBundle.build(
+        snapshot_bundle = FailureBundle.build(
             state.parent_identifier,
             state.metadata.workflow_version,
             state.metadata.stage_ordinal,
@@ -3125,6 +3155,11 @@ class GenericWorkflow:
             state.snapshot.candidate_shas,
             tuple(failures),
         )
+        if snapshot_bundle != authoritative_bundle:
+            raise WorkflowError(
+                "repair bundle aggregate evidence conflicts with source Gate authority"
+            )
+        return authoritative_bundle
 
     def _repair_authority(
         self,
