@@ -3420,6 +3420,84 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                 )
                 self.assertEqual(self.store.candidate_sha("api"), REPLACEMENT_SHA)
                 self.assertEqual(self.store.candidate_sha("web"), SHA["web"])
+                finished = self.workflow.record_phase_completion(
+                    completion_for(
+                        "web",
+                        parent="PRO-200",
+                        phase="repair",
+                        attempt=repair_round,
+                        sha=OTHER_SHA,
+                        failure_bundle_digest=bundle_digest,
+                    )
+                )
+                replay = self.workflow.record_phase_completion(
+                    completion_for(
+                        "api",
+                        parent="PRO-200",
+                        phase="repair",
+                        attempt=repair_round,
+                        sha=REPLACEMENT_SHA,
+                        failure_bundle_digest=bundle_digest,
+                    )
+                )
+                self.assertEqual(finished.next_action, "dispatch")
+                self.assertEqual(replay.next_action, "noop", replay.reason)
+                self.assertEqual(replay.mutation_count, 0)
+                current = self.store.states["PRO-200"]
+                if repair_round == 1:
+                    corrupted_children = tuple(
+                        replace(child, action_key="stage:" + "f" * 64)
+                        if child.phase == "repair" and child.repository_key == "web"
+                        else child
+                        for child in current.children
+                    )
+                    self.store.states["PRO-200"] = replace(
+                        current,
+                        children=corrupted_children,
+                    )
+                elif repair_round == 2:
+                    self.store.states["PRO-200"] = replace(
+                        current,
+                        snapshot=replace(
+                            current.snapshot,
+                            pull_requests={
+                                **current.snapshot.pull_requests,
+                                "web": PullRequestEvidence(
+                                    SHA["web"], "open", True, True
+                                ),
+                            },
+                        ),
+                    )
+                else:
+                    corrupted_children = tuple(
+                        replace(
+                            child,
+                            authorizing_comment_uuid=evidence_uuid(
+                                "forged-sibling-authorization"
+                            ),
+                        )
+                        if child.phase == "repair" and child.repository_key == "web"
+                        else child
+                        for child in current.children
+                    )
+                    self.store.states["PRO-200"] = replace(
+                        current,
+                        children=corrupted_children,
+                    )
+                forged_replay = self.workflow.record_phase_completion(
+                    completion_for(
+                        "api",
+                        parent="PRO-200",
+                        phase="repair",
+                        attempt=repair_round,
+                        sha=REPLACEMENT_SHA,
+                        failure_bundle_digest=bundle_digest,
+                    )
+                )
+                self.assertEqual(
+                    (forged_replay.next_action, forged_replay.mutation_count),
+                    ("block", 0),
+                )
 
     def test_current_repair_requires_exact_failure_bundle_owner_multiset(self):
         source = {"api": SHA["api"], "web": SHA["web"]}

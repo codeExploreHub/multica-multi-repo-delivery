@@ -4074,6 +4074,14 @@ class GenericWorkflow:
         unchanged_creation_candidates = all(
             repository == completion.repository_key
             or state.snapshot.candidate_shas.get(repository) == candidate_sha
+            or (
+                completion.phase == "repair"
+                and self._repair_sibling_replacement_is_authoritative(
+                    state,
+                    completed[0],
+                    repository,
+                )
+            )
             for repository, candidate_sha in completed[0].creation_candidate_shas.items()
         )
         gate_creation_candidates = (
@@ -4095,7 +4103,11 @@ class GenericWorkflow:
             completion.candidate_shas
             if completion.phase == "integration_qa"
             else {
-                **state.snapshot.candidate_shas,
+                **(
+                    completed[0].creation_candidate_shas
+                    if completion.phase == "repair"
+                    else state.snapshot.candidate_shas
+                ),
                 completion.repository_key: completion.candidate_sha,
             }
         )
@@ -4133,6 +4145,79 @@ class GenericWorkflow:
             "phase completion already exists",
             completed_child_status="done",
             action_key=expected_completion_key,
+        )
+
+    def _repair_sibling_replacement_is_authoritative(
+        self,
+        state: WorkflowState,
+        replayed: WorkflowChild,
+        repository: str,
+    ) -> bool:
+        """Explain one same-wave sibling replacement during exact replay."""
+
+        siblings = tuple(
+            child
+            for child in state.children
+            if child.repository_key == repository
+            and child.phase == "repair"
+            and child.stage_ordinal == replayed.stage_ordinal
+            and child.attempt == replayed.attempt
+            and child.action_key == replayed.action_key
+            and child.failure_bundle_digest == replayed.failure_bundle_digest
+            and child.authorizing_comment_uuid == replayed.authorizing_comment_uuid
+            and child.status == "done"
+            and not child.active
+            and child.phase_result == "pass"
+            and _canonical_uuid(child.evidence_comment_uuid)
+        )
+        if len(siblings) != 1:
+            return False
+        sibling = siblings[0]
+        candidate = state.snapshot.candidate_shas.get(repository)
+        pull_request = state.snapshot.pull_requests.get(repository)
+        if (
+            candidate is None
+            or candidate == replayed.creation_candidate_shas.get(repository)
+            or pull_request is None
+            or pull_request.head_sha != candidate
+        ):
+            return False
+        try:
+            observations = tuple(
+                self.snapshot_reader.read_phase_completion(
+                    state.parent_identifier,
+                    sibling.evidence_comment_uuid,
+                )
+                for _ in range(2)
+            )
+        except Exception:
+            return False
+        if (
+            observations[0] != observations[1]
+            or type(observations[0]) is not PhaseCompletion
+        ):
+            return False
+        observed = observations[0]
+        expected_action = self._action_key(
+            state,
+            f"repair:{sibling.target_key}",
+            sibling.stage_ordinal,
+            attempt=sibling.attempt,
+            candidate_shas=state.snapshot.candidate_shas,
+            failure_bundle_digest=sibling.failure_bundle_digest,
+            authorizing_comment_uuid=sibling.authorizing_comment_uuid,
+        )
+        return (
+            observed.repository_key == repository
+            and observed.phase == "repair"
+            and observed.result == "pass"
+            and observed.attempt == sibling.attempt
+            and observed.candidate_sha == candidate
+            and observed.failure_bundle_digest == sibling.failure_bundle_digest
+            and sibling.evidence_comment_url == observed.evidence_comment_url
+            and sibling.responsible_repositories
+            == observed.responsible_repositories
+            and expected_action in state.applied_action_keys
         )
 
     def record_phase_completion(self, completion: PhaseCompletion) -> WorkflowResult:
