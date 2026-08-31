@@ -1458,7 +1458,6 @@ class FakeWorkflowStore:
         )
         self.states[parent_identifier] = replace(
             state,
-            metadata=metadata,
             snapshot=replace(
                 state.snapshot,
                 recovery_count=1,
@@ -1470,7 +1469,6 @@ class FakeWorkflowStore:
             ),
             children=children,
             active_work=self.activate_on_rerun,
-            applied_action_keys=state.applied_action_keys | {action_key},
         )
         if self.fail_reads_after_rerun:
             self.fail_reads_after_rerun = False
@@ -10387,7 +10385,7 @@ class GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(len(manager.backend.started[0][0]), 2)
         self.assertEqual(len(manager.backend.stopped), 1)
 
-    def test_watcher_recovers_once_then_blocks_a_still_stalled_parent(self):
+    def test_watcher_recovers_once_then_reports_a_still_stalled_parent_without_parent_write(self):
         child = WorkflowChild(
             "PRO-101-API",
             "api",
@@ -10417,14 +10415,84 @@ class GenericWorkflowTests(unittest.TestCase):
             children=tuple(replace(item, active=False) for item in recovered.children),
             active_work=False,
         )
+        before_second = self.store.states["PRO-101"]
+        self.store.events.clear()
         second = self.workflow.recover_stalled_parent("PRO-101", now=stalled_at)
 
         self.assertEqual(first.next_action, "resume")
-        self.assertEqual(second.parent_status, "blocked")
-        self.assertEqual(len([event for event in self.store.events if event[0] == "rerun"]), 1)
-        rerun_key = [event for event in self.store.events if event[0] == "rerun"][0][-1]
-        blocked_key = [event for event in self.store.events if event[0] == "status"][-1][-1]
-        self.assertNotEqual(rerun_key, blocked_key)
+        self.assertEqual(second.next_action, "block")
+        self.assertEqual(second.mutation_count, 0)
+        self.assertEqual(self.store.states["PRO-101"], before_second)
+        self.assertFalse(
+            any(event[0] in {"rerun", "status", "create"} for event in self.store.events)
+        )
+
+    def test_watcher_rerun_preserves_parent_authority_and_same_stage_child_can_complete(self):
+        self.workflow.handle_parent_event(
+            "PRO-101", affected=frozenset({"api"})
+        )
+        created = self.store.states["PRO-101"]
+        child = created.children[0]
+        stalled = replace(
+            created,
+            snapshot=replace(
+                created.snapshot,
+                stalled=True,
+                stalled_repository="api",
+            ),
+            children=(replace(child, active=False),),
+            active_work=False,
+        )
+        self.store.states["PRO-101"] = stalled
+        self.store.activate_on_rerun = True
+        parent_authority = (
+            stalled.parent_status,
+            stalled.metadata,
+            stalled.applied_action_keys,
+        )
+        self.store.events.clear()
+
+        recovered = self.workflow.recover_stalled_parent("PRO-101")
+
+        after_recovery = self.store.states["PRO-101"]
+        self.assertEqual(recovered.next_action, "resume")
+        self.assertEqual(
+            replace(
+                after_recovery,
+                snapshot=replace(
+                    after_recovery.snapshot,
+                    recovery_count=stalled.snapshot.recovery_count,
+                ),
+                children=stalled.children,
+                active_work=stalled.active_work,
+            ),
+            stalled,
+        )
+        self.assertEqual(
+            (
+                after_recovery.parent_status,
+                after_recovery.metadata,
+                after_recovery.applied_action_keys,
+            ),
+            parent_authority,
+        )
+        recovered_child = next(
+            item for item in after_recovery.children if item.identifier == child.identifier
+        )
+        self.assertEqual(recovered_child.stage_ordinal, child.stage_ordinal)
+        self.assertEqual(recovered_child.action_key, child.action_key)
+        self.store.events.clear()
+
+        completed = self.workflow.record_phase_completion(completion_for("api"))
+
+        self.assertEqual(completed.completed_child_status, "done")
+        self.assertGreaterEqual(completed.mutation_count, 1)
+        self.assertTrue(
+            any(
+                item.identifier == child.identifier and item.status == "done"
+                for item in self.store.states["PRO-101"].children
+            )
+        )
 
     def test_watcher_entrypoints_fail_closed_without_mutation_for_future_child_relationship(self):
         future_child = WorkflowChild(
@@ -10612,12 +10680,25 @@ class GenericWorkflowTests(unittest.TestCase):
             stalled_repository="api",
         )
         self.store.add_state("PRO-101", snapshot, children=(child,))
+        self.store.activate_on_rerun = True
         self.store.fail_reads_after_rerun = True
+        before = self.store.states["PRO-101"]
 
-        result = self.workflow.recover_stalled_parent("PRO-101")
+        first = self.workflow.recover_stalled_parent("PRO-101")
+        second = self.workflow.recover_stalled_parent("PRO-101")
 
-        self.assertEqual(result.next_action, "uncertain")
+        self.assertEqual(first.next_action, "uncertain")
+        self.assertEqual(second.next_action, "noop")
         self.assertEqual(self.store.states["PRO-101"].snapshot.recovery_count, 1)
+        self.assertEqual(self.store.states["PRO-101"].metadata, before.metadata)
+        self.assertEqual(
+            self.store.states["PRO-101"].applied_action_keys,
+            before.applied_action_keys,
+        )
+        self.assertEqual(
+            len([event for event in self.store.events if event[0] == "rerun"]),
+            1,
+        )
         self.assertFalse(any(event[0] == "status" for event in self.store.events))
 
     def test_watcher_post_effect_read_must_still_name_requested_parent(self):

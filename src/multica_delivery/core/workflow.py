@@ -956,10 +956,12 @@ class WorkflowExecutor(Protocol):
         self,
         parent_identifier: str,
         child_identifier: str,
-        metadata: ParentMetadata,
+        expected_parent_metadata: ParentMetadata,
         *,
         action_key: str,
-    ) -> None: ...
+    ) -> None:
+        """Wake the child without persisting or changing parent authority."""
+        ...
 
 
 class GitHubMergeClient(Protocol):
@@ -7371,7 +7373,7 @@ class GenericWorkflow:
         if initial.human_wait or initial.active_work or not initial.snapshot.stalled:
             return self._result(initial, "noop", "work is healthy or waiting for a human")
         if decision.kind is DecisionKind.BLOCK and initial.snapshot.recovery_count >= 1:
-            return self._block(initial, decision.reason, stage_kind="recovery-block")
+            return self._zero_mutation_block(initial, decision.reason)
         if (
             decision.kind is not DecisionKind.DISPATCH
             or decision.dispatch_kind is not DispatchKind.RECOVERY
@@ -7455,19 +7457,16 @@ class GenericWorkflow:
         ):
             return self._result(fresh, "noop", "workflow changed before recovery")
         assert fresh.metadata is not None
-        ordinal = fresh.metadata.stage_ordinal + 1
         key = self._action_key(
             fresh,
             "recovery",
-            ordinal,
+            fresh.metadata.stage_ordinal,
         )
         if key in fresh.applied_action_keys:
-            return self._result(fresh, "noop", "recovery action already exists", action_key=key)
-        metadata = self._metadata(
-            fresh,
-            action_key=key,
-            stage_ordinal=ordinal,
-        )
+            return self._zero_mutation_block(
+                fresh,
+                "watcher recovery action must not be parent-applied",
+            )
         before_children = fresh.children
         target_identifier = candidates[0].identifier
 
@@ -7489,7 +7488,7 @@ class GenericWorkflow:
             self.executor.rerun_child(
                 parent_identifier,
                 target_identifier,
-                metadata,
+                fresh.metadata,
                 action_key=key,
             )
         except Exception:
@@ -7501,10 +7500,10 @@ class GenericWorkflow:
             lambda current: (
                 isinstance(current, WorkflowState)
                 and current.parent_identifier == parent_identifier
-                and current.metadata == metadata
+                and current.metadata == fresh.metadata
                 and current.snapshot.recovery_count
                 == fresh.snapshot.recovery_count + 1
-                and key in current.applied_action_keys
+                and current.applied_action_keys == fresh.applied_action_keys
             ),
         )
         if observed is None:
@@ -7575,9 +7574,9 @@ class GenericWorkflow:
             or frozenset(after_by_id) not in allowed_after_identifiers
             or not unchanged_other_children
             or observed.pull_requests != fresh.pull_requests
-            or observed.metadata != metadata
+            or observed.metadata != fresh.metadata
             or observed.human_wait != fresh.human_wait
-            or observed.applied_action_keys != fresh.applied_action_keys | {key}
+            or observed.applied_action_keys != fresh.applied_action_keys
         ):
             return WorkflowResult(
                 parent_identifier,
