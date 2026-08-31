@@ -431,11 +431,14 @@ class FakeWorkflowStore:
                 else 5
             ),
         )
-        if hydrate_current_gate_passes and any(
-            child.stage_ordinal == metadata.stage_ordinal
-            and child.attempt == snapshot.attempt
-            and child.phase in {"review", "qa", "integration_qa"}
-            for child in children
+        if hydrate_current_gate_passes and (
+            decide_parent_action(self.manifest, snapshot).kind is DecisionKind.MERGE
+            or any(
+                child.stage_ordinal == metadata.stage_ordinal
+                and child.attempt == snapshot.attempt
+                and child.phase in {"review", "qa", "integration_qa"}
+                for child in children
+            )
         ):
             observed = {
                 (child.phase, child.target_key, child.suite_key)
@@ -5914,6 +5917,153 @@ class GenericWorkflowTests(unittest.TestCase):
             [event[1] for event in self.store.events if event[0] == "github-read-pr"],
             ["api", "web"],
         )
+
+    def test_merge_requires_complete_authoritative_current_gate_chain(self):
+        self.store.add_state(
+            "PRO-101",
+            passing_snapshot(),
+            children=(),
+            pull_requests=pull_request_targets(),
+            stage_ordinal=5,
+            hydrate_current_gate_passes=False,
+        )
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(self.github.merged, [])
+
+        comment_uuid = str(uuid.UUID("1" * 32))
+        seed = WorkflowChild(
+            "PRO-101-API-REVIEW",
+            "api",
+            "api",
+            "",
+            "review",
+            5,
+            0,
+            "done",
+            "review:" + "1" * 64,
+            False,
+            evidence_comment_uuid=comment_uuid,
+            creation_candidate_shas=passing_snapshot().candidate_shas,
+            phase_result="pass",
+            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+        )
+        self.store.add_state(
+            "PRO-101",
+            passing_snapshot(),
+            children=(seed,),
+            pull_requests=pull_request_targets(),
+            stage_ordinal=5,
+        )
+        self.store.events.clear()
+        self.github.merged.clear()
+
+        valid = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(valid.next_action, "smoke")
+        self.assertEqual(
+            self.github.merged,
+            [
+                ("codeExploreHub/sample-commerce-api", 12),
+                ("codeExploreHub/sample-commerce-web", 14),
+            ],
+        )
+
+    def test_merge_rejects_every_corrupt_current_gate_authority_face(self):
+        def seed_valid() -> WorkflowState:
+            comment_uuid = str(uuid.UUID("1" * 32))
+            seed = WorkflowChild(
+                "PRO-101-API-REVIEW", "api", "api", "", "review", 5, 0,
+                "done", "review:" + "1" * 64, False,
+                evidence_comment_uuid=comment_uuid,
+                creation_candidate_shas=passing_snapshot().candidate_shas,
+                phase_result="pass",
+                evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+            )
+            self.store.add_state(
+                "PRO-101", passing_snapshot(), children=(seed,),
+                pull_requests=pull_request_targets(), stage_ordinal=5,
+            )
+            self.store.events.clear()
+            self.github.merged.clear()
+            return self.store.states["PRO-101"]
+
+        corruptions = (
+            "missing", "duplicate", "extra", "creation action", "completion action",
+            "status", "completion record", "role", "stage", "attempt", "candidate",
+        )
+        for corruption in corruptions:
+            with self.subTest(corruption=corruption):
+                state = seed_valid()
+                children = list(state.children)
+                applied = set(state.applied_action_keys)
+                if corruption == "missing":
+                    children.pop()
+                elif corruption == "duplicate":
+                    children.append(replace(children[0], identifier="PRO-101-DUPLICATE"))
+                elif corruption == "extra":
+                    children.append(
+                        WorkflowChild(
+                            "PRO-101-EXTRA", "api", "api", "", "implementation",
+                            5, 0, "done", "dispatch:" + "9" * 64, False,
+                        )
+                    )
+                elif corruption == "creation action":
+                    children[0] = replace(
+                        children[0],
+                        action_key=self.workflow._action_key(
+                            state, "gates", 4, attempt=0,
+                            candidate_shas=state.snapshot.candidate_shas,
+                        ),
+                    )
+                elif corruption == "completion action":
+                    completion_action = self.workflow._action_key(
+                        state, "review:api", 5, attempt=0,
+                        candidate_shas=state.snapshot.candidate_shas,
+                    )
+                    applied.remove(completion_action)
+                elif corruption == "status":
+                    children[0] = replace(children[0], status="blocked")
+                elif corruption == "completion record":
+                    self.store.completions.pop(
+                        ("PRO-101", children[0].evidence_comment_uuid)
+                    )
+                elif corruption == "role":
+                    children[0] = replace(children[0], phase="qa")
+                elif corruption == "stage":
+                    children[0] = replace(children[0], stage_ordinal=4)
+                elif corruption == "attempt":
+                    children[0] = replace(children[0], attempt=1)
+                else:
+                    children[0] = replace(
+                        children[0],
+                        creation_candidate_shas={"api": "f" * 40, "web": SHA["web"]},
+                    )
+                self.store.states["PRO-101"] = replace(
+                    state,
+                    children=tuple(children),
+                    applied_action_keys=frozenset(applied),
+                )
+
+                result = self.workflow.resume_parent("PRO-101")
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertEqual(self.github.merged, [])
+
+        seed_valid()
+        self.store.states["PRO-101"] = replace(
+            self.store.states["PRO-101"],
+            children=(),
+        )
+        direct = self.workflow.execute_merge_plan("PRO-101")
+        self.assertEqual(direct.next_action, "block")
+        self.assertEqual(direct.mutation_count, 0)
+        self.assertEqual(self.github.merged, [])
 
     def test_direct_merge_waits_without_mutation_for_active_current_stage(self):
         active_child = WorkflowChild(

@@ -2135,7 +2135,8 @@ class GenericWorkflow:
         source_attempt: int,
         repair_round: int,
         source: Mapping[str, str],
-    ) -> FailureBundle | None:
+        allow_all_pass: bool = False,
+    ) -> FailureBundle | tuple[()] | None:
         """Rebuild one immutable failure bundle from exact source Gate authority."""
 
         if state.metadata is None:
@@ -2305,7 +2306,7 @@ class GenericWorkflow:
                     )
                 )
         if not failures:
-            return None
+            return () if allow_all_pass else None
         try:
             return FailureBundle.build(
                 state.parent_identifier,
@@ -2317,6 +2318,23 @@ class GenericWorkflow:
             )
         except (TypeError, ValueError, WorkflowError):
             return None
+
+    def _current_gate_authority_problem(self, state: WorkflowState) -> str | None:
+        """Require an exact authoritative all-PASS current Gate chain."""
+
+        if state.metadata is None:
+            return "current Gate authority is unavailable"
+        observed = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=state.metadata.stage_ordinal,
+            source_attempt=state.snapshot.attempt,
+            repair_round=state.snapshot.attempt + 1,
+            source=state.snapshot.candidate_shas,
+            allow_all_pass=True,
+        )
+        if observed != ():
+            return "current Gate authority is incomplete or conflicting"
+        return None
 
     def _current_repair_failure_bundle(
         self,
@@ -3576,6 +3594,17 @@ class GenericWorkflow:
         if decision.kind is DecisionKind.REPAIR:
             return self._dispatch(state, decision, repair=True)
         if decision.kind is DecisionKind.MERGE:
+            gate_problem = self._current_gate_authority_problem(state)
+            if gate_problem is not None:
+                return self._zero_mutation_block(state, gate_problem)
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+            if self._current_gate_authority_problem(state) is not None:
+                return self._zero_mutation_block(
+                    state,
+                    "current Gate authority changed during merge fan-in",
+                )
             return self.execute_merge_plan(parent_identifier)
         if decision.kind is DecisionKind.SMOKE:
             return self._result(state, "smoke", decision.reason)
@@ -4779,6 +4808,18 @@ class GenericWorkflow:
         if stage_wait is not None:
             return stage_wait
         entry_decision = self._parent_decision(state)
+        if entry_decision.kind is DecisionKind.MERGE:
+            gate_problem = self._current_gate_authority_problem(state)
+            if gate_problem is not None:
+                return self._zero_mutation_block(state, gate_problem)
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+            if self._current_gate_authority_problem(state) is not None:
+                return self._zero_mutation_block(
+                    state,
+                    "current Gate authority changed during merge fan-in",
+                )
         affected = frozenset(state.snapshot.affected_repositories)
         try:
             confirmed = tuple(repository for repository in self.manifest.merge_order if repository in affected)
