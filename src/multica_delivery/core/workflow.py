@@ -3347,6 +3347,178 @@ class GenericWorkflow:
             child.authorizing_comment_uuid,
         )
 
+    def _authoritative_terminal_successor_actions(
+        self,
+        state: WorkflowState,
+        current: tuple[WorkflowChild, ...],
+        source_candidates: Mapping[str, str],
+        creation_action: str,
+    ) -> frozenset[str] | None:
+        """Validate exact completion authority for a partial successor prefix."""
+
+        actions: set[str] = set()
+        evidence_uuids: set[str] = set()
+        applicable_suites = {
+            suite.key: suite
+            for suite in self.manifest.integration_suites
+            if set(suite.repositories)
+            <= set(state.snapshot.affected_repositories)
+        }
+        for child in current:
+            if child.active and child.status in _ACTIVE_CHILD_STATUSES:
+                if (
+                    child.evidence_comment_uuid
+                    or child.phase_result
+                    or child.evidence_comment_url
+                    or child.responsible_repositories
+                ):
+                    return None
+                continue
+            if (
+                child.status != "done"
+                or child.active
+                or child.phase_result not in _PHASE_RESULTS
+                or not _canonical_uuid(child.evidence_comment_uuid)
+                or not _https_evidence_url(child.evidence_comment_url)
+                or child.evidence_comment_uuid in evidence_uuids
+            ):
+                return None
+            evidence_uuids.add(child.evidence_comment_uuid)
+            pull_request = state.pull_requests.get(child.repository_key)
+            if pull_request is None:
+                return None
+            try:
+                reads = tuple(
+                    self.snapshot_reader.read_phase_completion(
+                        state.parent_identifier,
+                        child.evidence_comment_uuid,
+                    )
+                    for _ in range(2)
+                )
+            except Exception:
+                return None
+            if (
+                reads[0] != reads[1]
+                or type(reads[0]) is not PhaseCompletion
+                or reads[0].pull_request_url not in {"", pull_request.url}
+            ):
+                return None
+            observed = reads[0]
+            if child.phase == "implementation":
+                aggregate = state.snapshot.children.get(child.repository_key)
+                if (
+                    child.target_key != child.repository_key
+                    or child.suite_key
+                    or child.responsible_repositories
+                    or aggregate is None
+                    or aggregate.result != child.phase_result
+                ):
+                    return None
+                candidate_sha = aggregate.candidate_sha
+                completion_candidates: Mapping[str, str] = {}
+            elif child.phase in {"review", "qa"}:
+                aggregate = (
+                    state.snapshot.reviews.get(child.repository_key)
+                    if child.phase == "review"
+                    else state.snapshot.qa.get(child.repository_key)
+                )
+                expected_owners = (
+                    (child.repository_key,)
+                    if child.phase_result != "pass"
+                    else ()
+                )
+                if (
+                    child.target_key != child.repository_key
+                    or child.suite_key
+                    or child.repository_key not in source_candidates
+                    or child.responsible_repositories != expected_owners
+                    or aggregate
+                    != RepositoryEvidence(
+                        source_candidates[child.repository_key],
+                        child.phase_result,
+                    )
+                ):
+                    return None
+                candidate_sha = source_candidates[child.repository_key]
+                completion_candidates = {}
+            elif child.phase == "integration_qa":
+                suite = applicable_suites.get(child.suite_key)
+                aggregate = state.snapshot.integration_qa.get(child.suite_key)
+                if (
+                    suite is None
+                    or child.target_key != suite.key
+                    or child.repository_key != suite.command_repository
+                    or child.repository_key not in source_candidates
+                    or (
+                        child.phase_result == "pass"
+                        and child.responsible_repositories
+                    )
+                    or (
+                        child.phase_result != "pass"
+                        and (
+                            not child.responsible_repositories
+                            or not set(child.responsible_repositories)
+                            <= set(suite.repositories)
+                        )
+                    )
+                    or aggregate
+                    != GateEvidence(
+                        source_candidates,
+                        child.phase_result,
+                        child.responsible_repositories,
+                    )
+                ):
+                    return None
+                candidate_sha = source_candidates[child.repository_key]
+                completion_candidates = source_candidates
+            else:
+                return None
+            expected = PhaseCompletion(
+                parent_identifier=state.parent_identifier,
+                repository_key=child.repository_key,
+                phase=child.phase,
+                result=child.phase_result,
+                attempt=child.attempt,
+                candidate_sha=candidate_sha,
+                pull_request_url=observed.pull_request_url,
+                evidence_comment_uuid=child.evidence_comment_uuid,
+                evidence_comment_url=child.evidence_comment_url,
+                suite_key=child.suite_key,
+                candidate_shas=completion_candidates,
+                responsible_repositories=child.responsible_repositories,
+            )
+            if (
+                _phase_completion_schema_problem(
+                    expected,
+                    manifest=self.manifest,
+                )
+                is not None
+                or observed != expected
+            ):
+                return None
+            action_candidates = (
+                completion_candidates
+                if child.phase == "integration_qa"
+                else {
+                    **source_candidates,
+                    child.repository_key: candidate_sha,
+                }
+            )
+            completion_action = self._action_key(
+                state,
+                f"{child.phase}:{child.target_key}",
+                child.stage_ordinal,
+                attempt=child.attempt,
+                candidate_shas=action_candidates,
+            )
+            if (
+                completion_action == creation_action
+                or completion_action not in state.applied_action_keys
+            ):
+                return None
+            actions.add(completion_action)
+        return frozenset(actions)
+
     def _reconcile_nonrepair_successor(
         self,
         state: WorkflowState,
@@ -3377,7 +3549,7 @@ class GenericWorkflow:
         phases = frozenset(child.phase for child in current)
         if (
             phases <= {"review", "qa", "integration_qa"}
-            and not metadata.last_action.startswith("stage:")
+            and not metadata.last_action.startswith(("stage:", "review:", "qa:"))
         ):
             return None
         creation_candidate_maps = {
@@ -3449,23 +3621,48 @@ class GenericWorkflow:
             attempt=metadata.repair_round,
             candidate_shas=source_candidates,
         )
-        open_reservation = all(
-            child.active
-            and child.status in _ACTIVE_CHILD_STATUSES
-            and not child.evidence_comment_uuid
-            and not child.phase_result
-            and not child.evidence_comment_url
-            for child in current
+        terminal_actions = self._authoritative_terminal_successor_actions(
+            state,
+            current,
+            source_candidates,
+            action_key,
         )
-        if metadata.last_action != action_key:
-            if open_reservation and metadata.last_action.startswith(
-                "stage:" if stage_kind == "gates" else "dispatch:"
+        if terminal_actions is None:
+            return self._zero_mutation_block(
+                state,
+                "partial successor terminal evidence is missing or conflicting",
+            )
+        if terminal_actions:
+            if (
+                action_key not in state.applied_action_keys
+                or metadata.last_action not in terminal_actions
             ):
                 return self._zero_mutation_block(
                     state,
-                    "non-repair successor reservation has the wrong creation action",
+                    "partial successor terminal action provenance is conflicting",
                 )
-            return None
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+            refreshed_actions = self._authoritative_terminal_successor_actions(
+                state,
+                current,
+                source_candidates,
+                action_key,
+            )
+            if refreshed_actions != terminal_actions:
+                return self._zero_mutation_block(
+                    state,
+                    "partial successor terminal evidence changed after parent fan-in",
+                )
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+        elif metadata.last_action != action_key:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor reservation has the wrong creation action",
+            )
         wanted = Counter(
             self._successor_request_identity(request, action_key)
             for request in requests
@@ -3480,15 +3677,13 @@ class GenericWorkflow:
                 "non-repair successor reservation conflicts with its exact intended membership",
             )
         if observed == wanted and action_key in state.applied_action_keys:
-            if open_reservation:
+            if not terminal_actions:
                 return self._result(
                     state,
                     "noop",
                     "complete non-repair successor reservation is already active",
                     action_key=action_key,
                 )
-            return None
-        if not open_reservation:
             return None
         missing = wanted - observed
         missing_counts = Counter(missing)
@@ -3738,11 +3933,9 @@ class GenericWorkflow:
                     "non-repair successor identity conflicts with its intended membership",
                 )
             if self._has_successor(state, requests):
-                return self._result(
+                return self._zero_mutation_block(
                     state,
-                    "noop",
-                    "an intended historical successor already exists",
-                    action_key=key,
+                    "historical successor collides with the exact current plan",
                 )
         if key in state.applied_action_keys:
             return self._result(state, "noop", "coordinator action already exists", action_key=key)

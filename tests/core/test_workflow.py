@@ -4626,7 +4626,7 @@ class GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(result.next_action, "noop")
         self.assertFalse(any(event[0] == "initialize" for event in self.store.events))
 
-    def test_terminal_duplicate_without_authoritative_evidence_is_not_recreated(self):
+    def test_historical_terminal_collision_blocks_current_successor_creation(self):
         snapshot = ParentSnapshot(affected_repositories=("api",))
         duplicate = WorkflowChild(
             "PRO-101-OLD",
@@ -4644,7 +4644,8 @@ class GenericWorkflowTests(unittest.TestCase):
 
         result = self.workflow.resume_parent("PRO-101")
 
-        self.assertEqual(result.next_action, "noop")
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
         self.assertFalse(any(event[0] == "create" for event in self.store.events))
 
     def test_api_completion_is_verified_done_then_resumes_and_dispatches_web(self):
@@ -4661,7 +4662,10 @@ class GenericWorkflowTests(unittest.TestCase):
         ]
         self.assertLess(read_positions[0], order.index("write-completion"))
         self.assertLess(order.index("write-completion"), read_positions[-1])
-        self.assertLess(read_positions[-1], order.index("done"))
+        self.assertEqual(
+            len([position for position in read_positions if position > order.index("done")]),
+            4,
+        )
         self.assertEqual(
             order[order.index("write-completion") + 1:order.index("done")].count(
                 "read-completion"
@@ -4858,6 +4862,206 @@ class GenericWorkflowTests(unittest.TestCase):
                     {tuple(child.creation_candidate_shas.items()) for child in current},
                     {tuple(snapshot.candidate_shas.items())},
                 )
+
+    def _seed_partial_gate_prefix(self):
+        snapshot = replace(
+            passing_snapshot(),
+            reviews={},
+            qa={},
+            integration_qa={},
+        )
+        self.store.add_state(
+            "PRO-101",
+            snapshot,
+            pull_requests=pull_request_targets(),
+            stage_ordinal=5,
+        )
+        self.store.partial_create_limits = [1]
+        first = self.workflow.resume_parent("PRO-101")
+        self.assertEqual(first.next_action, "uncertain")
+
+    def test_terminal_gate_prefix_converges_for_every_authoritative_result(self):
+        for result in ("pass", "fail", "blocked"):
+            with self.subTest(result=result):
+                self.setUp()
+                self._seed_partial_gate_prefix()
+                self.store.events.clear()
+
+                completed = self.workflow.record_phase_completion(
+                    completion_for("api", phase="review", result=result)
+                )
+                replay = self.workflow.resume_parent("PRO-101")
+
+                state = self.store.states["PRO-101"]
+                current = tuple(
+                    child
+                    for child in state.children
+                    if child.stage_ordinal == 6 and child.attempt == 0
+                )
+                identities = [
+                    (child.phase, child.target_key, child.suite_key)
+                    for child in current
+                ]
+                self.assertEqual(completed.completed_child_status, "done")
+                self.assertEqual(completed.next_action, "dispatch")
+                self.assertIn(replay.next_action, {"noop", "wait"})
+                self.assertEqual(len(current), 5)
+                self.assertEqual(len(set(identities)), 5)
+                self.assertEqual(identities.count(("review", "api", "")), 1)
+
+    def test_terminal_gate_prefix_survives_another_partial_retry(self):
+        self._seed_partial_gate_prefix()
+        self.store.partial_create_limits = [1]
+
+        first_retry = self.workflow.record_phase_completion(
+            completion_for("api", phase="review", result="pass")
+        )
+        second_retry = self.workflow.resume_parent("PRO-101")
+
+        current = tuple(
+            child
+            for child in self.store.states["PRO-101"].children
+            if child.stage_ordinal == 6 and child.attempt == 0
+        )
+        self.assertEqual(first_retry.next_action, "uncertain")
+        self.assertEqual(second_retry.next_action, "dispatch")
+        self.assertEqual(len(current), 5)
+        self.assertEqual(
+            len(
+                [
+                    child
+                    for child in current
+                    if child.phase == "review" and child.target_key == "api"
+                ]
+            ),
+            1,
+        )
+
+    def test_terminal_gate_prefix_requires_stable_authoritative_completion(self):
+        corruptions = ("missing", "drift", "post-parent-drift")
+        for corruption in corruptions:
+            with self.subTest(corruption=corruption):
+                self.setUp()
+                self._seed_partial_gate_prefix()
+                completion = completion_for("api", phase="review", result="pass")
+                recorded = self.workflow.record_phase_completion(completion)
+                self.assertEqual(recorded.completed_child_status, "done")
+                state = self.store.states["PRO-101"]
+                current = tuple(
+                    child
+                    for child in state.children
+                    if child.phase == "review" and child.target_key == "api"
+                )
+                self.store.states["PRO-101"] = replace(
+                    state,
+                    children=current,
+                    snapshot=replace(
+                        state.snapshot,
+                        reviews={"api": state.snapshot.reviews["api"]},
+                        qa={},
+                        integration_qa={},
+                    ),
+                )
+                if corruption == "missing":
+                    self.store.completions.pop(
+                        ("PRO-101", completion.evidence_comment_uuid)
+                    )
+                elif corruption == "drift":
+                    self.store.change_completion_after_first_read = True
+                else:
+                    self.store.completion_drift_after_parent_reread = (
+                        completion.evidence_comment_uuid
+                    )
+                self.store.events.clear()
+
+                result = self.workflow.resume_parent("PRO-101")
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+    def test_cancelled_or_blocked_gate_prefix_is_not_a_recoverable_completion(self):
+        for status in ("blocked", "cancelled"):
+            with self.subTest(status=status):
+                self.setUp()
+                self._seed_partial_gate_prefix()
+                state = self.store.states["PRO-101"]
+                child = replace(
+                    state.children[0],
+                    status=status,
+                    active=False,
+                )
+                self.store.states["PRO-101"] = replace(
+                    state,
+                    children=(child,),
+                )
+                self.store.events.clear()
+
+                result = self.workflow.resume_parent("PRO-101")
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+    def test_terminal_parallel_implementation_prefix_creates_missing_owner(self):
+        self.workflow.handle_parent_event(
+            "PRO-101",
+            affected=frozenset({"api", "web", "notifications"}),
+        )
+        self.store.partial_create_limits = [1]
+        partial = self.workflow.record_phase_completion(completion_for("api"))
+        self.assertEqual(partial.next_action, "uncertain")
+        self.store.events.clear()
+
+        completed = self.workflow.record_phase_completion(completion_for("web"))
+
+        current = tuple(
+            child
+            for child in self.store.states["PRO-101"].children
+            if child.stage_ordinal == 2 and child.attempt == 0
+        )
+        self.assertEqual(completed.completed_child_status, "done")
+        self.assertEqual(completed.next_action, "dispatch")
+        self.assertEqual(
+            [(child.target_key, child.phase) for child in current],
+            [("web", "implementation"), ("notifications", "implementation")],
+        )
+
+    def test_historical_successor_collision_blocks_without_suppressing_current_plan(self):
+        snapshot = replace(
+            passing_snapshot(),
+            reviews={},
+            qa={},
+            integration_qa={},
+        )
+        historical = WorkflowChild(
+            "PRO-101-HISTORICAL-API-REVIEW",
+            "api",
+            "api",
+            "",
+            "review",
+            4,
+            0,
+            "done",
+            "stage:" + "f" * 64,
+            False,
+            creation_candidate_shas=snapshot.candidate_shas,
+        )
+        self.store.add_state(
+            "PRO-101",
+            snapshot,
+            children=(historical,),
+            pull_requests=pull_request_targets(),
+            stage_ordinal=5,
+            hydrate_current_gate_passes=False,
+        )
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
 
     def test_gate_successor_recreates_each_missing_identity_only(self):
         expected = (
