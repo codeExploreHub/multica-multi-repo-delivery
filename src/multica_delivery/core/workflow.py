@@ -2494,6 +2494,62 @@ class GenericWorkflow:
                 return True, problem
         return True, None
 
+    def _terminal_repair_wave_authority_problem(
+        self,
+        state: WorkflowState,
+    ) -> WorkflowResult | None:
+        """Require a stable authoritative whole-wave barrier before fresh Gates."""
+
+        if state.metadata is None:
+            return self._zero_mutation_block(
+                state,
+                "terminal Repair Stage authority is unavailable",
+            )
+        current = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == state.metadata.stage_ordinal
+            and child.attempt == state.metadata.repair_round
+        )
+        repositories = tuple(child.repository_key for child in current)
+        if (
+            not current
+            or any(
+                child.phase != "repair"
+                or child.status != "done"
+                or child.active
+                or child.phase_result != "pass"
+                for child in current
+            )
+            or len(repositories) != len(set(repositories))
+        ):
+            return self._zero_mutation_block(
+                state,
+                "terminal Repair Stage membership is incomplete or conflicting",
+            )
+        observed = self._authoritative_repair_wave_completion_actions(
+            state,
+            current[0],
+        )
+        if observed is None or set(observed) != set(repositories):
+            return self._zero_mutation_block(
+                state,
+                "terminal Repair Stage completion authority is incomplete or conflicting",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        refreshed = self._authoritative_repair_wave_completion_actions(
+            state,
+            current[0],
+        )
+        if refreshed != observed:
+            return self._zero_mutation_block(
+                state,
+                "terminal Repair Stage completion authority changed after parent fan-in",
+            )
+        return self._parent_fan_in_still_current(state)
+
     def _parent_decision(self, state: WorkflowState) -> ParentDecision:
         snapshot = state.snapshot
         automatic_limit = self.manifest.policy.max_repair_attempts
@@ -4197,6 +4253,12 @@ class GenericWorkflow:
         if decision.kind is DecisionKind.DISPATCH:
             if state.snapshot.stalled:
                 return self._result(state, "wait", "stalled work is reserved for bounded recovery")
+            if decision.dispatch_kind is DispatchKind.GATES and repair_stage:
+                repair_authority_problem = (
+                    self._terminal_repair_wave_authority_problem(state)
+                )
+                if repair_authority_problem is not None:
+                    return repair_authority_problem
             return self._dispatch(state, decision)
         if decision.kind is DecisionKind.REPAIR:
             return self._dispatch(state, decision, repair=True)
