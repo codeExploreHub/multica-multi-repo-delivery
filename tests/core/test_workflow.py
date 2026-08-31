@@ -2660,6 +2660,92 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         self.store.read_counts["PRO-200"] = 0
         return children, actions
 
+    def append_foreign_repair_attempt(
+        self,
+        children: dict[str, WorkflowChild],
+        *,
+        wrong_attempt: int,
+    ) -> None:
+        state = self.store.states["PRO-200"]
+        original = children["api"]
+        foreign_uuid = evidence_uuid(
+            f"foreign-repair-attempt-{original.attempt}-{wrong_attempt}"
+        )
+        authorization_uuid = (
+            evidence_uuid(f"foreign-repair-auth-{wrong_attempt}")
+            if wrong_attempt == 3
+            else ""
+        )
+        foreign = replace(
+            original,
+            identifier=f"{original.identifier}-ATTEMPT-{wrong_attempt}",
+            attempt=wrong_attempt,
+            evidence_comment_uuid=foreign_uuid,
+            evidence_comment_url=f"https://example.test/evidence/{foreign_uuid}",
+            authorizing_comment_uuid=authorization_uuid,
+        )
+        self.store.states["PRO-200"] = replace(
+            state,
+            children=(*state.children, foreign),
+        )
+
+    def test_initial_fresh_gate_rejects_foreign_repair_attempts_in_same_stage(self):
+        for repair_round in (1, 2, 3):
+            for wrong_attempt in tuple(
+                attempt for attempt in range(4) if attempt != repair_round
+            ):
+                with self.subTest(
+                    repair_round=repair_round,
+                    wrong_attempt=wrong_attempt,
+                ):
+                    self.setUp()
+                    children, _ = self.seed_terminal_repair_wave(
+                        repair_round=repair_round
+                    )
+                    self.github.heads["api"] = self.store.states[
+                        "PRO-200"
+                    ].snapshot.candidate_shas["api"]
+                    self.append_foreign_repair_attempt(
+                        children,
+                        wrong_attempt=wrong_attempt,
+                    )
+                    self.store.events.clear()
+
+                    result = self.workflow.resume_parent("PRO-200")
+
+                    self.assertEqual(result.next_action, "block", result.reason)
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(event[0] == "create" for event in self.store.events)
+                    )
+
+    def test_partial_fresh_gate_rejects_foreign_predecessor_attempts(self):
+        for repair_round in (1, 2, 3):
+            for wrong_attempt in tuple(
+                attempt for attempt in range(4) if attempt != repair_round
+            ):
+                with self.subTest(
+                    repair_round=repair_round,
+                    wrong_attempt=wrong_attempt,
+                ):
+                    self.setUp()
+                    children, _ = self.seed_partial_fresh_gate_after_repair(
+                        repair_round=repair_round
+                    )
+                    self.append_foreign_repair_attempt(
+                        children,
+                        wrong_attempt=wrong_attempt,
+                    )
+                    self.store.events.clear()
+
+                    result = self.workflow.resume_parent("PRO-200")
+
+                    self.assertEqual(result.next_action, "block", result.reason)
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(event[0] == "create" for event in self.store.events)
+                    )
+
     def test_partial_fresh_gate_rechecks_terminal_repair_wave_every_retry(self):
         corruptions = (
             "missing completion",

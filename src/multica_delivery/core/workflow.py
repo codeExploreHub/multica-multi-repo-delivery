@@ -2522,11 +2522,11 @@ class GenericWorkflow:
             child
             for child in state.children
             if child.stage_ordinal == repair_stage
-            and child.attempt == repair_attempt
         )
         repositories = tuple(child.repository_key for child in current)
         if (
             not current
+            or {child.attempt for child in current} != {repair_attempt}
             or any(
                 child.phase != "repair"
                 or child.status != "done"
@@ -3847,11 +3847,14 @@ class GenericWorkflow:
                 child
                 for child in state.children
                 if child.stage_ordinal == metadata.stage_ordinal - 1
-                and child.attempt == metadata.repair_round
             )
             predecessor_phases = {child.phase for child in predecessor}
             if "repair" in predecessor_phases:
-                if predecessor_phases != {"repair"}:
+                if (
+                    {child.attempt for child in predecessor}
+                    != {metadata.repair_round}
+                    or predecessor_phases != {"repair"}
+                ):
                     return self._zero_mutation_block(
                         state,
                         "Gate successor has a mixed predecessor Stage",
