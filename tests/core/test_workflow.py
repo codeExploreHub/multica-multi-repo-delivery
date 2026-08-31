@@ -1260,6 +1260,7 @@ class FakeGitHub:
         self.fail_merged_reread_on: str | None = None
         self.fail_merged_rereads_remaining: dict[str, int] = {}
         self.read_failures_remaining: dict[str, int] = {}
+        self.change_head_after_read: dict[str, str] = {}
         self.malformed_read_on: str | None = None
         self.missing_merge_sha_on: str | None = None
         self.committed: set[str] = set()
@@ -1284,7 +1285,7 @@ class FakeGitHub:
         if key in self.committed and self.fail_merged_rereads_remaining.get(key, 0):
             self.fail_merged_rereads_remaining[key] -= 1
             raise GitHubBoundaryError("authoritative merged reread temporarily unavailable")
-        return PullRequestInfo(
+        result = PullRequestInfo(
             repository,
             number,
             "merged" if key in self.committed else "open",
@@ -1300,6 +1301,10 @@ class FakeGitHub:
             if key in self.committed
             else None,
         )
+        replacement = self.change_head_after_read.pop(key, None)
+        if replacement is not None:
+            self.heads[key] = replacement
+        return result
 
     def required_status_checks(
         self,
@@ -4861,6 +4866,89 @@ class GenericWorkflowTests(unittest.TestCase):
                 self.assertEqual(
                     {tuple(child.creation_candidate_shas.items()) for child in current},
                     {tuple(snapshot.candidate_shas.items())},
+                )
+
+    def test_nonrepair_gate_reservation_blocks_every_managed_head_drift(self):
+        for shape in ("active partial", "terminal partial", "complete"):
+            for repository in ("api", "web"):
+                with self.subTest(shape=shape, repository=repository):
+                    self.setUp()
+                    if shape == "complete":
+                        store, workflow = self._new_active_gate_stage()
+                        github = workflow.github
+                    else:
+                        self._seed_partial_gate_prefix()
+                        store = self.store
+                        workflow = self.workflow
+                        github = self.github
+                        if shape == "terminal partial":
+                            store.partial_create_limits = [0]
+                            completed = workflow.record_phase_completion(
+                                completion_for(
+                                    "api",
+                                    phase="review",
+                                    result="pass",
+                                )
+                            )
+                            self.assertEqual(completed.next_action, "uncertain")
+                    assert isinstance(github, FakeGitHub)
+                    github.heads[repository] = OTHER_SHA
+                    store.events.clear()
+
+                    result = workflow.resume_parent("PRO-101")
+
+                    self.assertEqual(result.next_action, "block")
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(event[0] == "create" for event in store.events)
+                    )
+
+    def test_partial_implementation_reservation_blocks_dependency_head_drift(self):
+        self.workflow.handle_parent_event(
+            "PRO-101",
+            affected=frozenset({"api", "web", "notifications"}),
+        )
+        self.store.partial_create_limits = [1]
+        partial = self.workflow.record_phase_completion(completion_for("api"))
+        self.assertEqual(partial.next_action, "uncertain", partial.reason)
+        self.github.heads["api"] = OTHER_SHA
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+    def test_nonrepair_head_guard_blocks_read_and_cross_read_drift(self):
+        cases = ("read error", "head drift", "parent drift")
+        for case in cases:
+            with self.subTest(case=case):
+                self.setUp()
+                self._seed_partial_gate_prefix()
+                if case == "read error":
+                    self.github.read_failures_remaining["api"] = 1
+                elif case == "head drift":
+                    self.github.change_head_after_read["api"] = OTHER_SHA
+                else:
+                    state = self.store.states["PRO-101"]
+                    assert isinstance(state.metadata, ParentMetadata)
+                    next_read = self.store.read_counts.get("PRO-101", 0) + 1
+                    self.store.read_state_override_by_count[next_read] = replace(
+                        state,
+                        metadata=replace(
+                            state.metadata,
+                            stage_ordinal=state.metadata.stage_ordinal + 1,
+                        ),
+                    )
+                self.store.events.clear()
+
+                result = self.workflow.resume_parent("PRO-101")
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(
+                    any(event[0] == "create" for event in self.store.events)
                 )
 
     def _seed_partial_gate_prefix(self):

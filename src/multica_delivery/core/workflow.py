@@ -3519,6 +3519,78 @@ class GenericWorkflow:
             actions.add(completion_action)
         return frozenset(actions)
 
+    def _nonrepair_successor_heads_still_current(
+        self,
+        state: WorkflowState,
+        source_candidates: Mapping[str, str],
+    ) -> WorkflowResult | None:
+        """Recheck every immutable non-Repair reservation head around the parent."""
+
+        repositories = set(source_candidates)
+        if (
+            not repositories <= set(state.snapshot.pull_requests)
+            or not repositories <= set(state.pull_requests)
+            or not repositories <= set(state.snapshot.affected_repositories)
+            or any(
+                state.snapshot.pull_requests[repository].head_sha
+                != source_candidates[repository]
+                or state.snapshot.pull_requests[repository].state != "open"
+                for repository in repositories
+            )
+        ):
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor pull-request evidence conflicts with its reservation",
+            )
+
+        def read_heads() -> tuple[PullRequestInfo, ...] | None:
+            observed: list[PullRequestInfo] = []
+            try:
+                for repository in sorted(repositories):
+                    target = state.pull_requests[repository]
+                    specification = self.manifest.repositories[repository]
+                    expected_url = (
+                        f"https://github.com/{specification.github}/pull/{target.number}"
+                    )
+                    pull_request = self.github.get_pull_request(
+                        specification.github,
+                        target.number,
+                    )
+                    if (
+                        type(pull_request) is not PullRequestInfo
+                        or target.repository_key != repository
+                        or target.url != expected_url
+                        or pull_request.repository != specification.github
+                        or pull_request.number != target.number
+                        or pull_request.state != "open"
+                        or pull_request.head_sha != source_candidates[repository]
+                        or pull_request.base_ref != specification.default_branch
+                        or pull_request.merged_at is not None
+                        or pull_request.merge_commit_sha is not None
+                    ):
+                        return None
+                    observed.append(pull_request)
+            except Exception:
+                return None
+            return tuple(observed)
+
+        first = read_heads()
+        if first is None:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor pull-request head authority is unavailable",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        second = read_heads()
+        if second is None or second != first:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor pull-request heads changed during fan-in",
+            )
+        return self._parent_fan_in_still_current(state)
+
     def _reconcile_nonrepair_successor(
         self,
         state: WorkflowState,
@@ -3677,14 +3749,26 @@ class GenericWorkflow:
                 "non-repair successor reservation conflicts with its exact intended membership",
             )
         if observed == wanted and action_key in state.applied_action_keys:
-            if not terminal_actions:
-                return self._result(
-                    state,
-                    "noop",
-                    "complete non-repair successor reservation is already active",
-                    action_key=action_key,
-                )
-            return None
+            if terminal_actions:
+                return None
+            head_problem = self._nonrepair_successor_heads_still_current(
+                state,
+                source_candidates,
+            )
+            if head_problem is not None:
+                return head_problem
+            return self._result(
+                state,
+                "noop",
+                "complete non-repair successor reservation is already active",
+                action_key=action_key,
+            )
+        head_problem = self._nonrepair_successor_heads_still_current(
+            state,
+            source_candidates,
+        )
+        if head_problem is not None:
+            return head_problem
         missing = wanted - observed
         missing_counts = Counter(missing)
         missing_requests: list[ChildRequest] = []
