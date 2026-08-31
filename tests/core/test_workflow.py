@@ -1261,6 +1261,7 @@ class FakeGitHub:
         self.fail_merged_rereads_remaining: dict[str, int] = {}
         self.read_failures_remaining: dict[str, int] = {}
         self.change_head_after_read: dict[str, str] = {}
+        self.change_mergeable_after_read: dict[str, bool] = {}
         self.malformed_read_on: str | None = None
         self.missing_merge_sha_on: str | None = None
         self.committed: set[str] = set()
@@ -1304,6 +1305,9 @@ class FakeGitHub:
         replacement = self.change_head_after_read.pop(key, None)
         if replacement is not None:
             self.heads[key] = replacement
+        mergeable_replacement = self.change_mergeable_after_read.pop(key, None)
+        if mergeable_replacement is not None:
+            self.mergeable[key] = mergeable_replacement
         return result
 
     def required_status_checks(
@@ -5197,6 +5201,101 @@ class GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(result.next_action, "block")
         self.assertEqual(result.mutation_count, 0)
         self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+    def _seed_terminal_partial_implementation_wave(self):
+        self.workflow.handle_parent_event(
+            "PRO-101",
+            affected=frozenset({"api", "web", "notifications"}),
+        )
+        self.store.partial_create_limits = [1]
+        partial = self.workflow.record_phase_completion(completion_for("api"))
+        self.assertEqual(partial.next_action, "uncertain", partial.reason)
+        self.store.partial_create_limits = [0]
+        terminal = self.workflow.record_phase_completion(completion_for("web"))
+        self.assertEqual(terminal.next_action, "uncertain", terminal.reason)
+        current = tuple(
+            child
+            for child in self.store.states["PRO-101"].children
+            if child.stage_ordinal == 2 and child.attempt == 0
+        )
+        self.assertEqual(
+            [(child.repository_key, child.status, child.active) for child in current],
+            [("web", "done", False)],
+        )
+        self.store.events.clear()
+
+    def test_terminal_partial_implementation_requires_its_output_head(self):
+        for case in ("mismatch", "cross-read drift"):
+            with self.subTest(case=case):
+                self.setUp()
+                self._seed_terminal_partial_implementation_wave()
+                if case == "mismatch":
+                    self.github.heads["web"] = OTHER_SHA
+                else:
+                    self.github.change_head_after_read["web"] = OTHER_SHA
+
+                result = self.workflow.resume_parent("PRO-101")
+
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(
+                    any(event[0] == "create" for event in self.store.events)
+                )
+
+    def test_terminal_partial_implementation_stable_output_converges(self):
+        self._seed_terminal_partial_implementation_wave()
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "dispatch", result.reason)
+        creates = [event for event in self.store.events if event[0] == "create"]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(
+            tuple(request.repository_key for request in creates[0][2]),
+            ("notifications",),
+        )
+
+    def test_complete_implementation_reservation_rechecks_terminal_output_head(self):
+        self._seed_terminal_partial_implementation_wave()
+        converged = self.workflow.resume_parent("PRO-101")
+        self.assertEqual(converged.next_action, "dispatch", converged.reason)
+        self.github.heads["web"] = OTHER_SHA
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+    def test_active_partial_implementation_does_not_adopt_its_moving_head(self):
+        self.workflow.handle_parent_event(
+            "PRO-101",
+            affected=frozenset({"api", "web", "notifications"}),
+        )
+        self.store.partial_create_limits = [1]
+        partial = self.workflow.record_phase_completion(completion_for("api"))
+        self.assertEqual(partial.next_action, "uncertain", partial.reason)
+        self.github.heads["web"] = OTHER_SHA
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "dispatch", result.reason)
+        creates = [event for event in self.store.events if event[0] == "create"]
+        self.assertEqual(
+            tuple(request.repository_key for request in creates[0][2]),
+            ("notifications",),
+        )
+
+    def test_nonrepair_head_stability_ignores_mergeable_only_change(self):
+        self._seed_terminal_partial_implementation_wave()
+        self.github.change_mergeable_after_read["api"] = False
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "dispatch", result.reason)
+        self.assertTrue(any(event[0] == "create" for event in self.store.events))
 
     def test_nonrepair_head_guard_blocks_read_and_cross_read_drift(self):
         cases = ("read error", "head drift", "parent drift")

@@ -3578,18 +3578,18 @@ class GenericWorkflow:
     def _nonrepair_successor_heads_still_current(
         self,
         state: WorkflowState,
-        source_candidates: Mapping[str, str],
+        expected_candidates: Mapping[str, str],
     ) -> WorkflowResult | None:
         """Recheck every immutable non-Repair reservation head around the parent."""
 
-        repositories = set(source_candidates)
+        repositories = set(expected_candidates)
         if (
             not repositories <= set(state.snapshot.pull_requests)
             or not repositories <= set(state.pull_requests)
             or not repositories <= set(state.snapshot.affected_repositories)
             or any(
                 state.snapshot.pull_requests[repository].head_sha
-                != source_candidates[repository]
+                != expected_candidates[repository]
                 or state.snapshot.pull_requests[repository].state != "open"
                 for repository in repositories
             )
@@ -3599,8 +3599,8 @@ class GenericWorkflow:
                 "non-repair successor pull-request evidence conflicts with its reservation",
             )
 
-        def read_heads() -> tuple[PullRequestInfo, ...] | None:
-            observed: list[PullRequestInfo] = []
+        def read_heads() -> tuple[tuple[object, ...], ...] | None:
+            observed: list[tuple[object, ...]] = []
             try:
                 for repository in sorted(repositories):
                     target = state.pull_requests[repository]
@@ -3619,13 +3619,23 @@ class GenericWorkflow:
                         or pull_request.repository != specification.github
                         or pull_request.number != target.number
                         or pull_request.state != "open"
-                        or pull_request.head_sha != source_candidates[repository]
+                        or pull_request.head_sha != expected_candidates[repository]
                         or pull_request.base_ref != specification.default_branch
                         or pull_request.merged_at is not None
                         or pull_request.merge_commit_sha is not None
                     ):
                         return None
-                    observed.append(pull_request)
+                    observed.append(
+                        (
+                            pull_request.repository,
+                            pull_request.number,
+                            pull_request.state,
+                            pull_request.head_sha,
+                            pull_request.base_ref,
+                            pull_request.merged_at,
+                            pull_request.merge_commit_sha,
+                        )
+                    )
             except Exception:
                 return None
             return tuple(observed)
@@ -3791,6 +3801,21 @@ class GenericWorkflow:
                 state,
                 "non-repair successor reservation has the wrong creation action",
             )
+        expected_head_candidates = dict(source_candidates)
+        if phases == {"implementation"}:
+            for child in current:
+                if child.status == "done" and not child.active:
+                    aggregate = state.snapshot.children.get(
+                        child.repository_key
+                    )
+                    if aggregate is None:
+                        return self._zero_mutation_block(
+                            state,
+                            "terminal implementation output is not authoritative",
+                        )
+                    expected_head_candidates[child.repository_key] = (
+                        aggregate.candidate_sha
+                    )
         wanted = Counter(
             self._successor_request_identity(request, action_key)
             for request in requests
@@ -3806,6 +3831,12 @@ class GenericWorkflow:
             )
         if observed == wanted and action_key in state.applied_action_keys:
             if terminal_actions:
+                head_problem = self._nonrepair_successor_heads_still_current(
+                    state,
+                    expected_head_candidates,
+                )
+                if head_problem is not None:
+                    return head_problem
                 return None
             head_problem = self._nonrepair_successor_heads_still_current(
                 state,
@@ -3821,7 +3852,7 @@ class GenericWorkflow:
             )
         head_problem = self._nonrepair_successor_heads_still_current(
             state,
-            source_candidates,
+            expected_head_candidates,
         )
         if head_problem is not None:
             return head_problem
