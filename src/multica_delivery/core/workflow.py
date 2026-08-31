@@ -3714,6 +3714,60 @@ class GenericWorkflow:
             )
         return self._result(observed, "complete", decision.reason, action_key=key, mutation_count=1)
 
+    def _completed_candidate_action_chain(
+        self,
+        state: WorkflowState,
+        source_candidates: Mapping[str, str],
+        completed: Mapping[str, tuple[WorkflowChild, str]],
+    ) -> Mapping[str, str] | None:
+        """Find an applied incremental completion chain independent of child order."""
+
+        def visit(
+            candidates: dict[str, str],
+            remaining: frozenset[str],
+        ) -> dict[str, str] | None:
+            if not remaining:
+                return (
+                    {}
+                    if candidates == dict(state.snapshot.candidate_shas)
+                    else None
+                )
+            for repository in sorted(remaining):
+                child, candidate = completed[repository]
+                action_candidates = {**candidates, repository: candidate}
+                completion_action = self._action_key(
+                    state,
+                    f"{child.phase}:{child.target_key}",
+                    child.stage_ordinal,
+                    attempt=child.attempt,
+                    candidate_shas=action_candidates,
+                    failure_bundle_digest=(
+                        child.failure_bundle_digest
+                        if child.phase == "repair"
+                        else ""
+                    ),
+                    authorizing_comment_uuid=(
+                        child.authorizing_comment_uuid
+                        if child.phase == "repair"
+                        else ""
+                    ),
+                )
+                if (
+                    completion_action == child.action_key
+                    or completion_action not in state.applied_action_keys
+                ):
+                    continue
+                tail = visit(
+                    action_candidates,
+                    remaining - {repository},
+                )
+                if tail is not None:
+                    return {repository: completion_action, **tail}
+            return None
+
+        chain = visit(dict(source_candidates), frozenset(completed))
+        return None if chain is None else MappingProxyType(chain)
+
     def _completed_sibling_candidate_changes(
         self,
         state: WorkflowState,
@@ -3757,57 +3811,19 @@ class GenericWorkflow:
             if child.creation_candidate_shas.get(repository) != candidate:
                 eligible[repository] = (sibling, candidate)
 
-        target = dict(child.creation_candidate_shas)
-        target.update(
-            {repository: candidate for repository, (_, candidate) in eligible.items()}
+        actions = self._completed_candidate_action_chain(
+            state,
+            child.creation_candidate_shas,
+            eligible,
         )
-        if target != dict(state.snapshot.candidate_shas):
+        if actions is None:
             return MappingProxyType({})
-
-        def completion_chain(
-            candidates: dict[str, str],
-            remaining: frozenset[str],
-        ) -> dict[str, str] | None:
-            if not remaining:
-                return {}
-            for repository in sorted(remaining):
-                sibling, candidate = eligible[repository]
-                action_candidates = {**candidates, repository: candidate}
-                completion_action = self._action_key(
-                    state,
-                    f"{sibling.phase}:{sibling.target_key}",
-                    sibling.stage_ordinal,
-                    attempt=sibling.attempt,
-                    candidate_shas=action_candidates,
-                    failure_bundle_digest=(
-                        sibling.failure_bundle_digest
-                        if sibling.phase == "repair"
-                        else ""
-                    ),
-                    authorizing_comment_uuid=(
-                        sibling.authorizing_comment_uuid
-                        if sibling.phase == "repair"
-                        else ""
-                    ),
-                )
-                if (
-                    completion_action == sibling.action_key
-                    or completion_action not in state.applied_action_keys
-                ):
-                    continue
-                tail = completion_chain(
-                    action_candidates,
-                    remaining - {repository},
-                )
-                if tail is not None:
-                    return {repository: candidate, **tail}
-            return None
-
-        changes = completion_chain(
-            dict(child.creation_candidate_shas),
-            frozenset(eligible),
+        return MappingProxyType(
+            {
+                repository: eligible[repository][1]
+                for repository in actions
+            }
         )
-        return MappingProxyType(changes or {})
 
     def _creation_candidates_match(
         self,
@@ -4109,24 +4125,28 @@ class GenericWorkflow:
                 else ""
             ),
         )
+        repair_completion_actions = (
+            self._authoritative_repair_wave_completion_actions(
+                state,
+                completed[0],
+            )
+            if completion.phase == "repair"
+            else None
+        )
         unchanged_creation_candidates = all(
             repository == completion.repository_key
             or state.snapshot.candidate_shas.get(repository) == candidate_sha
-            or (
-                completion.phase == "repair"
-                and self._repair_sibling_replacement_is_authoritative(
-                    state,
-                    completed[0],
-                    repository,
-                )
-            )
             for repository, candidate_sha in completed[0].creation_candidate_shas.items()
         )
         gate_creation_candidates = (
             dict(completed[0].creation_candidate_shas)
             == dict(state.snapshot.candidate_shas)
             if completion.phase in {"review", "qa", "integration_qa"}
-            else unchanged_creation_candidates
+            else (
+                repair_completion_actions is not None
+                if completion.phase == "repair"
+                else unchanged_creation_candidates
+            )
         )
         if (
             completed[0].action_key != expected_creation_key
@@ -4137,37 +4157,31 @@ class GenericWorkflow:
                 state,
                 "persisted phase evidence lacks exact child creation provenance",
             )
-        action_candidates = (
-            completion.candidate_shas
-            if completion.phase == "integration_qa"
-            else {
-                **(
-                    completed[0].creation_candidate_shas
-                    if completion.phase == "repair"
-                    else state.snapshot.candidate_shas
-                ),
-                completion.repository_key: completion.candidate_sha,
-            }
-        )
-        expected_completion_key = self._action_key(
-            state,
-            f"{completion.phase}:{completed[0].target_key}",
-            completed[0].stage_ordinal,
-            attempt=completion.attempt,
-            candidate_shas=action_candidates,
-            failure_bundle_digest=(
-                completion.failure_bundle_digest
-                if completion.phase == "repair"
-                else ""
-            ),
-            authorizing_comment_uuid=(
-                completed[0].authorizing_comment_uuid
-                if completion.phase == "repair"
-                else ""
-            ),
-        )
+        if completion.phase == "repair":
+            expected_completion_key = (
+                None
+                if repair_completion_actions is None
+                else repair_completion_actions.get(completion.repository_key)
+            )
+        else:
+            action_candidates = (
+                completion.candidate_shas
+                if completion.phase == "integration_qa"
+                else {
+                    **state.snapshot.candidate_shas,
+                    completion.repository_key: completion.candidate_sha,
+                }
+            )
+            expected_completion_key = self._action_key(
+                state,
+                f"{completion.phase}:{completed[0].target_key}",
+                completed[0].stage_ordinal,
+                attempt=completion.attempt,
+                candidate_shas=action_candidates,
+            )
         if (
-            expected_completion_key == completed[0].action_key
+            expected_completion_key is None
+            or expected_completion_key == completed[0].action_key
             or expected_completion_key not in state.applied_action_keys
         ):
             return self._zero_mutation_block(
@@ -4185,77 +4199,109 @@ class GenericWorkflow:
             action_key=expected_completion_key,
         )
 
-    def _repair_sibling_replacement_is_authoritative(
+    def _authoritative_repair_wave_completion_actions(
         self,
         state: WorkflowState,
         replayed: WorkflowChild,
-        repository: str,
-    ) -> bool:
-        """Explain one same-wave sibling replacement during exact replay."""
+    ) -> Mapping[str, str] | None:
+        """Prove one Repair wave's incremental completion-action chain."""
 
-        siblings = tuple(
+        wave = tuple(
             child
             for child in state.children
-            if child.repository_key == repository
-            and child.phase == "repair"
+            if child.phase == "repair"
             and child.stage_ordinal == replayed.stage_ordinal
             and child.attempt == replayed.attempt
-            and child.action_key == replayed.action_key
-            and child.failure_bundle_digest == replayed.failure_bundle_digest
-            and child.authorizing_comment_uuid == replayed.authorizing_comment_uuid
-            and child.status == "done"
-            and not child.active
-            and child.phase_result == "pass"
-            and _canonical_uuid(child.evidence_comment_uuid)
         )
-        if len(siblings) != 1:
-            return False
-        sibling = siblings[0]
-        candidate = state.snapshot.candidate_shas.get(repository)
-        pull_request = state.snapshot.pull_requests.get(repository)
+        repositories = tuple(child.repository_key for child in wave)
         if (
-            candidate is None
-            or candidate == replayed.creation_candidate_shas.get(repository)
-            or pull_request is None
-            or pull_request.head_sha != candidate
-        ):
-            return False
-        try:
-            observations = tuple(
-                self.snapshot_reader.read_phase_completion(
-                    state.parent_identifier,
-                    sibling.evidence_comment_uuid,
-                )
-                for _ in range(2)
+            not wave
+            or len(repositories) != len(set(repositories))
+            or any(
+                child.action_key != replayed.action_key
+                or child.creation_candidate_shas
+                != replayed.creation_candidate_shas
+                or child.failure_bundle_digest
+                != replayed.failure_bundle_digest
+                or child.authorizing_comment_uuid
+                != replayed.authorizing_comment_uuid
+                or child.target_key != child.repository_key
+                or child.suite_key
+                for child in wave
             )
-        except Exception:
-            return False
-        if (
-            observations[0] != observations[1]
-            or type(observations[0]) is not PhaseCompletion
         ):
-            return False
-        observed = observations[0]
-        expected_action = self._action_key(
+            return None
+
+        completed: dict[str, tuple[WorkflowChild, str]] = {}
+        for child in wave:
+            if child.active or child.status in _ACTIVE_CHILD_STATUSES:
+                if not child.active or child.status not in _ACTIVE_CHILD_STATUSES:
+                    return None
+                continue
+            if (
+                child.status != "done"
+                or child.phase_result != "pass"
+                or not _canonical_uuid(child.evidence_comment_uuid)
+                or not _https_evidence_url(child.evidence_comment_url)
+            ):
+                return None
+            repository = child.repository_key
+            candidate = state.snapshot.candidate_shas.get(repository)
+            aggregate = state.snapshot.children.get(repository)
+            pull_request = state.snapshot.pull_requests.get(repository)
+            target = state.pull_requests.get(repository)
+            if (
+                candidate is None
+                or aggregate is None
+                or aggregate.result != "pass"
+                or aggregate.candidate_sha != candidate
+                or pull_request is None
+                or pull_request.head_sha != candidate
+                or target is None
+            ):
+                return None
+            try:
+                observations = tuple(
+                    self.snapshot_reader.read_phase_completion(
+                        state.parent_identifier,
+                        child.evidence_comment_uuid,
+                    )
+                    for _ in range(2)
+                )
+            except Exception:
+                return None
+            if (
+                observations[0] != observations[1]
+                or type(observations[0]) is not PhaseCompletion
+            ):
+                return None
+            observed = observations[0]
+            if (
+                observed.parent_identifier != state.parent_identifier
+                or observed.repository_key != repository
+                or observed.phase != "repair"
+                or observed.result != "pass"
+                or observed.attempt != child.attempt
+                or observed.candidate_sha != candidate
+                or observed.pull_request_url not in {"", target.url}
+                or observed.evidence_comment_uuid
+                != child.evidence_comment_uuid
+                or observed.evidence_comment_url
+                != child.evidence_comment_url
+                or observed.suite_key
+                or observed.candidate_shas
+                or observed.responsible_repositories
+                != child.responsible_repositories
+                or observed.failure_bundle_digest
+                != child.failure_bundle_digest
+            ):
+                return None
+            completed[repository] = (child, candidate)
+
+        return self._completed_candidate_action_chain(
             state,
-            f"repair:{sibling.target_key}",
-            sibling.stage_ordinal,
-            attempt=sibling.attempt,
-            candidate_shas=state.snapshot.candidate_shas,
-            failure_bundle_digest=sibling.failure_bundle_digest,
-            authorizing_comment_uuid=sibling.authorizing_comment_uuid,
-        )
-        return (
-            observed.repository_key == repository
-            and observed.phase == "repair"
-            and observed.result == "pass"
-            and observed.attempt == sibling.attempt
-            and observed.candidate_sha == candidate
-            and observed.failure_bundle_digest == sibling.failure_bundle_digest
-            and sibling.evidence_comment_url == observed.evidence_comment_url
-            and sibling.responsible_repositories
-            == observed.responsible_repositories
-            and expected_action in state.applied_action_keys
+            replayed.creation_candidate_shas,
+            completed,
         )
 
     def record_phase_completion(self, completion: PhaseCompletion) -> WorkflowResult:
