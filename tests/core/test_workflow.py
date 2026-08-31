@@ -276,6 +276,7 @@ class FakeWorkflowStore:
         self.events: list[tuple[object, ...]] = []
         self.rollback_calls: list[object] = []
         self.corrupt_completion_read = False
+        self.change_completion_after_first_read = False
         self.change_after_completion_read = False
         self.completion_read_failures_remaining = 0
         self.retain_gates_on_replacement = False
@@ -816,6 +817,13 @@ class FakeWorkflowStore:
         value = self.completions.get((parent_identifier, evidence_comment_uuid))
         if value is not None and self.corrupt_completion_read:
             return replace(value, result="blocked" if value.result != "blocked" else "fail")
+        if value is not None and self.change_completion_after_first_read:
+            self.change_completion_after_first_read = False
+            self.completions[(parent_identifier, evidence_comment_uuid)] = replace(
+                value,
+                result="blocked" if value.result != "blocked" else "fail",
+            )
+            return value
         if value is not None and self.change_after_completion_read:
             state = self.states[parent_identifier]
             assert state.metadata is not None
@@ -2459,6 +2467,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                     "result",
                     "output",
                     "responsibility",
+                    "read-drift",
                 ):
                     with self.subTest(
                         repair_round=repair_round,
@@ -2579,6 +2588,8 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                                 self.store.completions[key],
                                 candidate_sha=OTHER_SHA,
                             )
+                        elif corruption == "read-drift":
+                            self.store.change_completion_after_first_read = True
                         else:
                             forged_gates = tuple(
                                 replace(child, responsible_repositories=("web",))
