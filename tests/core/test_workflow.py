@@ -507,6 +507,8 @@ class FakeWorkflowStore:
                     )
                 )
             children = children + tuple(additions)
+        hydrated_current_implementation = False
+        hydrated_implementation_identifiers: set[str] = set()
         if workflow_version != metadata.workflow_version:
             if workflow_version != 1:
                 raise ValueError("test store only models workflow versions one and two")
@@ -549,15 +551,125 @@ class FakeWorkflowStore:
                 else child
                 for child in children
             )
+            current_gate = any(
+                child.stage_ordinal == metadata.stage_ordinal
+                and child.attempt == snapshot.attempt
+                and child.phase in {"review", "qa", "integration_qa"}
+                for child in children
+            )
+            gate_dispatch = decide_parent_action(
+                self.manifest,
+                snapshot,
+            )
+            predecessor_stage = (
+                metadata.stage_ordinal - 1
+                if current_gate
+                else metadata.stage_ordinal
+            )
+            predecessor = tuple(
+                child
+                for child in children
+                if child.stage_ordinal == predecessor_stage
+            )
+            if (
+                hydrate_current_gate_passes
+                and (
+                    current_gate
+                    or (
+                        gate_dispatch.kind is DecisionKind.DISPATCH
+                        and gate_dispatch.dispatch_kind is DispatchKind.GATES
+                    )
+                )
+                and snapshot.attempt == 0
+                and not predecessor
+            ):
+                dependencies = {
+                    dependency
+                    for repository in metadata.affected_repositories
+                    for dependency in metadata.repository_dag[repository]
+                }
+                implementation_repositories = tuple(
+                    repository
+                    for repository in metadata.affected_repositories
+                    if repository not in dependencies
+                )
+                implementation_candidates = {
+                    repository: candidate
+                    for repository, candidate in snapshot.candidate_shas.items()
+                    if repository not in implementation_repositories
+                }
+                implementation_action = coordinator_action_key(
+                    workflow_version=metadata.workflow_version,
+                    instance_key=metadata.instance_key,
+                    parent_identifier=identifier,
+                    stage_kind="implementation",
+                    stage_ordinal=predecessor_stage,
+                    attempt=0,
+                    affected_repositories=frozenset(
+                        metadata.affected_repositories
+                    ),
+                    candidate_shas=implementation_candidates,
+                    contract_hashes=metadata.contract_hashes,
+                )
+                implementation_children: list[WorkflowChild] = []
+                for repository in implementation_repositories:
+                    aggregate = snapshot.children.get(repository)
+                    if aggregate is None or aggregate.result != "pass":
+                        continue
+                    comment_uuid = evidence_uuid(
+                        f"{identifier}-{predecessor_stage}-implementation-{repository}-pass"
+                    )
+                    implementation_children.append(
+                        WorkflowChild(
+                            f"{identifier}-{predecessor_stage}-IMPLEMENTATION-{repository.upper()}-PASS",
+                            repository,
+                            repository,
+                            "",
+                            "implementation",
+                            predecessor_stage,
+                            0,
+                            "done",
+                            implementation_action,
+                            False,
+                            evidence_comment_uuid=comment_uuid,
+                            creation_candidate_shas=implementation_candidates,
+                            phase_result="pass",
+                            evidence_comment_url=(
+                                f"https://example.test/evidence/{comment_uuid}"
+                            ),
+                        )
+                    )
+                children = (*children, *implementation_children)
+                hydrated_implementation_identifiers.update(
+                    child.identifier for child in implementation_children
+                )
+                hydrated_current_implementation = not current_gate
         applied_action_keys = {child.action_key for child in children}
         if isinstance(metadata, ParentMetadata):
             for child in children:
                 if (
-                    child.phase not in {"review", "qa", "integration_qa"}
+                    (
+                        child.phase == "implementation"
+                        and child.identifier
+                        not in hydrated_implementation_identifiers
+                    )
+                    or child.phase
+                    not in {"implementation", "review", "qa", "integration_qa"}
                     or child.status != "done"
                     or child.active
                 ):
                     continue
+                aggregate = snapshot.children.get(child.repository_key)
+                if child.phase == "implementation" and aggregate is None:
+                    continue
+                action_candidates = (
+                    {
+                        **child.creation_candidate_shas,
+                        child.repository_key: aggregate.candidate_sha,
+                    }
+                    if child.phase == "implementation"
+                    else child.creation_candidate_shas
+                )
                 try:
                     applied_action_keys.add(
                         coordinator_action_key(
@@ -570,7 +682,7 @@ class FakeWorkflowStore:
                             affected_repositories=frozenset(
                                 metadata.affected_repositories
                             ),
-                            candidate_shas=child.creation_candidate_shas,
+                            candidate_shas=action_candidates,
                             contract_hashes=metadata.contract_hashes,
                         )
                     )
@@ -583,10 +695,12 @@ class FakeWorkflowStore:
                         phase=child.phase,
                         result=child.phase_result,
                         attempt=child.attempt,
-                        candidate_sha=child.creation_candidate_shas[
-                            child.repository_key
-                        ],
-                        pull_request_url="",
+                        candidate_sha=action_candidates[child.repository_key],
+                        pull_request_url=(
+                            (pull_requests or {})[child.repository_key].url
+                            if child.repository_key in (pull_requests or {})
+                            else ""
+                        ),
                         evidence_comment_uuid=child.evidence_comment_uuid,
                         evidence_comment_url=child.evidence_comment_url,
                         suite_key=child.suite_key,
@@ -609,6 +723,39 @@ class FakeWorkflowStore:
                         ] = completion
                 except (KeyError, TypeError, ValueError, WorkflowError):
                     pass
+            if hydrated_current_implementation:
+                last_implementation = sorted(
+                    (
+                        child
+                        for child in children
+                        if child.phase == "implementation"
+                        and child.stage_ordinal == metadata.stage_ordinal
+                    ),
+                    key=lambda child: child.repository_key,
+                )[-1]
+                metadata = replace(
+                    metadata,
+                    last_action=coordinator_action_key(
+                        workflow_version=metadata.workflow_version,
+                        instance_key=metadata.instance_key,
+                        parent_identifier=identifier,
+                        stage_kind=(
+                            f"implementation:{last_implementation.repository_key}"
+                        ),
+                        stage_ordinal=last_implementation.stage_ordinal,
+                        attempt=last_implementation.attempt,
+                        affected_repositories=frozenset(
+                            metadata.affected_repositories
+                        ),
+                        candidate_shas={
+                            **last_implementation.creation_candidate_shas,
+                            last_implementation.repository_key: snapshot.children[
+                                last_implementation.repository_key
+                            ].candidate_sha,
+                        },
+                        contract_hashes=metadata.contract_hashes,
+                    ),
+                )
         self.states[identifier] = WorkflowState(
             parent_identifier=identifier,
             parent_status=status,
@@ -1960,7 +2107,7 @@ class WorkflowPullRequestDriftTests(TaskFourWorkflowFixture, unittest.TestCase):
                 result = self.workflow.resume_parent("PRO-200")
 
                 self.assertEqual(result.next_action, "block")
-                self.assertIn("out-of-band pull-request head change", result.reason)
+                self.assertIn("pull-request", result.reason)
                 self.assertEqual(result.mutation_count, 0)
                 self.assertEqual(self.store.states["PRO-200"], before)
                 self.assertFalse(any(event[0] == "create" for event in self.store.events))
@@ -2688,6 +2835,201 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             state,
             children=(*state.children, foreign),
         )
+
+    def seed_partial_gate_after_implementation(self) -> tuple[WorkflowChild, ...]:
+        self.store.add_blank("PRO-101")
+        self.workflow.handle_parent_event(
+            "PRO-101",
+            affected=frozenset({"api", "web"}),
+        )
+        api = self.workflow.record_phase_completion(completion_for("api"))
+        self.assertEqual(api.completed_child_status, "done", api.reason)
+        self.store.partial_create_limits = [1]
+        partial = self.workflow.record_phase_completion(completion_for("web"))
+        self.assertEqual(partial.next_action, "uncertain", partial.reason)
+        state = self.store.states["PRO-101"]
+        assert isinstance(state.metadata, ParentMetadata)
+        predecessor = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == state.metadata.stage_ordinal - 1
+        )
+        self.assertTrue(predecessor)
+        self.assertEqual({child.phase for child in predecessor}, {"implementation"})
+        self.store.events.clear()
+        return predecessor
+
+    def rewrite_exact_predecessor_phase(
+        self,
+        parent_identifier: str,
+        phase: str,
+    ) -> None:
+        state = self.store.states[parent_identifier]
+        assert isinstance(state.metadata, ParentMetadata)
+        predecessor_stage = state.metadata.stage_ordinal - 1
+        predecessor = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == predecessor_stage
+        )
+        self.assertTrue(predecessor)
+        source = dict(predecessor[0].creation_candidate_shas)
+        digest = "f" * 64 if phase == "repair" else ""
+        stage_kind = "gates" if phase in {"review", "qa"} else phase
+        creation_action = coordinator_action_key(
+            workflow_version=2,
+            instance_key=self.manifest.instance.key,
+            parent_identifier=parent_identifier,
+            stage_kind=stage_kind,
+            stage_ordinal=predecessor_stage,
+            attempt=state.metadata.repair_round,
+            affected_repositories=frozenset(state.snapshot.affected_repositories),
+            candidate_shas=source,
+            contract_hashes=state.metadata.contract_hashes,
+            failure_bundle_digest=digest,
+        )
+        rewritten: list[WorkflowChild] = []
+        completion_actions: set[str] = set()
+        for child in state.children:
+            if child.stage_ordinal != predecessor_stage:
+                rewritten.append(child)
+                continue
+            rewritten_child = replace(
+                child,
+                phase=phase,
+                action_key=creation_action,
+                suite_key="",
+                target_key=child.repository_key,
+                failure_bundle_digest=digest,
+                failure_evidence_uuids=(
+                    (evidence_uuid(f"swapped-{phase}-{child.identifier}"),)
+                    if phase == "repair"
+                    else ()
+                ),
+                authorizing_comment_uuid="",
+                responsible_repositories=(),
+            )
+            rewritten.append(rewritten_child)
+            completion = self.store.completions.get(
+                (parent_identifier, child.evidence_comment_uuid)
+            )
+            if completion is not None:
+                self.store.completions[
+                    (parent_identifier, child.evidence_comment_uuid)
+                ] = replace(
+                    completion,
+                    phase=phase,
+                    suite_key="",
+                    responsible_repositories=(),
+                    failure_bundle_digest=digest,
+                )
+                completion_action = coordinator_action_key(
+                    workflow_version=2,
+                    instance_key=self.manifest.instance.key,
+                    parent_identifier=parent_identifier,
+                    stage_kind=f"{phase}:{child.repository_key}",
+                    stage_ordinal=predecessor_stage,
+                    attempt=state.metadata.repair_round,
+                    affected_repositories=frozenset(
+                        state.snapshot.affected_repositories
+                    ),
+                    candidate_shas=state.snapshot.candidate_shas,
+                    contract_hashes=state.metadata.contract_hashes,
+                    failure_bundle_digest=digest,
+                )
+                completion_actions.add(completion_action)
+        self.store.states[parent_identifier] = replace(
+            state,
+            children=tuple(rewritten),
+            applied_action_keys=(
+                state.applied_action_keys
+                | {creation_action}
+                | completion_actions
+            ),
+        )
+
+    def test_partial_gate_predecessor_phase_is_bound_to_repair_round(self):
+        self.seed_partial_gate_after_implementation()
+        self.rewrite_exact_predecessor_phase("PRO-101", "repair")
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                self.setUp()
+                self.seed_partial_fresh_gate_after_repair(
+                    repair_round=repair_round
+                )
+                self.rewrite_exact_predecessor_phase("PRO-200", "implementation")
+                self.store.events.clear()
+
+                result = self.workflow.resume_parent("PRO-200")
+
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(
+                    any(event[0] == "create" for event in self.store.events)
+                )
+
+    def test_partial_gate_rejects_foreign_or_empty_predecessor_phase(self):
+        for repair_round in (0, 1, 2, 3):
+            for phase in ("review", "qa", "empty"):
+                with self.subTest(repair_round=repair_round, phase=phase):
+                    self.setUp()
+                    if repair_round == 0:
+                        self.seed_partial_gate_after_implementation()
+                        parent_identifier = "PRO-101"
+                    else:
+                        self.seed_partial_fresh_gate_after_repair(
+                            repair_round=repair_round
+                        )
+                        parent_identifier = "PRO-200"
+                    if phase == "empty":
+                        state = self.store.states[parent_identifier]
+                        assert isinstance(state.metadata, ParentMetadata)
+                        predecessor_stage = state.metadata.stage_ordinal - 1
+                        self.store.states[parent_identifier] = replace(
+                            state,
+                            children=tuple(
+                                child
+                                for child in state.children
+                                if child.stage_ordinal != predecessor_stage
+                            ),
+                        )
+                    else:
+                        self.rewrite_exact_predecessor_phase(
+                            parent_identifier,
+                            phase,
+                        )
+                    self.store.events.clear()
+
+                    result = self.workflow.resume_parent(parent_identifier)
+
+                    self.assertEqual(result.next_action, "block", result.reason)
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(event[0] == "create" for event in self.store.events)
+                    )
+
+    def test_partial_gate_valid_predecessor_phase_converges_by_round(self):
+        self.seed_partial_gate_after_implementation()
+        initial = self.workflow.resume_parent("PRO-101")
+        self.assertEqual(initial.next_action, "dispatch", initial.reason)
+
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                self.setUp()
+                self.seed_partial_fresh_gate_after_repair(
+                    repair_round=repair_round
+                )
+
+                result = self.workflow.resume_parent("PRO-200")
+
+                self.assertEqual(result.next_action, "dispatch", result.reason)
 
     def test_initial_fresh_gate_rejects_foreign_repair_attempts_in_same_stage(self):
         for repair_round in (1, 2, 3):
@@ -5336,6 +5678,20 @@ class GenericWorkflowTests(unittest.TestCase):
                 ("web-api", "integration_qa"),
             ),
         )
+        state = store.states["PRO-101"]
+        assert isinstance(state.metadata, ParentMetadata)
+        store.states["PRO-101"] = replace(
+            state,
+            children=tuple(
+                sorted(
+                    state.children,
+                    key=lambda child: (
+                        child.stage_ordinal != state.metadata.stage_ordinal,
+                        child.attempt != snapshot.attempt,
+                    ),
+                )
+            ),
+        )
         store.events.clear()
         return store, workflow
 
@@ -5388,7 +5744,7 @@ class GenericWorkflowTests(unittest.TestCase):
         self.assertEqual(len(set(identities)), 5)
         self.assertIn(state.metadata.last_action, state.applied_action_keys)
 
-    def test_partial_fresh_gate_successor_converges_in_every_repair_round(self):
+    def test_partial_fresh_gate_without_repair_predecessor_blocks_each_round(self):
         for attempt in (1, 2, 3):
             with self.subTest(attempt=attempt):
                 store = FakeWorkflowStore(self.manifest)
@@ -5423,9 +5779,9 @@ class GenericWorkflowTests(unittest.TestCase):
                     if child.stage_ordinal == 6 and child.attempt == attempt
                 )
                 self.assertEqual(first.next_action, "uncertain")
-                self.assertEqual(second.next_action, "dispatch")
-                self.assertEqual(third.next_action, "noop")
-                self.assertEqual(len(current), 5)
+                self.assertEqual(second.next_action, "block")
+                self.assertEqual(third.next_action, "block")
+                self.assertEqual(len(current), 1)
                 self.assertEqual(len({child.action_key for child in current}), 1)
                 self.assertEqual(
                     {tuple(child.creation_candidate_shas.items()) for child in current},
@@ -5626,6 +5982,20 @@ class GenericWorkflowTests(unittest.TestCase):
         self.store.partial_create_limits = [1]
         first = self.workflow.resume_parent("PRO-101")
         self.assertEqual(first.next_action, "uncertain")
+        state = self.store.states["PRO-101"]
+        assert isinstance(state.metadata, ParentMetadata)
+        self.store.states["PRO-101"] = replace(
+            state,
+            children=tuple(
+                sorted(
+                    state.children,
+                    key=lambda child: (
+                        child.stage_ordinal != state.metadata.stage_ordinal,
+                        child.attempt != snapshot.attempt,
+                    ),
+                )
+            ),
+        )
 
     def test_terminal_gate_prefix_converges_for_every_authoritative_result(self):
         for result in ("pass", "fail", "blocked"):
@@ -5952,6 +6322,7 @@ class GenericWorkflowTests(unittest.TestCase):
             "PRO-101",
             snapshot,
             pull_requests=pull_request_targets(),
+            hydrate_current_gate_passes=False,
         )
         typed_decision = ParentDecision(
             DecisionKind.DISPATCH,
@@ -5966,6 +6337,7 @@ class GenericWorkflowTests(unittest.TestCase):
         ):
             result = self.workflow.resume_parent("PRO-101")
 
+        self.assertTrue(result.created_children, result)
         self.assertEqual(result.created_children[0], ("api", "review"))
         self.assertNotIn(("api", "implementation"), result.created_children)
 
@@ -7576,7 +7948,13 @@ class GenericWorkflowTests(unittest.TestCase):
                 children = list(state.children)
                 applied = set(state.applied_action_keys)
                 if corruption == "missing":
-                    children.pop()
+                    missing_index = max(
+                        index
+                        for index, child in enumerate(children)
+                        if child.stage_ordinal == 5
+                        and child.phase in {"review", "qa", "integration_qa"}
+                    )
+                    children.pop(missing_index)
                 elif corruption == "duplicate":
                     children.append(replace(children[0], identifier="PRO-101-DUPLICATE"))
                 elif corruption == "extra":

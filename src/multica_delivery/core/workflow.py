@@ -3842,23 +3842,35 @@ class GenericWorkflow:
                 state,
                 "non-repair successor reservation conflicts with its exact intended membership",
             )
-        if phases <= {"review", "qa", "integration_qa"}:
+        if (
+            (
+                observed != wanted
+                or action_key not in state.applied_action_keys
+            )
+            and phases <= {"review", "qa", "integration_qa"}
+        ):
             predecessor = tuple(
                 child
                 for child in state.children
                 if child.stage_ordinal == metadata.stage_ordinal - 1
             )
             predecessor_phases = {child.phase for child in predecessor}
-            if "repair" in predecessor_phases:
-                if (
-                    {child.attempt for child in predecessor}
-                    != {metadata.repair_round}
-                    or predecessor_phases != {"repair"}
-                ):
-                    return self._zero_mutation_block(
-                        state,
-                        "Gate successor has a mixed predecessor Stage",
-                    )
+            expected_predecessor_phase = (
+                "implementation"
+                if metadata.repair_round == 0
+                else "repair"
+            )
+            if (
+                not predecessor
+                or {child.attempt for child in predecessor}
+                != {metadata.repair_round}
+                or predecessor_phases != {expected_predecessor_phase}
+            ):
+                return self._zero_mutation_block(
+                    state,
+                    "Gate successor has the wrong predecessor Stage",
+                )
+            if expected_predecessor_phase == "repair":
                 repair_problem = self._terminal_repair_wave_authority_problem(
                     state,
                     stage_ordinal=metadata.stage_ordinal - 1,
@@ -3866,6 +3878,78 @@ class GenericWorkflow:
                 )
                 if repair_problem is not None:
                     return repair_problem
+            else:
+                predecessor_candidates = {
+                    tuple(child.creation_candidate_shas.items())
+                    for child in predecessor
+                }
+                repositories = tuple(
+                    child.repository_key for child in predecessor
+                )
+                if (
+                    len(predecessor_candidates) != 1
+                    or len(repositories) != len(set(repositories))
+                    or any(
+                        child.status != "done"
+                        or child.active
+                        or child.phase_result != "pass"
+                        for child in predecessor
+                    )
+                ):
+                    return self._zero_mutation_block(
+                        state,
+                        "Gate successor Implementation predecessor is conflicting",
+                    )
+                implementation_candidates = dict(
+                    next(iter(predecessor_candidates))
+                )
+                implementation_action = self._action_key(
+                    state,
+                    "implementation",
+                    metadata.stage_ordinal - 1,
+                    attempt=metadata.repair_round,
+                    candidate_shas=implementation_candidates,
+                )
+                observed_predecessor_actions = (
+                    self._authoritative_terminal_successor_actions(
+                        state,
+                        predecessor,
+                        implementation_candidates,
+                        implementation_action,
+                    )
+                )
+                if (
+                    implementation_action not in state.applied_action_keys
+                    or any(
+                        child.action_key != implementation_action
+                        for child in predecessor
+                    )
+                    or observed_predecessor_actions is None
+                    or len(observed_predecessor_actions) != len(predecessor)
+                ):
+                    return self._zero_mutation_block(
+                        state,
+                        "Gate successor Implementation predecessor lacks authority",
+                    )
+                fan_in_problem = self._parent_fan_in_still_current(state)
+                if fan_in_problem is not None:
+                    return fan_in_problem
+                refreshed_predecessor_actions = (
+                    self._authoritative_terminal_successor_actions(
+                        state,
+                        predecessor,
+                        implementation_candidates,
+                        implementation_action,
+                    )
+                )
+                if refreshed_predecessor_actions != observed_predecessor_actions:
+                    return self._zero_mutation_block(
+                        state,
+                        "Gate successor Implementation predecessor changed during fan-in",
+                    )
+                fan_in_problem = self._parent_fan_in_still_current(state)
+                if fan_in_problem is not None:
+                    return fan_in_problem
         if observed == wanted and action_key in state.applied_action_keys:
             if terminal_actions:
                 head_problem = self._nonrepair_successor_heads_still_current(
