@@ -162,6 +162,11 @@ class MetadataTests(unittest.TestCase):
         cases = (
             ("noncanonical UUID", {"comment_uuid": "00000000000040008000000000000013"}),
             ("non-HTTPS URL", {"comment_url": "http://multica.example/comments/13"}),
+            ("URL username", {"comment_url": "https://user@multica.example/comments/13"}),
+            ("URL password", {"comment_url": "https://user:pass@multica.example/comments/13"}),
+            ("URL query", {"comment_url": "https://multica.example/comments/13?raw=1"}),
+            ("URL fragment", {"comment_url": "https://multica.example/comments/13#raw"}),
+            ("URL empty path", {"comment_url": "https://multica.example"}),
             ("non-64-hex digest", {"bundle_digest": "a" * 63}),
             ("negative round", {"granted_round": -1}),
         )

@@ -154,7 +154,15 @@ class RepairAuthorization:
         if not isinstance(self.comment_url, str):
             raise MetadataError("comment_url must be an HTTPS URL")
         parsed = urlparse(self.comment_url)
-        if parsed.scheme != "https" or not parsed.netloc:
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path
+        ):
             raise MetadataError("comment_url must be an HTTPS URL")
         if not isinstance(self.bundle_digest, str) or not _DIGEST.fullmatch(self.bundle_digest):
             raise MetadataError("bundle_digest must be a lowercase 64-hex digest")
