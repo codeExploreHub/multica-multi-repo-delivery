@@ -394,7 +394,11 @@ class ParentDecisionTests(unittest.TestCase):
             snapshot,
             qa={**snapshot.qa, "notifications": gate_for("notifications", sha="d" * 40)},
             integration_qa={
-                "web-api": GateEvidence(candidate_shas=SHA, result="fail"),
+                "web-api": GateEvidence(
+                    candidate_shas=SHA,
+                    result="fail",
+                    responsible_repositories=("api",),
+                ),
             },
             pull_requests={
                 **snapshot.pull_requests,
@@ -635,6 +639,7 @@ class ParentDecisionTests(unittest.TestCase):
                     "web-api": GateEvidence(
                         candidate_shas=snapshot.candidate_shas,
                         result="fail",
+                        responsible_repositories=("api",),
                     )
                 },
             ),
@@ -669,6 +674,50 @@ class ParentDecisionTests(unittest.TestCase):
             },
         )
         self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.REPAIR)
+
+    def test_integration_failure_repairs_only_its_declared_responsibility_subset(self):
+        snapshot = passing_snapshot()
+        decision = decide_parent_action(
+            self.manifest,
+            replace(
+                snapshot,
+                integration_qa={
+                    "web-api": GateEvidence(
+                        candidate_shas=snapshot.candidate_shas,
+                        result="fail",
+                        responsible_repositories=("api",),
+                    )
+                },
+            ),
+        )
+
+        self.assertEqual(decision.kind, DecisionKind.REPAIR)
+        self.assertEqual(decision.repositories, ("api",))
+
+    def test_integration_failure_rejects_invalid_responsibility_sets(self):
+        snapshot = passing_snapshot()
+        for label, repositories in (
+            ("empty", ()),
+            ("duplicate", ("api", "api")),
+            ("unknown", ("api", "notifications")),
+        ):
+            with self.subTest(label=label):
+                decision = decide_parent_action(
+                    self.manifest,
+                    replace(
+                        snapshot,
+                        integration_qa={
+                            "web-api": GateEvidence(
+                                candidate_shas=snapshot.candidate_shas,
+                                result="fail",
+                                responsible_repositories=repositories,
+                            )
+                        },
+                    ),
+                )
+
+                self.assertEqual(decision.kind, DecisionKind.BLOCK)
+                self.assertEqual(decision.repositories, ())
 
     def test_non_applicable_integration_qa_evidence_is_malformed(self):
         snapshot = passing_snapshot(affected=("api",))

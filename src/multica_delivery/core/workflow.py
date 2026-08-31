@@ -2107,6 +2107,118 @@ class GenericWorkflow:
             for repository, pull_request in state.snapshot.pull_requests.items()
         )
 
+    def _current_repair_head_problem(
+        self,
+        state: WorkflowState,
+        completion: PhaseCompletion | None = None,
+    ) -> tuple[bool, str | None]:
+        """Validate current Repair Stage heads without adopting active-owner motion."""
+
+        if state.metadata is None:
+            return False, None
+        current = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == state.metadata.stage_ordinal
+            and child.attempt == state.metadata.repair_round
+        )
+        if not current or not any(child.phase == "repair" for child in current):
+            return False, None
+        problem = "current Repair Stage head or membership evidence is conflicting"
+        if any(child.phase != "repair" for child in current):
+            return True, problem
+        source = dict(current[0].creation_candidate_shas)
+        affected = set(state.snapshot.affected_repositories)
+        if (
+            not source
+            or set(source) != affected
+            or set(state.snapshot.candidate_shas) != affected
+            or set(state.snapshot.pull_requests) != affected
+            or set(state.pull_requests) != affected
+        ):
+            return True, problem
+        expected_action = self._action_key(
+            state,
+            "repair",
+            state.metadata.stage_ordinal,
+            attempt=state.metadata.repair_round,
+            candidate_shas=source,
+            failure_bundle_digest=current[0].failure_bundle_digest,
+            authorizing_comment_uuid=current[0].authorizing_comment_uuid,
+        )
+        owners = Counter(child.repository_key for child in current)
+        if (
+            any(count != 1 for count in owners.values())
+            or not set(owners) <= affected
+            or any(
+                child.target_key != child.repository_key
+                or child.suite_key
+                or dict(child.creation_candidate_shas) != source
+                or child.action_key != expected_action
+                or child.failure_bundle_digest != current[0].failure_bundle_digest
+                or child.authorizing_comment_uuid
+                != current[0].authorizing_comment_uuid
+                for child in current
+            )
+            or expected_action not in state.applied_action_keys
+        ):
+            return True, problem
+
+        for repository in affected:
+            candidate = state.snapshot.candidate_shas[repository]
+            pull_request = state.snapshot.pull_requests[repository]
+            child = next(
+                (item for item in current if item.repository_key == repository),
+                None,
+            )
+            if child is None:
+                evidence = state.snapshot.children.get(repository)
+                if (
+                    candidate != source[repository]
+                    or pull_request.head_sha != source[repository]
+                    or evidence is None
+                    or evidence.result != "pass"
+                    or evidence.candidate_sha != source[repository]
+                ):
+                    return True, problem
+                continue
+            evidence = state.snapshot.children.get(repository)
+            if child.status in _ACTIVE_CHILD_STATUSES and child.active:
+                if (
+                    candidate != source[repository]
+                    or evidence is None
+                    or evidence.result != "pending"
+                    or evidence.candidate_sha not in {"", source[repository]}
+                ):
+                    return True, problem
+                if completion is not None and completion.repository_key == repository:
+                    if completion.phase != "repair":
+                        return True, problem
+                    if completion.result == "pass":
+                        if (
+                            completion.candidate_sha == source[repository]
+                            or completion.candidate_sha != pull_request.head_sha
+                        ):
+                            return True, problem
+                    elif (
+                        completion.candidate_sha != source[repository]
+                        or pull_request.head_sha != source[repository]
+                    ):
+                        return True, problem
+                continue
+            if (
+                child.status != "done"
+                or child.active
+                or child.phase_result != "pass"
+                or evidence is None
+                or evidence.result != "pass"
+                or evidence.candidate_sha != candidate
+                or candidate == source[repository]
+                or pull_request.head_sha != candidate
+            ):
+                return True, problem
+        return True, None
+
     def _parent_decision(self, state: WorkflowState) -> ParentDecision:
         snapshot = state.snapshot
         automatic_limit = self.manifest.policy.max_repair_attempts
@@ -3122,7 +3234,10 @@ class GenericWorkflow:
             return self._result(state, "noop", "parent is not active")
         if state.human_wait:
             return self._result(state, "wait", "parent is waiting for a human")
-        if not self._candidate_heads_match(state):
+        repair_stage, repair_head_problem = self._current_repair_head_problem(state)
+        if repair_head_problem is not None:
+            return self._zero_mutation_block(state, repair_head_problem)
+        if not repair_stage and not self._candidate_heads_match(state):
             return self._zero_mutation_block(
                 state,
                 "out-of-band pull-request head change",
@@ -3771,12 +3886,18 @@ class GenericWorkflow:
                 state,
                 "managed pull request lacks authoritative head evidence",
             )
+        repair_stage, repair_head_problem = self._current_repair_head_problem(
+            state,
+            completion,
+        )
+        if repair_head_problem is not None:
+            return self._zero_mutation_block(state, repair_head_problem)
         mismatched_heads = {
             repository
             for repository, pull_request in state.snapshot.pull_requests.items()
             if state.snapshot.candidate_shas.get(repository) != pull_request.head_sha
         }
-        if mismatched_heads and (
+        if not repair_stage and mismatched_heads and (
             completion.phase not in {"implementation", "repair"}
             or completion.result != "pass"
             or mismatched_heads != {completion.repository_key}
