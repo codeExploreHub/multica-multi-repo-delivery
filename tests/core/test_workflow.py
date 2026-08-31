@@ -554,7 +554,6 @@ class FakeWorkflowStore:
                 except WorkflowError:
                     pass
                 try:
-                    pull_request = (pull_requests or {})[child.repository_key]
                     completion = PhaseCompletion(
                         parent_identifier=identifier,
                         repository_key=child.repository_key,
@@ -564,7 +563,7 @@ class FakeWorkflowStore:
                         candidate_sha=child.creation_candidate_shas[
                             child.repository_key
                         ],
-                        pull_request_url=pull_request.url,
+                        pull_request_url="",
                         evidence_comment_uuid=child.evidence_comment_uuid,
                         evidence_comment_url=child.evidence_comment_url,
                         suite_key=child.suite_key,

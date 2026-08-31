@@ -2192,6 +2192,24 @@ class GenericWorkflow:
             pull_request = state.pull_requests.get(child.repository_key)
             if pull_request is None:
                 return None
+            try:
+                observed_completions = tuple(
+                    self.snapshot_reader.read_phase_completion(
+                        state.parent_identifier,
+                        child.evidence_comment_uuid,
+                    )
+                    for _ in range(2)
+                )
+            except Exception:
+                return None
+            if (
+                observed_completions[0] != observed_completions[1]
+                or type(observed_completions[0]) is not PhaseCompletion
+                or observed_completions[0].pull_request_url
+                not in {"", pull_request.url}
+            ):
+                return None
+            observed_completion = observed_completions[0]
             expected_completion = PhaseCompletion(
                 parent_identifier=state.parent_identifier,
                 repository_key=child.repository_key,
@@ -2199,7 +2217,7 @@ class GenericWorkflow:
                 result=child.phase_result,
                 attempt=source_attempt,
                 candidate_sha=source[child.repository_key],
-                pull_request_url=pull_request.url,
+                pull_request_url=observed_completion.pull_request_url,
                 evidence_comment_uuid=child.evidence_comment_uuid,
                 evidence_comment_url=child.evidence_comment_url,
                 suite_key=child.suite_key,
@@ -2214,20 +2232,7 @@ class GenericWorkflow:
                 is not None
             ):
                 return None
-            try:
-                observed_completions = tuple(
-                    self.snapshot_reader.read_phase_completion(
-                        state.parent_identifier,
-                        child.evidence_comment_uuid,
-                    )
-                    for _ in range(2)
-                )
-            except Exception:
-                return None
-            if any(
-                observed != expected_completion
-                for observed in observed_completions
-            ):
+            if observed_completion != expected_completion:
                 return None
             evidence_uuids.add(child.evidence_comment_uuid)
             if child.phase in {"review", "qa"}:
