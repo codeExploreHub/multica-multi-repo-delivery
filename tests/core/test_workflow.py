@@ -314,6 +314,7 @@ class FakeWorkflowStore:
         self.duplicate_repair_child_on_create = False
         self.replace_repair_digest_after_create = False
         self.repair_failure_uuid_corruption: str | None = None
+        self.partial_create_limits: list[int] = []
 
     def add_blank(
         self,
@@ -728,6 +729,14 @@ class FakeWorkflowStore:
         action_key: str,
     ) -> None:
         self.events.append(("create", parent_identifier, children, action_key))
+        requested_children = children
+        partial_limit = (
+            self.partial_create_limits.pop(0)
+            if self.partial_create_limits
+            else None
+        )
+        if partial_limit is not None:
+            children = children[:partial_limit]
         state = self.states[parent_identifier]
         snapshot = state.snapshot
         implementation = dict(snapshot.children)
@@ -839,6 +848,8 @@ class FakeWorkflowStore:
         if self.fail_reads_after_create:
             self.fail_reads_after_create = False
             self.parent_read_failures_remaining = 2
+        if partial_limit is not None and len(children) < len(requested_children):
+            raise RuntimeError("child creation stopped after a committed prefix")
 
     def write_phase_completion(
         self,
@@ -4719,6 +4730,269 @@ class GenericWorkflowTests(unittest.TestCase):
                 ("web", "qa"),
                 ("web-api", "integration_qa"),
             ),
+        )
+
+    def _new_active_gate_stage(self):
+        store = FakeWorkflowStore(self.manifest)
+        workflow = GenericWorkflow(
+            self.manifest,
+            store,
+            store,
+            github=FakeGitHub(store.events),
+        )
+        snapshot = replace(
+            passing_snapshot(),
+            reviews={},
+            qa={},
+            integration_qa={},
+        )
+        store.add_state(
+            "PRO-101",
+            snapshot,
+            pull_requests=pull_request_targets(),
+            stage_ordinal=5,
+        )
+        created = workflow.resume_parent("PRO-101")
+        self.assertEqual(
+            created.created_children,
+            (
+                ("api", "review"),
+                ("api", "qa"),
+                ("web", "review"),
+                ("web", "qa"),
+                ("web-api", "integration_qa"),
+            ),
+        )
+        store.events.clear()
+        return store, workflow
+
+    def test_partial_gate_successor_converges_without_duplicate_children(self):
+        snapshot = replace(
+            passing_snapshot(),
+            reviews={},
+            qa={},
+            integration_qa={},
+        )
+        self.store.add_state(
+            "PRO-101",
+            snapshot,
+            pull_requests=pull_request_targets(),
+            stage_ordinal=5,
+        )
+        self.store.partial_create_limits = [1, 1]
+
+        first = self.workflow.resume_parent("PRO-101")
+        second = self.workflow.resume_parent("PRO-101")
+        third = self.workflow.resume_parent("PRO-101")
+        fourth = self.workflow.resume_parent("PRO-101")
+
+        state = self.store.states["PRO-101"]
+        current = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == 6 and child.attempt == 0
+        )
+        create_events = [event for event in self.store.events if event[0] == "create"]
+        identities = [
+            (child.phase, child.target_key, child.suite_key)
+            for child in current
+        ]
+        self.assertEqual(first.next_action, "uncertain")
+        self.assertEqual(second.next_action, "uncertain")
+        self.assertEqual(third.next_action, "dispatch")
+        self.assertEqual(fourth.next_action, "noop")
+        self.assertEqual([len(event[2]) for event in create_events], [5, 4, 3])
+        self.assertEqual(
+            identities,
+            [
+                ("review", "api", ""),
+                ("qa", "api", ""),
+                ("review", "web", ""),
+                ("qa", "web", ""),
+                ("integration_qa", "web-api", "web-api"),
+            ],
+        )
+        self.assertEqual(len(set(identities)), 5)
+        self.assertIn(state.metadata.last_action, state.applied_action_keys)
+
+    def test_partial_fresh_gate_successor_converges_in_every_repair_round(self):
+        for attempt in (1, 2, 3):
+            with self.subTest(attempt=attempt):
+                store = FakeWorkflowStore(self.manifest)
+                workflow = GenericWorkflow(
+                    self.manifest,
+                    store,
+                    store,
+                    github=FakeGitHub(store.events),
+                )
+                snapshot = replace(
+                    passing_snapshot(),
+                    reviews={},
+                    qa={},
+                    integration_qa={},
+                    attempt=attempt,
+                )
+                store.add_state(
+                    "PRO-101",
+                    snapshot,
+                    pull_requests=pull_request_targets(),
+                    stage_ordinal=5,
+                )
+                store.partial_create_limits = [1]
+
+                first = workflow.resume_parent("PRO-101")
+                second = workflow.resume_parent("PRO-101")
+                third = workflow.resume_parent("PRO-101")
+
+                current = tuple(
+                    child
+                    for child in store.states["PRO-101"].children
+                    if child.stage_ordinal == 6 and child.attempt == attempt
+                )
+                self.assertEqual(first.next_action, "uncertain")
+                self.assertEqual(second.next_action, "dispatch")
+                self.assertEqual(third.next_action, "noop")
+                self.assertEqual(len(current), 5)
+                self.assertEqual(len({child.action_key for child in current}), 1)
+                self.assertEqual(
+                    {tuple(child.creation_candidate_shas.items()) for child in current},
+                    {tuple(snapshot.candidate_shas.items())},
+                )
+
+    def test_gate_successor_recreates_each_missing_identity_only(self):
+        expected = (
+            ("review", "api", ""),
+            ("qa", "api", ""),
+            ("review", "web", ""),
+            ("qa", "web", ""),
+            ("integration_qa", "web-api", "web-api"),
+        )
+        for missing_index, wanted in enumerate(expected):
+            with self.subTest(missing=wanted):
+                store, workflow = self._new_active_gate_stage()
+                state = store.states["PRO-101"]
+                store.states["PRO-101"] = replace(
+                    state,
+                    children=tuple(
+                        child
+                        for index, child in enumerate(state.children)
+                        if index != missing_index
+                    ),
+                )
+
+                result = workflow.resume_parent("PRO-101")
+
+                creates = [event for event in store.events if event[0] == "create"]
+                self.assertEqual(result.next_action, "dispatch")
+                self.assertEqual(len(creates), 1)
+                self.assertEqual(len(creates[0][2]), 1)
+                request = creates[0][2][0]
+                self.assertEqual(
+                    (request.phase, request.target_key, request.suite_key),
+                    wanted,
+                )
+                current = tuple(
+                    child
+                    for child in store.states["PRO-101"].children
+                    if child.stage_ordinal == 6 and child.attempt == 0
+                )
+                self.assertEqual(len(current), 5)
+
+    def test_complete_gate_successor_finalizes_missing_action_then_is_noop(self):
+        store, workflow = self._new_active_gate_stage()
+        state = store.states["PRO-101"]
+        action_key = state.metadata.last_action
+        store.states["PRO-101"] = replace(
+            state,
+            applied_action_keys=state.applied_action_keys - {action_key},
+        )
+
+        finalized = workflow.resume_parent("PRO-101")
+        replay = workflow.resume_parent("PRO-101")
+
+        creates = [event for event in store.events if event[0] == "create"]
+        self.assertEqual(finalized.next_action, "dispatch")
+        self.assertEqual(finalized.mutation_count, 1)
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][2], ())
+        self.assertEqual(replay.next_action, "noop")
+        self.assertIn(
+            store.states["PRO-101"].metadata.last_action,
+            store.states["PRO-101"].applied_action_keys,
+        )
+
+    def test_conflicting_partial_gate_successors_block_without_mutation(self):
+        cases = ("duplicate", "extra", "action", "stage", "candidate")
+        for corruption in cases:
+            with self.subTest(corruption=corruption):
+                store, workflow = self._new_active_gate_stage()
+                state = store.states["PRO-101"]
+                children = list(state.children)
+                if corruption == "duplicate":
+                    children.append(
+                        replace(children[0], identifier="PRO-101-DUPLICATE")
+                    )
+                elif corruption == "extra":
+                    children.append(
+                        WorkflowChild(
+                            "PRO-101-EXTRA",
+                            "api",
+                            "api",
+                            "",
+                            "implementation",
+                            6,
+                            0,
+                            "todo",
+                            state.metadata.last_action,
+                            True,
+                            creation_candidate_shas=state.snapshot.candidate_shas,
+                        )
+                    )
+                elif corruption == "action":
+                    children[0] = replace(children[0], action_key="stage:" + "f" * 64)
+                elif corruption == "stage":
+                    children[0] = replace(children[0], stage_ordinal=5)
+                elif corruption == "candidate":
+                    children[0] = replace(
+                        children[0],
+                        creation_candidate_shas={"api": OTHER_SHA, "web": SHA["web"]},
+                    )
+                store.states["PRO-101"] = replace(state, children=tuple(children))
+                store.events.clear()
+
+                result = workflow.resume_parent("PRO-101")
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertFalse(any(event[0] == "create" for event in store.events))
+
+    def test_partial_parallel_implementation_wave_creates_only_missing_owner(self):
+        self.workflow.handle_parent_event(
+            "PRO-101",
+            affected=frozenset({"api", "web", "notifications"}),
+        )
+        self.store.partial_create_limits = [1]
+
+        first = self.workflow.record_phase_completion(completion_for("api"))
+        second = self.workflow.resume_parent("PRO-101")
+        third = self.workflow.resume_parent("PRO-101")
+
+        current = tuple(
+            child
+            for child in self.store.states["PRO-101"].children
+            if child.stage_ordinal == 2 and child.attempt == 0
+        )
+        creates = [event for event in self.store.events if event[0] == "create"]
+        self.assertEqual(first.next_action, "uncertain")
+        self.assertEqual(second.next_action, "dispatch")
+        self.assertEqual(third.next_action, "noop")
+        self.assertEqual(
+            [(child.target_key, child.phase) for child in current],
+            [("web", "implementation"), ("notifications", "implementation")],
+        )
+        self.assertEqual(
+            tuple(request.target_key for request in creates[-1][2]),
+            ("notifications",),
         )
 
     def test_gate_dispatch_uses_typed_phase_not_decision_reason_wording(self):

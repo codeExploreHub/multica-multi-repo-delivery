@@ -1796,7 +1796,18 @@ class GenericWorkflow:
                     or child.status not in _CHILD_STATUSES
                     or type(child.action_key) is not str
                     or _ACTION_KEY.fullmatch(child.action_key) is None
-                    or child.action_key not in state.applied_action_keys
+                    or (
+                        child.action_key not in state.applied_action_keys
+                        and not (
+                            type(metadata) is ParentMetadata
+                            and child.phase != "repair"
+                            and child.active
+                            and child.status in _ACTIVE_CHILD_STATUSES
+                            and child.stage_ordinal == metadata.stage_ordinal
+                            and child.attempt == metadata.repair_round
+                            and child.action_key == metadata.last_action
+                        )
+                    )
                     or type(child.active) is not bool
                     or not _canonical_uuid(child.evidence_comment_uuid, empty=True)
                     or type(child.creation_candidate_shas)
@@ -3016,6 +3027,42 @@ class GenericWorkflow:
                 )
         return tuple(requests)
 
+    def _complete_gate_requests(
+        self,
+        state: WorkflowState,
+        ordinal: int,
+    ) -> tuple[ChildRequest, ...]:
+        affected = frozenset(state.snapshot.affected_repositories)
+        requests: list[ChildRequest] = []
+        for repository in self._ordered(affected):
+            for phase in ("review", "qa"):
+                requests.append(
+                    ChildRequest(
+                        repository,
+                        repository,
+                        "",
+                        phase,
+                        ordinal,
+                        state.snapshot.attempt,
+                        state.snapshot.candidate_shas,
+                        state.pull_requests.get(repository),
+                    )
+                )
+        for suite in self.manifest.integration_suites:
+            if set(suite.repositories) <= affected:
+                requests.append(
+                    ChildRequest(
+                        suite.key,
+                        suite.command_repository,
+                        suite.key,
+                        "integration_qa",
+                        ordinal,
+                        state.snapshot.attempt,
+                        state.snapshot.candidate_shas,
+                    )
+                )
+        return tuple(requests)
+
     def _failure_bundle(
         self,
         state: WorkflowState,
@@ -3265,6 +3312,255 @@ class GenericWorkflow:
             for child in state.children
         )
 
+    @staticmethod
+    def _successor_request_identity(
+        request: ChildRequest,
+        action_key: str,
+    ) -> tuple[object, ...]:
+        return (
+            request.target_key,
+            request.repository_key,
+            request.suite_key,
+            request.phase,
+            request.stage_ordinal,
+            request.attempt,
+            action_key,
+            tuple(request.candidate_shas.items()),
+            "" if request.failure_bundle is None else request.failure_bundle.digest,
+            _failure_uuid_partition(request.failure_refs),
+            request.authorizing_comment_uuid,
+        )
+
+    @staticmethod
+    def _successor_child_identity(child: WorkflowChild) -> tuple[object, ...]:
+        return (
+            child.target_key,
+            child.repository_key,
+            child.suite_key,
+            child.phase,
+            child.stage_ordinal,
+            child.attempt,
+            child.action_key,
+            tuple(child.creation_candidate_shas.items()),
+            child.failure_bundle_digest,
+            child.failure_evidence_uuids,
+            child.authorizing_comment_uuid,
+        )
+
+    def _reconcile_nonrepair_successor(
+        self,
+        state: WorkflowState,
+    ) -> WorkflowResult | None:
+        metadata = state.metadata
+        if type(metadata) is not ParentMetadata:
+            return None
+        current = tuple(
+            child
+            for child in state.children
+            if (
+                child.stage_ordinal == metadata.stage_ordinal
+                and child.attempt == metadata.repair_round
+            )
+            or (
+                child.active
+                and child.status in _ACTIVE_CHILD_STATUSES
+                and child.action_key == metadata.last_action
+            )
+        )
+        if not current or all(child.phase == "repair" for child in current):
+            return None
+        if any(child.phase == "repair" for child in current):
+            return self._zero_mutation_block(
+                state,
+                "current successor reservation mixes repair and non-repair children",
+            )
+        phases = frozenset(child.phase for child in current)
+        if (
+            phases <= {"review", "qa", "integration_qa"}
+            and not metadata.last_action.startswith("stage:")
+        ):
+            return None
+        creation_candidate_maps = {
+            tuple(child.creation_candidate_shas.items())
+            for child in current
+        }
+        if len(creation_candidate_maps) != 1:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor reservation has conflicting creation candidates",
+            )
+        source_candidates = dict(next(iter(creation_candidate_maps)))
+        request_state = replace(
+            state,
+            snapshot=replace(
+                state.snapshot,
+                candidate_shas=source_candidates,
+            ),
+        )
+        if phases <= {"review", "qa", "integration_qa"}:
+            if source_candidates != dict(state.snapshot.candidate_shas):
+                return self._zero_mutation_block(
+                    state,
+                    "Gate successor reservation creation candidates changed",
+                )
+            stage_kind = "gates"
+            requests = self._complete_gate_requests(
+                request_state,
+                metadata.stage_ordinal,
+            )
+        elif phases == {"implementation"}:
+            current_repositories = {
+                child.repository_key
+                for child in current
+                if child.stage_ordinal == metadata.stage_ordinal
+            }
+            baseline_snapshot = replace(
+                request_state.snapshot,
+                children={
+                    repository: evidence
+                    for repository, evidence in state.snapshot.children.items()
+                    if repository not in current_repositories
+                },
+            )
+            baseline = decide_parent_action(self.manifest, baseline_snapshot)
+            if (
+                baseline.kind is not DecisionKind.DISPATCH
+                or baseline.dispatch_kind is not DispatchKind.IMPLEMENTATION
+            ):
+                return self._zero_mutation_block(
+                    state,
+                    "implementation successor reservation cannot reconstruct its dependency wave",
+                )
+            stage_kind = "implementation"
+            requests = self._implementation_requests(
+                request_state,
+                baseline.repositories,
+                metadata.stage_ordinal,
+            )
+        else:
+            return self._zero_mutation_block(
+                state,
+                "current non-repair successor reservation has mixed phase kinds",
+            )
+        action_key = self._action_key(
+            state,
+            stage_kind,
+            metadata.stage_ordinal,
+            attempt=metadata.repair_round,
+            candidate_shas=source_candidates,
+        )
+        open_reservation = all(
+            child.active
+            and child.status in _ACTIVE_CHILD_STATUSES
+            and not child.evidence_comment_uuid
+            and not child.phase_result
+            and not child.evidence_comment_url
+            for child in current
+        )
+        if metadata.last_action != action_key:
+            if open_reservation and metadata.last_action.startswith(
+                "stage:" if stage_kind == "gates" else "dispatch:"
+            ):
+                return self._zero_mutation_block(
+                    state,
+                    "non-repair successor reservation has the wrong creation action",
+                )
+            return None
+        wanted = Counter(
+            self._successor_request_identity(request, action_key)
+            for request in requests
+        )
+        observed = Counter(
+            self._successor_child_identity(child)
+            for child in current
+        )
+        if not wanted or observed - wanted:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor reservation conflicts with its exact intended membership",
+            )
+        if observed == wanted and action_key in state.applied_action_keys:
+            if open_reservation:
+                return self._result(
+                    state,
+                    "noop",
+                    "complete non-repair successor reservation is already active",
+                    action_key=action_key,
+                )
+            return None
+        if not open_reservation:
+            return None
+        if (
+            action_key not in state.applied_action_keys
+            and metadata.last_action != action_key
+        ):
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor reservation lacks its canonical creation action",
+            )
+        missing = wanted - observed
+        missing_counts = Counter(missing)
+        missing_requests: list[ChildRequest] = []
+        for request in requests:
+            identity = self._successor_request_identity(request, action_key)
+            if missing_counts[identity]:
+                missing_requests.append(request)
+                missing_counts[identity] -= 1
+        try:
+            self.executor.create_children(
+                state.parent_identifier,
+                tuple(missing_requests),
+                metadata,
+                action_key=action_key,
+            )
+        except Exception:
+            pass
+
+        def exact_successor(current_state: object) -> bool:
+            if (
+                type(current_state) is not WorkflowState
+                or current_state.parent_identifier != state.parent_identifier
+                or current_state.metadata != metadata
+                or action_key not in current_state.applied_action_keys
+            ):
+                return False
+            exact_current = tuple(
+                child
+                for child in current_state.children
+                if (
+                    child.stage_ordinal == metadata.stage_ordinal
+                    and child.attempt == metadata.repair_round
+                )
+                or child.action_key == action_key
+            )
+            return Counter(
+                self._successor_child_identity(child)
+                for child in exact_current
+            ) == wanted
+
+        observed_state = self._reconcile_parent(
+            state.parent_identifier,
+            exact_successor,
+        )
+        if observed_state is None:
+            return self._uncertain(
+                state,
+                "non-repair successor reservation is not yet complete",
+                action_key=action_key,
+                mutation_count=1,
+            )
+        return self._result(
+            observed_state,
+            "dispatch",
+            "non-repair successor reservation converged",
+            created=tuple(
+                (request.target_key, request.phase)
+                for request in missing_requests
+            ),
+            action_key=action_key,
+            mutation_count=1,
+        )
+
     def _dispatch(
         self,
         state: WorkflowState,
@@ -3391,37 +3687,10 @@ class GenericWorkflow:
             authorizing_comment_uuid=authorizing_comment_uuid,
         )
 
-        def request_identity(request: ChildRequest) -> tuple[object, ...]:
-            return (
-                request.target_key,
-                request.repository_key,
-                request.suite_key,
-                request.phase,
-                request.stage_ordinal,
-                request.attempt,
-                key,
-                tuple(request.candidate_shas.items()),
-                "" if request.failure_bundle is None else request.failure_bundle.digest,
-                _failure_uuid_partition(request.failure_refs),
-                request.authorizing_comment_uuid,
-            )
-
-        def child_identity(child: WorkflowChild) -> tuple[object, ...]:
-            return (
-                child.target_key,
-                child.repository_key,
-                child.suite_key,
-                child.phase,
-                child.stage_ordinal,
-                child.attempt,
-                child.action_key,
-                tuple(child.creation_candidate_shas.items()),
-                child.failure_bundle_digest,
-                child.failure_evidence_uuids,
-                child.authorizing_comment_uuid,
-            )
-
-        wanted = Counter(request_identity(request) for request in requests)
+        wanted = Counter(
+            self._successor_request_identity(request, key)
+            for request in requests
+        )
 
         def relevant_repair_children(
             workflow_state: WorkflowState,
@@ -3440,7 +3709,7 @@ class GenericWorkflow:
 
         if repair:
             observed_successors = Counter(
-                child_identity(child)
+                self._successor_child_identity(child)
                 for child in relevant_repair_children(state)
             )
             if observed_successors:
@@ -3453,8 +3722,36 @@ class GenericWorkflow:
                     state,
                     "repair successor bundle identity conflicts with the complete failure bundle",
                 )
-        elif self._has_successor(state, requests):
-            return self._result(state, "noop", "an intended successor already exists")
+        else:
+            observed_successors = Counter(
+                self._successor_child_identity(child)
+                for child in state.children
+                if child.stage_ordinal == ordinal
+                and child.attempt == attempt
+                and child.phase != "repair"
+            )
+            if observed_successors:
+                if (
+                    observed_successors == wanted
+                    and key in state.applied_action_keys
+                ):
+                    return self._result(
+                        state,
+                        "noop",
+                        "non-repair successors already exist",
+                        action_key=key,
+                    )
+                return self._zero_mutation_block(
+                    state,
+                    "non-repair successor identity conflicts with its intended membership",
+                )
+            if self._has_successor(state, requests):
+                return self._result(
+                    state,
+                    "noop",
+                    "an intended historical successor already exists",
+                    action_key=key,
+                )
         if key in state.applied_action_keys:
             return self._result(state, "noop", "coordinator action already exists", action_key=key)
         metadata = self._metadata(
@@ -3486,18 +3783,18 @@ class GenericWorkflow:
                 return False
             if repair:
                 observed_successors = Counter(
-                    child_identity(child)
+                    self._successor_child_identity(child)
                     for child in relevant_repair_children(current)
                 )
                 return observed_successors == wanted
             observed_children = Counter(
-                child_identity(child)
+                self._successor_child_identity(child)
                 for child in current.children
+                if child.stage_ordinal == ordinal
+                and child.attempt == attempt
+                and child.phase != "repair"
             )
-            return all(
-                observed_children[identity] >= count
-                for identity, count in wanted.items()
-            )
+            return observed_children == wanted
 
         observed = self._reconcile_parent(
             state.parent_identifier,
@@ -3555,6 +3852,9 @@ class GenericWorkflow:
             return self._result(state, "noop", "parent is not active")
         if state.human_wait:
             return self._result(state, "wait", "parent is waiting for a human")
+        nonrepair_successor = self._reconcile_nonrepair_successor(state)
+        if nonrepair_successor is not None:
+            return nonrepair_successor
         repair_stage, repair_head_problem = self._current_repair_head_problem(state)
         if repair_head_problem is not None:
             return self._zero_mutation_block(state, repair_head_problem)
