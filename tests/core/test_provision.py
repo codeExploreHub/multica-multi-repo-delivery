@@ -827,6 +827,29 @@ class ProvisionerTests(unittest.TestCase):
         self.assertIn("cannot create a FailureBundle", watcher)
         self.assertIn("cannot dispatch repair", watcher)
 
+    def test_provisioned_workflow_watcher_contract_is_v2_control_project_only(self):
+        result = self.apply()
+        watcher_id = result.lock.resource_ids["agent"]["workflow-watcher"]
+        watcher = self.multica.agents[watcher_id].instructions
+
+        required_contract = (
+            "Only version-2 workflows are recoverable",
+            "Version-1 workflows are migration-block signals only",
+            "never rerun version-1 work",
+            "must not write metadata, status, Stage, or action history",
+            "first watched Project is the unique parent/control Project",
+            "Later watched Projects contain repository children only",
+            "ignore parent Issues in later watched Projects",
+            "at most one approved rerun of an existing current assignment",
+            "cannot create a FailureBundle",
+            "cannot dispatch repair",
+            "never implements",
+            "merges, or deploys",
+        )
+        for clause in required_contract:
+            with self.subTest(clause=clause):
+                self.assertIn(clause, watcher)
+
     def test_actions_follow_the_fixed_phase_order(self):
         result = self.provisioner.reconcile(
             self.manifest, FrameworkLock.empty(), apply=False, secret_lookup=no_secrets

@@ -504,10 +504,15 @@ class Provisioner:
                 f"{display} Workflow Watcher",
                 f"Performs bounded stalled-work recovery for {display}.",
                 (
-                    "Reread workflow state and perform at most one approved rerun of an "
-                    "existing current assignment. The Watcher cannot create a FailureBundle, "
-                    "cannot dispatch repair, and never implements, creates children, changes a "
-                    "repair attempt, merges, or deploys."
+                    "Only version-2 workflows are recoverable. Version-1 workflows are "
+                    "migration-block signals only: report the block, never rerun version-1 "
+                    "work, and must not write metadata, status, Stage, or action history. The "
+                    "first watched Project is the unique parent/control Project. Later watched "
+                    "Projects contain repository children only; ignore parent Issues in later "
+                    "watched Projects. Reread exact workflow state and perform at most one "
+                    "approved rerun of an existing current assignment. The Watcher cannot "
+                    "create a FailureBundle, cannot dispatch repair, and never implements, "
+                    "creates children, changes a repair attempt, merges, or deploys."
                 ),
                 bindings["workflow-watcher"],
                 environment["workflow-watcher"],

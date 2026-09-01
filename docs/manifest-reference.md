@@ -33,6 +33,15 @@ Command values are arrays, not shell strings. Paths must be absolute, normalized
 
 Development may enable automatic merge after quality gates. Production cannot. Deployment remains forbidden to the package in both environments.
 
+The generated Workflow Watcher treats the first watched Project as the only
+parent/control Project. Later watched Projects contain repository children;
+parent Issues found there are foreign and ignored. Only version-2 workflows
+are recoverable. A version-1 workflow is reported as an explicit migration
+block and receives no rerun or metadata, status, Stage, or action-history
+write from the Watcher. Every recovery remains bounded to at most one exact
+current assignment and grants no bundle, repair, merge, or deployment
+authority.
+
 Validate locally before external planning:
 
 ```bash
