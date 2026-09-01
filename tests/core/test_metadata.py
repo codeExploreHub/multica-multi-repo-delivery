@@ -216,7 +216,35 @@ class MetadataTests(unittest.TestCase):
             "granted_round": 3,
         }
         RepairAuthorization(**values)
-        invalid_urls = (
+        RepairAuthorization(
+            **{
+                **values,
+                "comment_url": f"https://[2001:db8::1]/comments/{comment_uuid}",
+            }
+        )
+        canonical_url = str(values["comment_url"])
+        raw_ascii_urls = tuple(
+            f"https://multica.example/issue{chr(code)}/comments/{comment_uuid}"
+            for code in (*range(0x21), 0x7F)
+        ) + tuple(
+            prefix + canonical_url
+            for prefix in (" ", "\t", "\r", "\n", "\x00")
+        ) + tuple(
+            canonical_url + suffix
+            for suffix in (" ", "\t", "\r", "\n", "\x00")
+        )
+        invalid_urls = raw_ascii_urls + (
+            "HTTPS://multica.example/comments/" + comment_uuid,
+            canonical_url + "?",
+            canonical_url + "#",
+            f"https://multica.example/com\tments/{comment_uuid}",
+            f"https://multica.example/com\rments/{comment_uuid}",
+            f"https://multica.example/com\nments/{comment_uuid}",
+            f"https://multica.example:/comments/{comment_uuid}",
+            f"https://[2001:db8::1]:/comments/{comment_uuid}",
+            f"https://multica.example/%/comments/{comment_uuid}",
+            f"https://multica.example/%0/comments/{comment_uuid}",
+            f"https://multica.example/%GG/comments/{comment_uuid}",
             f"https://multica.example:443/comments/{comment_uuid}",
             "https://multica.example/comments/"
             "00000000-0000-4000-8000-000000000099",

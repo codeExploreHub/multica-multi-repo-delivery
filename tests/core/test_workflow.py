@@ -1834,7 +1834,33 @@ class WorkflowValueValidationTests(unittest.TestCase):
             "PRO-201", "api", phase="review", comment_digit="1"
         )
         comment_uuid = reference.evidence_comment_uuid
-        invalid_urls = (
+        canonical_url = f"https://multica.example/comments/{comment_uuid}"
+        replace(
+            reference,
+            evidence_comment_url=f"https://[2001:db8::1]/comments/{comment_uuid}",
+        )
+        raw_ascii_urls = tuple(
+            f"https://multica.example/issue{chr(code)}/comments/{comment_uuid}"
+            for code in (*range(0x21), 0x7F)
+        ) + tuple(
+            prefix + canonical_url
+            for prefix in (" ", "\t", "\r", "\n", "\x00")
+        ) + tuple(
+            canonical_url + suffix
+            for suffix in (" ", "\t", "\r", "\n", "\x00")
+        )
+        invalid_urls = raw_ascii_urls + (
+            "HTTPS://multica.example/comments/" + comment_uuid,
+            canonical_url + "?",
+            canonical_url + "#",
+            f"https://multica.example/com\tments/{comment_uuid}",
+            f"https://multica.example/com\rments/{comment_uuid}",
+            f"https://multica.example/com\nments/{comment_uuid}",
+            f"https://multica.example:/comments/{comment_uuid}",
+            f"https://[2001:db8::1]:/comments/{comment_uuid}",
+            f"https://multica.example/%/comments/{comment_uuid}",
+            f"https://multica.example/%0/comments/{comment_uuid}",
+            f"https://multica.example/%GG/comments/{comment_uuid}",
             f"https://multica.example:443/comments/{comment_uuid}",
             "https://multica.example/comments/"
             "123e4567-e89b-42d3-a456-426614174002",
@@ -1925,17 +1951,49 @@ class WorkflowCompletionSchemaTests(unittest.TestCase):
     def test_phase_completion_evidence_url_is_canonically_bound_to_uuid(self):
         completion = completion_for("api", phase="review", result="pass")
         comment_uuid = completion.evidence_comment_uuid
+        canonical_url = (
+            "https://multica.example/issues/PRO-201/comments/" + comment_uuid
+        )
         canonical = replace(
             completion,
-            evidence_comment_url=(
-                "https://multica.example/issues/PRO-201/comments/"
-                + comment_uuid
-            ),
+            evidence_comment_url=canonical_url,
         )
         self.assertIsNone(
             _phase_completion_schema_problem(canonical, manifest=self.manifest)
         )
-        invalid_urls = (
+        self.assertIsNone(
+            _phase_completion_schema_problem(
+                replace(
+                    canonical,
+                    evidence_comment_url=(
+                        f"https://[2001:db8::1]/comments/{comment_uuid}"
+                    ),
+                ),
+                manifest=self.manifest,
+            )
+        )
+        raw_ascii_urls = tuple(
+            f"https://multica.example/issue{chr(code)}/comments/{comment_uuid}"
+            for code in (*range(0x21), 0x7F)
+        ) + tuple(
+            prefix + canonical_url
+            for prefix in (" ", "\t", "\r", "\n", "\x00")
+        ) + tuple(
+            canonical_url + suffix
+            for suffix in (" ", "\t", "\r", "\n", "\x00")
+        )
+        invalid_urls = raw_ascii_urls + (
+            "HTTPS://multica.example/comments/" + comment_uuid,
+            canonical_url + "?",
+            canonical_url + "#",
+            f"https://multica.example/com\tments/{comment_uuid}",
+            f"https://multica.example/com\rments/{comment_uuid}",
+            f"https://multica.example/com\nments/{comment_uuid}",
+            f"https://multica.example:/comments/{comment_uuid}",
+            f"https://[2001:db8::1]:/comments/{comment_uuid}",
+            f"https://multica.example/%/comments/{comment_uuid}",
+            f"https://multica.example/%0/comments/{comment_uuid}",
+            f"https://multica.example/%GG/comments/{comment_uuid}",
             f"https://multica.example:443/comments/{comment_uuid}",
             f"https://user@multica.example/comments/{comment_uuid}",
             f"https://user:pass@multica.example/comments/{comment_uuid}",

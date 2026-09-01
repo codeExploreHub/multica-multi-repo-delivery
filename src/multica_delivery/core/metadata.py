@@ -5,7 +5,7 @@ import json
 import re
 from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -18,6 +18,8 @@ _PHASE_RESULTS = frozenset({"pending", "pass", "fail", "blocked"})
 _RECOVERY_ACTIONS = frozenset({"noop", "rerun", "resume_parent", "block"})
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_RAW_ASCII_CONTROL_OR_SPACE = re.compile(r"[\x00-\x20\x7f]")
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 class MetadataError(ValueError):
@@ -39,6 +41,8 @@ def _canonical_comment_url(value: object, comment_uuid: object) -> bool:
         type(value) is not str
         or type(comment_uuid) is not str
         or _UUID.fullmatch(comment_uuid) is None
+        or _RAW_ASCII_CONTROL_OR_SPACE.search(value) is not None
+        or _INVALID_PERCENT_ESCAPE.search(value) is not None
     ):
         return False
     try:
@@ -48,6 +52,13 @@ def _canonical_comment_url(value: object, comment_uuid: object) -> bool:
     except (AttributeError, TypeError, ValueError):
         return False
     path = parsed.path
+    authority = parsed.netloc
+    if authority.startswith("["):
+        closing_bracket = authority.find("]")
+        if closing_bracket < 0 or authority[closing_bracket + 1 :]:
+            return False
+    elif ":" in authority:
+        return False
     return (
         parsed.scheme == "https"
         and bool(parsed.netloc)
@@ -57,6 +68,7 @@ def _canonical_comment_url(value: object, comment_uuid: object) -> bool:
         and port is None
         and not parsed.query
         and not parsed.fragment
+        and urlunsplit((parsed.scheme, authority, path, "", "")) == value
         and decoded_path == path
         and path.startswith("/")
         and "//" not in path
