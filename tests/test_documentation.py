@@ -99,6 +99,12 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("Round 3 requires a member-authored authorization", template)
         self.assertIn("exact current FailureBundle and digest", template)
         self.assertIn("exactly the next round", template)
+        self.assertIn(
+            'canonical closed JSON `{"bundle_digest":"<64-lowercase-hex>",'
+            '"granted_round":3}`',
+            template,
+        )
+        self.assertIn("authoritative comment body", template)
         self.assertIn("consumed once", template)
         self.assertIn("different bundle or later round", template)
 

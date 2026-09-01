@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from tempfile import TemporaryDirectory
+import json
 import unittest
 import uuid
 from unittest.mock import patch
@@ -110,6 +111,33 @@ def _cleanup_process_temporaries() -> None:
 
 def evidence_uuid(label: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://example.test/{label}"))
+
+
+def authorization_body(bundle_digest: str, granted_round: int = 3) -> str:
+    return json.dumps(
+        {"bundle_digest": bundle_digest, "granted_round": granted_round},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def authorizing_comment(
+    comment_uuid: str,
+    comment_url: str,
+    author_type: str,
+    content: str,
+) -> AuthorizingComment:
+    try:
+        return AuthorizingComment(
+            comment_uuid,
+            comment_url,
+            author_type,
+            content,
+        )
+    except TypeError:
+        result = AuthorizingComment(comment_uuid, comment_url, author_type)
+        object.__setattr__(result, "content", content)
+        return result
 
 
 def completion_for(
@@ -2121,6 +2149,8 @@ class TaskFourWorkflowFixture:
         authoritative_url: str | None = None,
         metadata_digest: str | None = None,
         add_authoritative_comment: bool = True,
+        comment_content=None,
+        omit_authoritative_content: bool = False,
     ) -> FailureBundle:
         state = self.add_failed_review_state()
         self.store.authorizing_comments.clear()
@@ -2146,11 +2176,19 @@ class TaskFourWorkflowFixture:
             ),
         )
         if add_authoritative_comment:
-            authoritative = AuthorizingComment(
+            content = (
+                authorization_body(bundle.digest)
+                if comment_content is None
+                else comment_content(bundle)
+            )
+            authoritative = authorizing_comment(
                 comment_uuid,
                 comment_url,
                 author_type,
+                content,
             )
+            if omit_authoritative_content:
+                object.__delattr__(authoritative, "content")
             if authoritative_url is not None:
                 object.__setattr__(authoritative, "comment_url", authoritative_url)
             self.store.authorizing_comments[("PRO-200", comment_uuid)] = authoritative
@@ -2205,6 +2243,42 @@ class WorkflowCompletionImmutabilityTests(TaskFourWorkflowFixture, unittest.Test
                     self.assertFalse(
                         any(event[0] == "rerun" for event in self.store.events)
                     )
+
+    def test_watcher_rejects_round_three_comment_body_drift(self):
+        self.dispatch_authorized_repair()
+        state = self.store.states["PRO-200"]
+        assert isinstance(state.metadata, ParentMetadata)
+        current = tuple(
+            child
+            for child in state.children
+            if child.phase == "repair"
+            and child.stage_ordinal == state.metadata.stage_ordinal
+        )
+        comment_uuid = current[0].authorizing_comment_uuid
+        comment = self.store.authorizing_comments[("PRO-200", comment_uuid)]
+        object.__setattr__(comment, "content", authorization_body("f" * 64))
+        stalled = replace(
+            state,
+            snapshot=replace(
+                state.snapshot,
+                stalled=True,
+                stalled_repository="api",
+            ),
+            children=tuple(
+                replace(child, active=False) if child in current else child
+                for child in state.children
+            ),
+            active_work=False,
+        )
+        self.store.states["PRO-200"] = stalled
+        self.store.activate_on_rerun = True
+        self.store.events.clear()
+
+        result = self.workflow.recover_stalled_parent("PRO-200")
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "rerun" for event in self.store.events))
 
     def test_completed_repair_cannot_submit_a_second_replacement_sha(self):
         bundle = self.dispatch_authorized_repair()
@@ -2445,6 +2519,74 @@ class WorkflowPullRequestDriftTests(TaskFourWorkflowFixture, unittest.TestCase):
 
 
 class WorkflowRepairAuthorizationTests(TaskFourWorkflowFixture, unittest.TestCase):
+    def test_member_authorization_requires_exact_canonical_comment_body(self):
+        malformed = {
+            "missing body": {"omit_authoritative_content": True},
+            "missing key": {
+                "comment_content": lambda bundle: json.dumps(
+                    {"bundle_digest": bundle.digest},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+            "extra key": {
+                "comment_content": lambda bundle: json.dumps(
+                    {
+                        "bundle_digest": bundle.digest,
+                        "granted_round": 3,
+                        "scope": "repair",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+            "noncanonical": {
+                "comment_content": lambda bundle: json.dumps(
+                    {"bundle_digest": bundle.digest, "granted_round": 3}
+                )
+            },
+            "duplicate key": {
+                "comment_content": lambda bundle: (
+                    '{"bundle_digest":"'
+                    + bundle.digest
+                    + '","bundle_digest":"'
+                    + bundle.digest
+                    + '","granted_round":3}'
+                )
+            },
+            "invalid json": {"comment_content": lambda bundle: "{"},
+            "wrong digest": {
+                "comment_content": lambda bundle: authorization_body("f" * 64)
+            },
+            "wrong round": {
+                "comment_content": lambda bundle: authorization_body(
+                    bundle.digest,
+                    2,
+                )
+            },
+            "boolean round": {
+                "comment_content": lambda bundle: (
+                    '{"bundle_digest":"'
+                    + bundle.digest
+                    + '","granted_round":true}'
+                )
+            },
+        }
+        for label, options in malformed.items():
+            with self.subTest(label=label):
+                self.authorize_extra_round(**options)
+                before = self.store.states["PRO-200"]
+                self.store.events.clear()
+
+                result = self.workflow.resume_parent("PRO-200")
+
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.mutation_count, 0)
+                self.assertEqual(self.store.states["PRO-200"], before)
+                self.assertFalse(
+                    any(event[0] == "create" for event in self.store.events)
+                )
+
     def test_parent_drift_after_authorization_comment_blocks_repair_dispatch(self):
         self.authorize_extra_round()
         before = self.store.states["PRO-200"]
@@ -2604,7 +2746,6 @@ class WorkflowRepairAuthorizationTests(TaskFourWorkflowFixture, unittest.TestCas
         self.assertEqual(result.next_action, "block")
         self.assertEqual(result.mutation_count, 0)
         self.assertFalse(any(event[0] == "create" for event in self.store.events))
-
 
 class WorkflowLegacyCompletionTests(TaskFourWorkflowFixture, unittest.TestCase):
     def test_completed_version_one_parent_remains_readable_without_migration(self):
@@ -2875,6 +3016,18 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         )
         seeded = self.store.states["PRO-200"]
         assert isinstance(seeded.metadata, ParentMetadata)
+        if repair_round == 3:
+            authorization_url = (
+                f"https://example.test/comments/{authorization_uuid}"
+            )
+            self.store.authorizing_comments[
+                ("PRO-200", authorization_uuid)
+            ] = authorizing_comment(
+                authorization_uuid,
+                authorization_url,
+                "member",
+                authorization_body(bundle.digest, repair_round),
+            )
         completion_actions: dict[str, str] = {}
         incremental = dict(source)
         for repository in sorted(repositories):
@@ -3637,10 +3790,11 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             )
             self.store.authorizing_comments[
                 ("PRO-200", authorization_uuid)
-            ] = AuthorizingComment(
+            ] = authorizing_comment(
                 authorization_uuid,
                 authorization_url,
                 "member",
+                authorization_body(bundle.digest, repair_round),
             )
         self.store.states["PRO-200"] = replace(
             state,
@@ -3655,6 +3809,26 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             attempt=repair_round,
             sha=REPLACEMENT_SHA,
             failure_bundle_digest=bundle.digest,
+        )
+
+    def test_round_three_completion_transition_revalidates_comment_body(self):
+        completion = self.seed_active_parallel_repair(3)
+        state = self.store.states["PRO-200"]
+        current = tuple(child for child in state.children if child.phase == "repair")
+        comment_uuid = current[0].authorizing_comment_uuid
+        comment = self.store.authorizing_comments[("PRO-200", comment_uuid)]
+        object.__setattr__(comment, "content", authorization_body("f" * 64))
+        self.store.events.clear()
+
+        result = self.workflow.record_phase_completion(completion)
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(
+            any(
+                event[0] in {"write-completion", "done"}
+                for event in self.store.events
+            )
         )
 
     def seed_repair_dispatch_source(
@@ -3721,7 +3895,12 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             )
             self.store.authorizing_comments[
                 ("PRO-200", comment_uuid)
-            ] = AuthorizingComment(comment_uuid, comment_url, "member")
+            ] = authorizing_comment(
+                comment_uuid,
+                comment_url,
+                "member",
+                authorization_body(bundle.digest, repair_round),
+            )
         self.store.states["PRO-200"] = replace(
             state,
             metadata=replace(
@@ -3732,6 +3911,27 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         )
         self.store.events.clear()
         return bundle
+
+    def test_partial_round_three_reservation_revalidates_comment_body(self):
+        self.seed_repair_dispatch_source(3)
+        self.store.partial_create_limits = [1]
+        first = self.workflow.resume_parent("PRO-200")
+        self.assertEqual(first.next_action, "uncertain", first.reason)
+        state = self.store.states["PRO-200"]
+        current = tuple(child for child in state.children if child.phase == "repair")
+        self.assertEqual(len(current), 1)
+        comment_uuid = current[0].authorizing_comment_uuid
+        comment = self.store.authorizing_comments[("PRO-200", comment_uuid)]
+        object.__setattr__(comment, "content", authorization_body("f" * 64))
+        self.store.events.clear()
+        before = self.store.states["PRO-200"]
+
+        retry = self.workflow.resume_parent("PRO-200")
+
+        self.assertEqual(retry.next_action, "block", retry.reason)
+        self.assertEqual(retry.mutation_count, 0)
+        self.assertEqual(self.store.states["PRO-200"], before)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
 
     def test_partial_repair_successor_recreates_only_missing_owner(self):
         for repair_round in (1, 2, 3):
@@ -5395,6 +5595,15 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                 )
                 seeded = self.store.states["PRO-200"]
                 assert isinstance(seeded.metadata, ParentMetadata)
+                if repair_round == 3:
+                    self.store.authorizing_comments[
+                        ("PRO-200", authorization_uuid)
+                    ] = authorizing_comment(
+                        authorization_uuid,
+                        f"https://example.test/comments/{authorization_uuid}",
+                        "member",
+                        authorization_body(bundle.digest, repair_round),
+                    )
                 self.store.states["PRO-200"] = replace(
                     seeded,
                     metadata=replace(seeded.metadata, last_action=action_key),
@@ -5940,10 +6149,11 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             if repair_round == 3:
                 self.store.authorizing_comments[
                     ("PRO-200", authorization_uuid)
-                ] = AuthorizingComment(
+                ] = authorizing_comment(
                     authorization_uuid,
                     f"https://example.test/comments/{authorization_uuid}",
                     "member",
+                    authorization_body(bundle.digest, repair_round),
                 )
             stored = self.store.states["PRO-200"]
             current = tuple(

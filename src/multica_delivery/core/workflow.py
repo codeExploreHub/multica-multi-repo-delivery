@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 import hashlib
+import json
 import re
 from types import MappingProxyType
 from typing import Protocol
@@ -40,6 +41,7 @@ from .metadata import (
     LegacyParentMetadataV1,
     MetadataError,
     ParentMetadata,
+    RepairAuthorization,
     _canonical_comment_url,
     canonical_json,
 )
@@ -820,14 +822,57 @@ class AuthorizingComment:
     comment_uuid: str
     comment_url: str
     author_type: str
+    content: str
 
     def __post_init__(self) -> None:
         if (
             not _canonical_uuid(self.comment_uuid)
             or not _canonical_comment_url(self.comment_url, self.comment_uuid)
             or not _exact_stable(self.author_type)
+            or type(self.content) is not str
         ):
             raise WorkflowError("authorizing comment is malformed")
+
+
+def _repair_authorization_comment_matches(
+    comment: object,
+    *,
+    comment_uuid: str,
+    bundle_digest: str,
+    granted_round: int,
+    authorization: RepairAuthorization | None = None,
+) -> bool:
+    if (
+        type(comment) is not AuthorizingComment
+        or comment.comment_uuid != comment_uuid
+        or comment.author_type != "member"
+        or not _canonical_comment_url(comment.comment_url, comment_uuid)
+        or not _valid_digest(bundle_digest)
+        or type(granted_round) is not int
+        or granted_round < 1
+        or (
+            authorization is not None
+            and (
+                authorization.comment_uuid != comment_uuid
+                or authorization.comment_url != comment.comment_url
+                or authorization.bundle_digest != bundle_digest
+                or authorization.granted_round != granted_round
+            )
+        )
+    ):
+        return False
+    try:
+        content = json.loads(comment.content)
+    except (AttributeError, json.JSONDecodeError, TypeError):
+        return False
+    return (
+        type(content) is dict
+        and set(content) == {"bundle_digest", "granted_round"}
+        and content.get("bundle_digest") == bundle_digest
+        and type(content.get("granted_round")) is int
+        and content["granted_round"] == granted_round
+        and comment.content == canonical_json(content)
+    )
 
 
 class ScopeResolver(Protocol):
@@ -3338,11 +3383,12 @@ class GenericWorkflow:
             )
         except Exception as error:
             raise WorkflowError("repair authorization comment could not be reread") from error
-        if (
-            type(comment) is not AuthorizingComment
-            or comment.comment_uuid != authorization.comment_uuid
-            or comment.comment_url != authorization.comment_url
-            or comment.author_type != "member"
+        if not _repair_authorization_comment_matches(
+            comment,
+            comment_uuid=authorization.comment_uuid,
+            bundle_digest=bundle.digest,
+            granted_round=next_round,
+            authorization=authorization,
         ):
             raise WorkflowError("repair authorization comment is not authoritative")
         return next_round, False
@@ -4151,12 +4197,12 @@ class GenericWorkflow:
                         state,
                         "repair authorization changed after parent fan-in",
                     )
-                if (
-                    authorization is None
-                    or type(comment) is not AuthorizingComment
-                    or comment.comment_uuid != authorization.comment_uuid
-                    or comment.comment_url != authorization.comment_url
-                    or comment.author_type != "member"
+                if authorization is None or not _repair_authorization_comment_matches(
+                    comment,
+                    comment_uuid=authorizing_comment_uuid,
+                    bundle_digest=bundle.digest,
+                    granted_round=decision.next_attempt,
+                    authorization=authorization,
                 ):
                     return self._zero_mutation_block(
                         state,
@@ -4492,9 +4538,12 @@ class GenericWorkflow:
                 return object()
             return (
                 comment
-                if type(comment) is AuthorizingComment
-                and comment.comment_uuid == authorization_uuid
-                and comment.author_type == "member"
+                if _repair_authorization_comment_matches(
+                    comment,
+                    comment_uuid=authorization_uuid,
+                    bundle_digest=bundle.digest,
+                    granted_round=metadata.repair_round,
+                )
                 else object()
             )
 
@@ -5099,9 +5148,12 @@ class GenericWorkflow:
             return "member-authorized Repair comment is unavailable"
         if (
             comments[0] != comments[1]
-            or type(comments[0]) is not AuthorizingComment
-            or comments[0].comment_uuid != child.authorizing_comment_uuid
-            or comments[0].author_type != "member"
+            or not _repair_authorization_comment_matches(
+                comments[0],
+                comment_uuid=child.authorizing_comment_uuid,
+                bundle_digest=child.failure_bundle_digest,
+                granted_round=child.attempt,
+            )
         ):
             return "member-authorized Repair comment is not authoritative"
         return None
@@ -5375,9 +5427,12 @@ class GenericWorkflow:
                 return object()
             return (
                 observed
-                if type(observed) is AuthorizingComment
-                and observed.comment_uuid == child.authorizing_comment_uuid
-                and observed.author_type == "member"
+                if _repair_authorization_comment_matches(
+                    observed,
+                    comment_uuid=child.authorizing_comment_uuid,
+                    bundle_digest=child.failure_bundle_digest,
+                    granted_round=child.attempt,
+                )
                 else object()
             )
 
@@ -5883,6 +5938,32 @@ class GenericWorkflow:
             or source_bundle.digest != replayed.failure_bundle_digest
         ):
             return None
+        if replayed.attempt <= self.manifest.policy.max_repair_attempts:
+            if replayed.authorizing_comment_uuid:
+                return None
+        else:
+            if not replayed.authorizing_comment_uuid:
+                return None
+            try:
+                comments = tuple(
+                    self.snapshot_reader.read_authorizing_comment(
+                        state.parent_identifier,
+                        replayed.authorizing_comment_uuid,
+                    )
+                    for _ in range(2)
+                )
+            except Exception:
+                return None
+            if (
+                comments[0] != comments[1]
+                or not _repair_authorization_comment_matches(
+                    comments[0],
+                    comment_uuid=replayed.authorizing_comment_uuid,
+                    bundle_digest=source_bundle.digest,
+                    granted_round=replayed.attempt,
+                )
+            ):
+                return None
         expected_partitions = {
             repository: _failure_uuid_partition(
                 source_bundle.for_repository(repository)
@@ -6090,6 +6171,37 @@ class GenericWorkflow:
                 state,
                 completion_problem or "phase completion child is missing",
             )
+        def read_authorization() -> AuthorizingComment | None | object:
+            if completion.phase != "repair":
+                return None
+            if child.attempt <= self.manifest.policy.max_repair_attempts:
+                return None if not child.authorizing_comment_uuid else object()
+            if not child.authorizing_comment_uuid:
+                return object()
+            try:
+                comment = self.snapshot_reader.read_authorizing_comment(
+                    state.parent_identifier,
+                    child.authorizing_comment_uuid,
+                )
+            except Exception:
+                return object()
+            return (
+                comment
+                if _repair_authorization_comment_matches(
+                    comment,
+                    comment_uuid=child.authorizing_comment_uuid,
+                    bundle_digest=child.failure_bundle_digest,
+                    granted_round=child.attempt,
+                )
+                else object()
+            )
+
+        authorization = read_authorization()
+        if type(authorization) is object:
+            return self._zero_mutation_block(
+                state,
+                "phase completion repair authorization is not authoritative",
+            )
         previous_candidate_sha = state.snapshot.candidate_shas.get(
             completion.repository_key
         )
@@ -6136,6 +6248,14 @@ class GenericWorkflow:
             merge_plan=merge_plan,
             merge_state=merge_state,
         )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        if read_authorization() != authorization:
+            return self._zero_mutation_block(
+                state,
+                "phase completion repair authorization changed after parent fan-in",
+            )
         fan_in_problem = self._parent_fan_in_still_current(state)
         if fan_in_problem is not None:
             return fan_in_problem
