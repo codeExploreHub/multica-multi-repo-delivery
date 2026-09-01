@@ -204,6 +204,34 @@ class MetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(MetadataError, "unknown fields"):
             decode_parent_metadata(canonical_json(value))
 
+    def test_repair_authorization_url_is_canonically_bound_to_uuid(self):
+        comment_uuid = "00000000-0000-4000-8000-000000000013"
+        values = {
+            "comment_uuid": comment_uuid,
+            "comment_url": (
+                "https://multica.example/issues/PRO-200/comments/"
+                + comment_uuid
+            ),
+            "bundle_digest": "c" * 64,
+            "granted_round": 3,
+        }
+        RepairAuthorization(**values)
+        invalid_urls = (
+            f"https://multica.example:443/comments/{comment_uuid}",
+            "https://multica.example/comments/"
+            "00000000-0000-4000-8000-000000000099",
+            f"https://multica.example/authorization/{comment_uuid}",
+            f"https://multica.example/comments%2F{comment_uuid}",
+            f"https://multica.example/%2e%2e/comments/{comment_uuid}",
+            f"https://multica.example/../comments/{comment_uuid}",
+            f"https://multica.example//comments/{comment_uuid}",
+            f"https://multica.example/comments/{comment_uuid}/extra",
+        )
+        for comment_url in invalid_urls:
+            with self.subTest(comment_url=comment_url):
+                with self.assertRaises(MetadataError):
+                    RepairAuthorization(**{**values, "comment_url": comment_url})
+
     def test_repository_bearing_fields_must_match_the_affected_set(self):
         with self.assertRaisesRegex(MetadataError, "candidate_shas"):
             ParentMetadata(affected_repositories=("api",), candidate_shas={"web": "a" * 40})

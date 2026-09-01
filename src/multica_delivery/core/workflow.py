@@ -36,7 +36,13 @@ from ..adapters.exact_sha import (
     ExactShaVerification,
     LocalExactShaCommandRunner,
 )
-from .metadata import LegacyParentMetadataV1, MetadataError, ParentMetadata, canonical_json
+from .metadata import (
+    LegacyParentMetadataV1,
+    MetadataError,
+    ParentMetadata,
+    _canonical_comment_url,
+    canonical_json,
+)
 from .model import DeliveryManifest, validate_policy_authority
 from ..adapters.processes import OwnedProcess, ProcessManager, ProcessOwnershipError, ProcessRun
 from .topology import TopologyError, merge_order
@@ -146,21 +152,6 @@ def _exact_repository_tuple(value: object, field_name: str, *, nonempty: bool = 
     return tuple(sorted(value))
 
 
-def _https_evidence_url(value: object) -> bool:
-    if type(value) is not str:
-        return False
-    parsed = urlsplit(value)
-    return (
-        parsed.scheme == "https"
-        and bool(parsed.netloc)
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.query
-        and not parsed.fragment
-        and bool(parsed.path)
-    )
-
-
 def _phase_completion_schema_problem(
     completion: object,
     *,
@@ -192,16 +183,9 @@ def _phase_completion_schema_problem(
         ):
             return "phase completion is malformed"
 
-        evidence_url = urlsplit(completion.evidence_comment_url)
-        if (
-            type(completion.evidence_comment_url) is not str
-            or evidence_url.scheme != "https"
-            or not evidence_url.netloc
-            or evidence_url.username is not None
-            or evidence_url.password is not None
-            or evidence_url.query
-            or evidence_url.fragment
-            or not evidence_url.path
+        if not _canonical_comment_url(
+            completion.evidence_comment_url,
+            completion.evidence_comment_uuid,
         ):
             return "phase completion evidence is malformed"
 
@@ -336,7 +320,10 @@ class FailureEvidenceRef:
             or type(self.repair_round) is not int
             or self.repair_round < 0
             or not _canonical_uuid(self.evidence_comment_uuid)
-            or not _https_evidence_url(self.evidence_comment_url)
+            or not _canonical_comment_url(
+                self.evidence_comment_url,
+                self.evidence_comment_uuid,
+            )
             or not _exact_stable(self.suite_key, empty=True)
             or (self.phase == "integration_qa") != bool(self.suite_key)
         ):
@@ -561,7 +548,13 @@ class WorkflowChild:
         if (
             type(self.phase_result) is not str
             or self.phase_result not in _PHASE_RESULTS | {""}
-            or (self.evidence_comment_url and not _https_evidence_url(self.evidence_comment_url))
+            or (
+                self.evidence_comment_url
+                and not _canonical_comment_url(
+                    self.evidence_comment_url,
+                    self.evidence_comment_uuid,
+                )
+            )
             or (self.failure_bundle_digest and not _valid_digest(self.failure_bundle_digest))
             or type(self.failure_evidence_uuids) is not tuple
             or any(not _canonical_uuid(item) for item in self.failure_evidence_uuids)
@@ -831,7 +824,7 @@ class AuthorizingComment:
     def __post_init__(self) -> None:
         if (
             not _canonical_uuid(self.comment_uuid)
-            or not _https_evidence_url(self.comment_url)
+            or not _canonical_comment_url(self.comment_url, self.comment_uuid)
             or not _exact_stable(self.author_type)
         ):
             raise WorkflowError("authorizing comment is malformed")
@@ -1823,7 +1816,10 @@ class GenericWorkflow:
                     or type(child.evidence_comment_url) is not str
                     or (
                         child.evidence_comment_url
-                        and not _https_evidence_url(child.evidence_comment_url)
+                        and not _canonical_comment_url(
+                            child.evidence_comment_url,
+                            child.evidence_comment_uuid,
+                        )
                     )
                     or type(child.responsible_repositories) is not tuple
                     or any(
@@ -2207,7 +2203,10 @@ class GenericWorkflow:
                 or child.phase_result not in _PHASE_RESULTS
                 or dict(child.creation_candidate_shas) != dict(source)
                 or not _canonical_uuid(child.evidence_comment_uuid)
-                or not _https_evidence_url(child.evidence_comment_url)
+                or not _canonical_comment_url(
+                    child.evidence_comment_url,
+                    child.evidence_comment_uuid,
+                )
                 or child.evidence_comment_uuid in evidence_uuids
             ):
                 return None
@@ -3214,7 +3213,10 @@ class GenericWorkflow:
                 != dict(state.snapshot.candidate_shas)
                 or child.phase_result not in _PHASE_RESULTS
                 or not _canonical_uuid(child.evidence_comment_uuid)
-                or not _https_evidence_url(child.evidence_comment_url)
+                or not _canonical_comment_url(
+                    child.evidence_comment_url,
+                    child.evidence_comment_uuid,
+                )
                 or child.evidence_comment_uuid in evidence_uuids
             ):
                 raise WorkflowError("repair bundle source Stage evidence is incomplete")
@@ -3453,7 +3455,10 @@ class GenericWorkflow:
                 or child.active
                 or child.phase_result not in _PHASE_RESULTS
                 or not _canonical_uuid(child.evidence_comment_uuid)
-                or not _https_evidence_url(child.evidence_comment_url)
+                or not _canonical_comment_url(
+                    child.evidence_comment_url,
+                    child.evidence_comment_uuid,
+                )
                 or child.evidence_comment_uuid in evidence_uuids
             ):
                 return None
@@ -4960,7 +4965,10 @@ class GenericWorkflow:
                 or sibling.status not in _TERMINAL_CHILD_STATUSES
                 or sibling.phase_result != "pass"
                 or not _canonical_uuid(sibling.evidence_comment_uuid)
-                or not _https_evidence_url(sibling.evidence_comment_url)
+                or not _canonical_comment_url(
+                    sibling.evidence_comment_url,
+                    sibling.evidence_comment_uuid,
+                )
                 or sibling.target_key != sibling.repository_key
                 or sibling.suite_key
             ):
@@ -5150,13 +5158,12 @@ class GenericWorkflow:
             observed_uuid = str(uuid.UUID(completion.evidence_comment_uuid))
         except (ValueError, AttributeError, TypeError):
             return "phase completion evidence UUID is malformed", None
-        evidence_url = urlsplit(completion.evidence_comment_url)
         if (
             observed_uuid != completion.evidence_comment_uuid
-            or evidence_url.scheme != "https"
-            or not evidence_url.netloc
-            or evidence_url.username is not None
-            or evidence_url.password is not None
+            or not _canonical_comment_url(
+                completion.evidence_comment_url,
+                completion.evidence_comment_uuid,
+            )
         ):
             return "phase completion evidence is malformed", None
         repository = self.manifest.repositories[completion.repository_key]
@@ -5927,7 +5934,10 @@ class GenericWorkflow:
                 child.status != "done"
                 or child.phase_result != "pass"
                 or not _canonical_uuid(child.evidence_comment_uuid)
-                or not _https_evidence_url(child.evidence_comment_url)
+                or not _canonical_comment_url(
+                    child.evidence_comment_url,
+                    child.evidence_comment_uuid,
+                )
             ):
                 return None
             repository = child.repository_key

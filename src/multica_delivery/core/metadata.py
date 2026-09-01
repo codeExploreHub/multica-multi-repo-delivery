@@ -5,7 +5,7 @@ import json
 import re
 from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlsplit
 
 
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -30,6 +30,40 @@ def canonical_json(value: object) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError) as error:
         raise MetadataError(f"value is not canonical JSON: {error}") from error
+
+
+def _canonical_comment_url(value: object, comment_uuid: object) -> bool:
+    """Validate a product-neutral HTTPS comment URL bound to one UUID."""
+
+    if (
+        type(value) is not str
+        or type(comment_uuid) is not str
+        or _UUID.fullmatch(comment_uuid) is None
+    ):
+        return False
+    try:
+        parsed = urlsplit(value)
+        decoded_path = unquote(parsed.path)
+        port = parsed.port
+    except (AttributeError, TypeError, ValueError):
+        return False
+    path = parsed.path
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.netloc)
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+        and not parsed.query
+        and not parsed.fragment
+        and decoded_path == path
+        and path.startswith("/")
+        and "//" not in path
+        and "\\" not in path
+        and all(segment not in {"", ".", ".."} for segment in path[1:].split("/"))
+        and path.endswith(f"/comments/{comment_uuid}")
+    )
 
 
 def _frozen_mapping(value: Mapping[str, str], field_name: str, *, sha_values: bool = False) -> Mapping[str, str]:
@@ -151,19 +185,8 @@ class RepairAuthorization:
     def __post_init__(self) -> None:
         if not isinstance(self.comment_uuid, str) or not _UUID.fullmatch(self.comment_uuid):
             raise MetadataError("comment_uuid must be a canonical UUID")
-        if not isinstance(self.comment_url, str):
-            raise MetadataError("comment_url must be an HTTPS URL")
-        parsed = urlparse(self.comment_url)
-        if (
-            parsed.scheme != "https"
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or not parsed.path
-        ):
-            raise MetadataError("comment_url must be an HTTPS URL")
+        if not _canonical_comment_url(self.comment_url, self.comment_uuid):
+            raise MetadataError("comment_url must be a canonical HTTPS comment URL")
         if not isinstance(self.bundle_digest, str) or not _DIGEST.fullmatch(self.bundle_digest):
             raise MetadataError("bundle_digest must be a lowercase 64-hex digest")
         if not isinstance(self.granted_round, int) or isinstance(self.granted_round, bool) or self.granted_round < 0:
