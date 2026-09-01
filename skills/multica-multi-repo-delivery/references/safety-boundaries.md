@@ -28,3 +28,9 @@ A Multica apply plan never authorizes:
 Separate authority does not mean blanket refusal. When the current full-hash Multica apply is explicitly approved, execute that exact action, report its result, and stop before any unapproved adjacent category.
 
 Production manifests forbid automatic merge. Deployment remains external and human-triggered in every environment.
+
+## Migration boundary
+
+A reviewed `0.1.0 -> 0.2.0` migration plan may update installed framework files and Multica Agent instructions. It cannot mutate Issues, adopt PR SHAs, merge, push, tag, release, or deploy. Apply still requires the current fresh plan's complete 64-character hash; migration approval cannot be reused for an adjacent action.
+
+Core/plan-parent alone performs complete Gate Stage fan-in and produces the canonical FailureBundle. Delivery Lead validates and uses that exact bundle without reconstruction and is the sole Stage/child executor. Reviewer and QA stop at verdict evidence; Engineers require a current bundle-bound repair child and every assigned failure partition; the Watcher cannot create a bundle or dispatch repair.

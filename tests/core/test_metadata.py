@@ -4,10 +4,12 @@ import unittest
 
 from multica_delivery.core.metadata import (
     ChildMetadata,
+    LegacyParentMetadataV1,
     MetadataError,
     ParentMetadata,
     PhaseMetadata,
     PullRequestMetadata,
+    RepairAuthorization,
     RecoveryMetadata,
     canonical_json,
     decode_child_metadata,
@@ -40,22 +42,24 @@ class MetadataTests(unittest.TestCase):
             ParentMetadata(
                 affected_repositories=("api", "web"),
                 repository_dag={"api": (), "web": ("api",)},
-                attempt=1,
+                repair_round=1,
                 last_action="dispatch",
                 merge_state="pending",
                 candidate_shas={"api": "a" * 40, "web": "b" * 40},
             )
         )
         self.assertEqual(encoded, canonical_json(json.loads(encoded)))
-        self.assertEqual(decode_parent_metadata(encoded).attempt, 1)
+        self.assertEqual(decode_parent_metadata(encoded).repair_round, 1)
 
     def test_decode_rejects_unknown_fields(self):
         with self.assertRaisesRegex(MetadataError, "unknown fields"):
             decode_parent_metadata('{"attempt":1,"surprise":true}')
 
     def test_decode_rejects_missing_fields(self):
+        value = json.loads(encode_parent_metadata(ParentMetadata()))
+        del value["last_action"]
         with self.assertRaisesRegex(MetadataError, "missing fields"):
-            decode_parent_metadata('{"attempt":1}')
+            decode_parent_metadata(canonical_json(value))
 
     def test_decode_rejects_invalid_sha_and_non_object(self):
         encoded = encode_parent_metadata(
@@ -106,9 +110,155 @@ class MetadataTests(unittest.TestCase):
                 repository_dag={"api": ("web",), "web": ("api",)},
             )
 
-    def test_attempt_is_limited_to_the_two_repair_attempt_budget(self):
-        with self.assertRaisesRegex(MetadataError, "attempt"):
-            ParentMetadata(attempt=3)
+    def test_version_two_metadata_separates_round_from_automatic_budget(self):
+        authorization = RepairAuthorization(
+            comment_uuid="00000000-0000-4000-8000-000000000011",
+            comment_url="https://multica.example/comments/00000000-0000-4000-8000-000000000011",
+            bundle_digest="a" * 64,
+            granted_round=3,
+        )
+        metadata = ParentMetadata(
+            workflow_version=2,
+            metadata_version=2,
+            instance_key="demo",
+            affected_repositories=("api",),
+            repository_dag={"api": ()},
+            repair_round=2,
+            automatic_repairs_used=2,
+            repair_authorization=authorization,
+        )
+        observed = decode_parent_metadata(encode_parent_metadata(metadata))
+        self.assertEqual(observed, metadata)
+
+    def test_human_authorization_must_grant_exactly_the_next_round(self):
+        with self.assertRaisesRegex(MetadataError, "next repair round"):
+            ParentMetadata(
+                workflow_version=2,
+                metadata_version=2,
+                instance_key="demo",
+                affected_repositories=("api",),
+                repository_dag={"api": ()},
+                repair_round=2,
+                automatic_repairs_used=2,
+                repair_authorization=RepairAuthorization(
+                    "00000000-0000-4000-8000-000000000012",
+                    "https://multica.example/comments/00000000-0000-4000-8000-000000000012",
+                    "b" * 64,
+                    4,
+                ),
+            )
+
+    def test_completed_version_one_metadata_remains_decodable(self):
+        legacy = decode_parent_metadata(
+            '{"affected_repositories":[],"attempt":2,"candidate_shas":{},'
+            '"contract_hashes":{},"instance_key":"demo","last_action":"dispatch",'
+            '"merge_plan":[],"merge_state":"blocked","metadata_version":1,'
+            '"repository_dag":{},"stage_ordinal":6,"workflow_version":1}'
+        )
+        self.assertIsInstance(legacy, LegacyParentMetadataV1)
+        self.assertEqual(legacy.attempt, 2)
+
+    def test_repair_authorization_rejects_noncanonical_values_and_early_rounds(self):
+        cases = (
+            ("noncanonical UUID", {"comment_uuid": "00000000000040008000000000000013"}),
+            ("non-HTTPS URL", {"comment_url": "http://multica.example/comments/13"}),
+            ("URL username", {"comment_url": "https://user@multica.example/comments/13"}),
+            ("URL password", {"comment_url": "https://user:pass@multica.example/comments/13"}),
+            ("URL query", {"comment_url": "https://multica.example/comments/13?raw=1"}),
+            ("URL fragment", {"comment_url": "https://multica.example/comments/13#raw"}),
+            ("URL empty path", {"comment_url": "https://multica.example"}),
+            ("non-64-hex digest", {"bundle_digest": "a" * 63}),
+            ("negative round", {"granted_round": -1}),
+        )
+        for label, changes in cases:
+            with self.subTest(label=label):
+                values = {
+                    "comment_uuid": "00000000-0000-4000-8000-000000000013",
+                    "comment_url": "https://multica.example/comments/00000000-0000-4000-8000-000000000013",
+                    "bundle_digest": "c" * 64,
+                    "granted_round": 3,
+                }
+                values.update(changes)
+                with self.assertRaises(MetadataError):
+                    RepairAuthorization(**values)
+        with self.assertRaisesRegex(MetadataError, "automatic_repairs_used"):
+            ParentMetadata(repair_round=3, automatic_repairs_used=3)
+        for repair_round, automatic_repairs_used, granted_round in ((1, 1, 2), (2, 1, 3)):
+            with self.subTest(repair_round=repair_round):
+                with self.assertRaisesRegex(MetadataError, "automatic_repairs_used"):
+                    ParentMetadata(
+                        repair_round=repair_round,
+                        automatic_repairs_used=automatic_repairs_used,
+                        repair_authorization=RepairAuthorization(
+                            "00000000-0000-4000-8000-000000000014",
+                            "https://multica.example/comments/00000000-0000-4000-8000-000000000014",
+                            "d" * 64,
+                            granted_round,
+                        ),
+                    )
+
+    def test_version_two_parent_decoder_rejects_unknown_fields(self):
+        encoded = encode_parent_metadata(ParentMetadata())
+        value = json.loads(encoded)
+        value["surprise"] = True
+        with self.assertRaisesRegex(MetadataError, "unknown fields"):
+            decode_parent_metadata(canonical_json(value))
+
+    def test_repair_authorization_url_is_canonically_bound_to_uuid(self):
+        comment_uuid = "00000000-0000-4000-8000-000000000013"
+        values = {
+            "comment_uuid": comment_uuid,
+            "comment_url": (
+                "https://multica.example/issues/PRO-200/comments/"
+                + comment_uuid
+            ),
+            "bundle_digest": "c" * 64,
+            "granted_round": 3,
+        }
+        RepairAuthorization(**values)
+        RepairAuthorization(
+            **{
+                **values,
+                "comment_url": f"https://[2001:db8::1]/comments/{comment_uuid}",
+            }
+        )
+        canonical_url = str(values["comment_url"])
+        raw_ascii_urls = tuple(
+            f"https://multica.example/issue{chr(code)}/comments/{comment_uuid}"
+            for code in (*range(0x21), 0x7F)
+        ) + tuple(
+            prefix + canonical_url
+            for prefix in (" ", "\t", "\r", "\n", "\x00")
+        ) + tuple(
+            canonical_url + suffix
+            for suffix in (" ", "\t", "\r", "\n", "\x00")
+        )
+        invalid_urls = raw_ascii_urls + (
+            "HTTPS://multica.example/comments/" + comment_uuid,
+            canonical_url + "?",
+            canonical_url + "#",
+            f"https://multica.example/com\tments/{comment_uuid}",
+            f"https://multica.example/com\rments/{comment_uuid}",
+            f"https://multica.example/com\nments/{comment_uuid}",
+            f"https://multica.example:/comments/{comment_uuid}",
+            f"https://[2001:db8::1]:/comments/{comment_uuid}",
+            f"https://multica.example/%/comments/{comment_uuid}",
+            f"https://multica.example/%0/comments/{comment_uuid}",
+            f"https://multica.example/%GG/comments/{comment_uuid}",
+            f"https://multica.example:443/comments/{comment_uuid}",
+            "https://multica.example/comments/"
+            "00000000-0000-4000-8000-000000000099",
+            f"https://multica.example/authorization/{comment_uuid}",
+            f"https://multica.example/comments%2F{comment_uuid}",
+            f"https://multica.example/%2e%2e/comments/{comment_uuid}",
+            f"https://multica.example/../comments/{comment_uuid}",
+            f"https://multica.example//comments/{comment_uuid}",
+            f"https://multica.example/comments/{comment_uuid}/extra",
+        )
+        for comment_url in invalid_urls:
+            with self.subTest(comment_url=comment_url):
+                with self.assertRaises(MetadataError):
+                    RepairAuthorization(**{**values, "comment_url": comment_url})
 
     def test_repository_bearing_fields_must_match_the_affected_set(self):
         with self.assertRaisesRegex(MetadataError, "candidate_shas"):

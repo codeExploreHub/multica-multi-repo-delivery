@@ -24,6 +24,7 @@ from tests.cli.test_apply import CountingSecretSource, EpochClock
 HERE = Path(__file__).parent
 FINDINGS = ValidationReport((ValidationFinding("pass", "e2e", "valid"),))
 AUDIT = ContractAuditReport((ContractAuditEntry("e2e", "pass", "available"),))
+RESOLVED_SKILL_REF = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
 
 
 class LifecycleTests(unittest.TestCase):
@@ -89,7 +90,7 @@ class LifecycleTests(unittest.TestCase):
         (control / "framework.lock").write_text("""skill_version: ''
 engine_version: ''
 manifest_schema_version: 1
-workflow_metadata_version: 1
+workflow_metadata_version: 2
 supported_multica_cli: ''
 manifest_digest: ''
 resource_ids: {}
@@ -177,6 +178,30 @@ resource_ids: {}
                         CountingSecretSource(),
                     )
                     self.assertGreater(applied.mutation_count, 0)
+                    after_first = json.loads(multica_state.read_text())
+                    self.assertEqual(len(after_first["skills"]), 1)
+                    skill_id, skill = next(iter(after_first["skills"].items()))
+                    self.assertEqual(skill["id"], skill_id)
+                    self.assertEqual(
+                        skill["config"]["origin"],
+                        {
+                            "type": "github",
+                            "owner": "openai",
+                            "repo": "superpowers",
+                            "ref": RESOLVED_SKILL_REF,
+                            "path": "skills/using-superpowers",
+                            "source_url": (
+                                "https://github.com/openai/superpowers/tree/"
+                                f"{RESOLVED_SKILL_REF}/skills/using-superpowers"
+                            ),
+                        },
+                    )
+                    self.assertEqual(after_first["events"].count("skill.import"), 1)
+                    lock = yaml.safe_load((control / "framework.lock").read_text())
+                    self.assertEqual(
+                        lock["resource_ids"]["skill"]["using-superpowers"],
+                        skill_id,
+                    )
 
                     second = planning.create(control, EpochClock(1787836801))
                     PlanStore().write(control / "plan.json", second)
@@ -193,6 +218,10 @@ resource_ids: {}
                         CountingSecretSource(),
                     )
                     self.assertEqual(repeated.mutation_count, 0)
+                    after_repeat = json.loads(multica_state.read_text())
+                    self.assertEqual(list(after_repeat["skills"]), [skill_id])
+                    self.assertEqual(after_repeat["skills"][skill_id], skill)
+                    self.assertEqual(after_repeat["events"].count("skill.import"), 1)
 
                     doctor = DoctorService(
                         lambda path: FINDINGS,
@@ -211,6 +240,32 @@ resource_ids: {}
                 self.assertEqual(multica_record["rejected_argv"], [])
                 self.assertEqual(github_record["prohibited_events"], [])
                 self.assertFalse(any("deploy" in event for event in multica_record["events"]))
+
+    def test_pinned_skill_import_persists_exact_commit(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            multica_state, _ = self._states(
+                root,
+                "example/control",
+                ("example/repository",),
+            )
+            environment = {
+                "PATH": f"{HERE / 'fakes'}:{os.environ['PATH']}",
+                "MULTICA_FAKE_STATE": str(multica_state),
+            }
+            pinned_url = (
+                "https://github.com/openai/superpowers/tree/"
+                f"{RESOLVED_SKILL_REF}/skills/using-superpowers"
+            )
+            with patch.dict(os.environ, environment, clear=False):
+                client = MulticaClient(ClosedSubprocessRunner())
+                created = client.import_skill(pinned_url)
+                observed = client.list_skills()
+
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(observed[0].id, created.id)
+            self.assertEqual(observed[0].ref, RESOLVED_SKILL_REF)
+            self.assertEqual(observed[0].source_url, pinned_url)
 
 
 if __name__ == "__main__":

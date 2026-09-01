@@ -51,9 +51,15 @@ class GateEvidence:
 
     candidate_shas: Mapping[str, str]
     result: str
+    responsible_repositories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "candidate_shas", _frozen(self.candidate_shas))
+        object.__setattr__(
+            self,
+            "responsible_repositories",
+            tuple(self.responsible_repositories),
+        )
 
 
 @dataclass(frozen=True)
@@ -253,18 +259,37 @@ def _snapshot_problem(manifest: DeliveryManifest, snapshot: ParentSnapshot) -> s
         ):
             return "pull request evidence is malformed"
 
-    applicable_suite_keys = {
-        suite.key
+    applicable_suites = {
+        suite.key: frozenset(suite.repositories)
         for suite in manifest.integration_suites
         if set(suite.repositories) <= affected
     }
-    if set(snapshot.integration_qa) - applicable_suite_keys:
+    if set(snapshot.integration_qa) - set(applicable_suites):
         return "integration QA evidence contains a non-applicable suite"
-    for evidence in snapshot.integration_qa.values():
+    for suite_key, evidence in snapshot.integration_qa.items():
         if (
             not isinstance(evidence, GateEvidence)
             or evidence.result not in _RESULTS
             or any(not _valid_sha(sha) for sha in evidence.candidate_shas.values())
+            or not isinstance(evidence.responsible_repositories, tuple)
+            or any(
+                not isinstance(repository, str) or not repository
+                for repository in evidence.responsible_repositories
+            )
+            or len(set(evidence.responsible_repositories))
+            != len(evidence.responsible_repositories)
+            or (
+                evidence.result in {"fail", "blocked"}
+                and (
+                    not evidence.responsible_repositories
+                    or not set(evidence.responsible_repositories)
+                    <= applicable_suites[suite_key]
+                )
+            )
+            or (
+                evidence.result in {"pending", "pass"}
+                and evidence.responsible_repositories
+            )
         ):
             return "integration QA evidence is malformed"
     observation_ids: set[str] = set()
@@ -296,6 +321,12 @@ def _repair(
     reason: str,
     repositories: set[str] | frozenset[str],
 ) -> ParentDecision:
+    affected = frozenset(snapshot.affected_repositories)
+    if not repositories or not repositories <= affected:
+        return _decision(
+            DecisionKind.BLOCK,
+            f"{reason}; repair ownership is outside the affected repository set",
+        )
     if snapshot.merge_state in {"merging", "merged", "partial"} or snapshot.merged_shas:
         return _decision(
             DecisionKind.BLOCK,
@@ -587,7 +618,10 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
             evidence = values.get(repository)
             if evidence is None:
                 continue
-            if evidence.candidate_sha != snapshot.candidate_shas[repository]:
+            if evidence.result == "pending":
+                if pending_reason is None:
+                    pending_reason = f"{repository} {label} is still active"
+            elif evidence.candidate_sha != snapshot.candidate_shas[repository]:
                 repair_findings.append(
                     f"{repository} {label} evidence does not match candidate SHA"
                 )
@@ -595,23 +629,45 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
             elif evidence.result in {"fail", "blocked"}:
                 repair_findings.append(f"{repository} {label} evidence did not pass")
                 repair_repositories.add(repository)
-            elif evidence.result != "pass" and pending_reason is None:
-                pending_reason = f"{repository} {label} is still active"
 
     for suite_key in sorted(suites):
         evidence = snapshot.integration_qa.get(suite_key)
         if evidence is None:
             continue
-        if dict(evidence.candidate_shas) != dict(snapshot.candidate_shas):
+        if evidence.result == "pending":
+            if pending_reason is None:
+                pending_reason = f"{suite_key} integration QA is still active"
+        elif dict(evidence.candidate_shas) != dict(snapshot.candidate_shas):
             repair_findings.append(
                 f"{suite_key} integration QA evidence does not match candidate SHA map"
             )
             repair_repositories.update(suites[suite_key])
         elif evidence.result in {"fail", "blocked"}:
             repair_findings.append(f"{suite_key} integration QA evidence did not pass")
-            repair_repositories.update(suites[suite_key])
-        elif evidence.result != "pass" and pending_reason is None:
-            pending_reason = f"{suite_key} integration QA is still active"
+            repair_repositories.update(evidence.responsible_repositories)
+
+    if pending_reason is not None:
+        return _decision(DecisionKind.WAIT, pending_reason)
+    if missing_gate_repositories or missing_suites:
+        if all_merged:
+            return _decision(
+                DecisionKind.BLOCK,
+                "merged work lacks complete pre-merge review, QA, or integration evidence; human action is required",
+            )
+        if snapshot.reviews or snapshot.qa or snapshot.integration_qa:
+            return _decision(
+                DecisionKind.WAIT,
+                "required exact-SHA gate membership or evidence is incomplete",
+            )
+        dispatch = set(missing_gate_repositories)
+        for suite in missing_suites:
+            dispatch.update(suites[suite])
+        return _decision(
+            DecisionKind.DISPATCH,
+            "dispatch missing exact-SHA review and QA gates",
+            _ordered(manifest, dispatch),
+            dispatch_kind=DispatchKind.GATES,
+        )
 
     for repository in _ordered(manifest, affected):
         pull_request = snapshot.pull_requests[repository]
@@ -635,12 +691,7 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
                 if pending_reason is None:
                     pending_reason = f"{repository} merge preflight evidence is incomplete"
 
-    if all_merged and (
-        missing_gate_repositories
-        or missing_suites
-        or repair_repositories
-        or pending_reason is not None
-    ):
+    if all_merged and (repair_repositories or pending_reason is not None):
         return _decision(
             DecisionKind.BLOCK,
             "merged work lacks complete pre-merge review, QA, or integration evidence; human action is required",
@@ -652,19 +703,8 @@ def decide_parent_action(manifest: DeliveryManifest, snapshot: ParentSnapshot) -
             "; ".join(repair_findings),
             repair_repositories,
         )
-    if missing_gate_repositories or missing_suites:
-        dispatch = set(missing_gate_repositories)
-        for suite in missing_suites:
-            dispatch.update(suites[suite])
-        return _decision(
-            DecisionKind.DISPATCH,
-            "dispatch missing exact-SHA review and QA gates",
-            _ordered(manifest, dispatch),
-            dispatch_kind=DispatchKind.GATES,
-        )
     if pending_reason is not None:
         return _wait_or_recover(manifest, snapshot, pending_reason)
-
     if all_merged:
         return _smoke_decision(manifest, snapshot, affected, suites)
     if snapshot.merge_state == "merging":

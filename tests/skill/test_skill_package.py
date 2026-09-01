@@ -38,8 +38,23 @@ class SkillPackageTests(unittest.TestCase):
             "name": "multica-multi-repo-delivery",
             "description": DESCRIPTION,
         })
-        self.assertLessEqual(len(body.split()), 500)
+        self.assertLess(len(body.split()), 500)
         self.assertIn("multica-delivery --version", body)
+        self.assertIn("Version `0.2.0`", body)
+        self.assertIn("every current Gate Stage child", body)
+        self.assertIn("Core/plan-parent", body)
+        self.assertIn("canonical FailureBundle", body)
+        self.assertIn("without reconstruction", body)
+        self.assertIn("completed version-1", body.lower())
+        self.assertIn("active version-1", body.lower())
+        self.assertIn("explicit migration", body)
+        self.assertIn("complete 64-character hash", body)
+        self.assertIn("Exactly two repair rounds are automatic", body)
+        self.assertIn("Round 3 requires a member-authored authorization", body)
+        self.assertIn("exact current FailureBundle and digest", body)
+        self.assertIn("exactly the next round", body)
+        self.assertIn("consumed once", body)
+        self.assertIn("different bundle or later round", body)
         self.assertNotRegex(body, r"\b(TODO|FIXME|PLACEHOLDER)\b")
 
         interface = yaml.safe_load((SKILL / "agents" / "openai.yaml").read_text())
@@ -64,6 +79,20 @@ class SkillPackageTests(unittest.TestCase):
         self.assertNotIn("SkillsHub", all_text)
         self.assertNotIn("intra.xiaojukeji", all_text)
         self.assertNotRegex(all_text, r"\b(TODO|FIXME|PLACEHOLDER)\b")
+
+    def test_references_define_fan_in_migration_and_adjacent_mutation_boundaries(self):
+        lifecycle = (SKILL / "references" / "lifecycle.md").read_text(encoding="utf-8")
+        safety = (SKILL / "references" / "safety-boundaries.md").read_text(encoding="utf-8")
+        troubleshooting = (SKILL / "references" / "troubleshooting.md").read_text(encoding="utf-8")
+        all_text = "\n".join((lifecycle, safety, troubleshooting))
+
+        self.assertIn("workflow metadata version 2", all_text)
+        self.assertIn("completed version-1", all_text.lower())
+        self.assertIn("active version-1", all_text.lower())
+        self.assertIn("0.1.0 -> 0.2.0", all_text)
+        self.assertIn("complete 64-character", all_text)
+        for action in ("Issues", "adopt PR SHAs", "merge", "push", "tag", "release", "deploy"):
+            self.assertIn(action, all_text)
 
     def test_distribution_declares_every_skill_resource(self):
         configuration = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))

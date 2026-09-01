@@ -394,7 +394,11 @@ class ParentDecisionTests(unittest.TestCase):
             snapshot,
             qa={**snapshot.qa, "notifications": gate_for("notifications", sha="d" * 40)},
             integration_qa={
-                "web-api": GateEvidence(candidate_shas=SHA, result="fail"),
+                "web-api": GateEvidence(
+                    candidate_shas=SHA,
+                    result="fail",
+                    responsible_repositories=("api",),
+                ),
             },
             pull_requests={
                 **snapshot.pull_requests,
@@ -405,6 +409,109 @@ class ParentDecisionTests(unittest.TestCase):
         self.assertEqual(decision.kind, DecisionKind.REPAIR)
         self.assertEqual(decision.repositories, ("api", "notifications", "web"))
         self.assertEqual(decision.next_attempt, 1)
+
+    def test_terminal_gate_failures_use_one_shared_repair_decision(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            reviews={
+                **snapshot.reviews,
+                "api": gate_for("api", result="fail"),
+            },
+            qa={
+                **snapshot.qa,
+                "web": gate_for("web", result="blocked"),
+            },
+        )
+
+        decision = decide_parent_action(self.manifest, snapshot)
+
+        self.assertEqual(decision.kind, DecisionKind.REPAIR)
+        self.assertEqual(decision.repositories, ("api", "web"))
+        self.assertEqual(decision.next_attempt, 1)
+
+    def test_gate_failure_waits_while_any_gate_evidence_is_pending(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            reviews={
+                **snapshot.reviews,
+                "api": gate_for("api", result="fail"),
+            },
+            qa={
+                **snapshot.qa,
+                "web": gate_for("web", result="pending"),
+            },
+        )
+
+        decision = decide_parent_action(self.manifest, snapshot)
+
+        self.assertEqual(decision.kind, DecisionKind.WAIT)
+        self.assertEqual(decision.repositories, ())
+
+    def test_gate_failure_waits_until_every_required_gate_identity_is_present(self):
+        snapshot = passing_snapshot()
+        failed_review = {
+            **snapshot.reviews,
+            "api": gate_for("api", result="fail"),
+        }
+        incomplete = {
+            "missing repository review": replace(
+                snapshot,
+                reviews={"api": failed_review["api"]},
+            ),
+            "missing repository QA": replace(
+                snapshot,
+                reviews=failed_review,
+                qa={"api": snapshot.qa["api"]},
+            ),
+            "missing integration suite": replace(
+                snapshot,
+                reviews=failed_review,
+                integration_qa={},
+            ),
+        }
+
+        for label, value in incomplete.items():
+            with self.subTest(label=label):
+                decision = decide_parent_action(self.manifest, value)
+
+                self.assertEqual(decision.kind, DecisionKind.WAIT)
+                self.assertEqual(decision.repositories, ())
+                self.assertIsNone(decision.next_attempt)
+
+    def test_complete_pass_and_failure_gate_membership_still_repairs(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            qa={
+                **snapshot.qa,
+                "api": gate_for("api", result="fail"),
+            },
+        )
+
+        decision = decide_parent_action(self.manifest, snapshot)
+
+        self.assertEqual(decision.kind, DecisionKind.REPAIR)
+        self.assertEqual(decision.repositories, ("api",))
+
+    def test_stalled_parent_still_waits_while_gate_evidence_is_pending(self):
+        snapshot = passing_snapshot()
+        snapshot = replace(
+            snapshot,
+            reviews={
+                **snapshot.reviews,
+                "api": gate_for("api", result="pending"),
+            },
+            stalled=True,
+            stalled_repository="api",
+        )
+
+        decision = decide_parent_action(self.manifest, snapshot)
+
+        self.assertEqual(decision.kind, DecisionKind.WAIT)
+        self.assertIsNone(decision.dispatch_kind)
+        self.assertEqual(decision.repositories, ())
 
     def test_missing_review_and_qa_dispatches_exact_gate_work(self):
         snapshot = passing_snapshot()
@@ -532,6 +639,7 @@ class ParentDecisionTests(unittest.TestCase):
                     "web-api": GateEvidence(
                         candidate_shas=snapshot.candidate_shas,
                         result="fail",
+                        responsible_repositories=("api",),
                     )
                 },
             ),
@@ -566,6 +674,50 @@ class ParentDecisionTests(unittest.TestCase):
             },
         )
         self.assertEqual(decide_parent_action(self.manifest, snapshot).kind, DecisionKind.REPAIR)
+
+    def test_integration_failure_repairs_only_its_declared_responsibility_subset(self):
+        snapshot = passing_snapshot()
+        decision = decide_parent_action(
+            self.manifest,
+            replace(
+                snapshot,
+                integration_qa={
+                    "web-api": GateEvidence(
+                        candidate_shas=snapshot.candidate_shas,
+                        result="fail",
+                        responsible_repositories=("api",),
+                    )
+                },
+            ),
+        )
+
+        self.assertEqual(decision.kind, DecisionKind.REPAIR)
+        self.assertEqual(decision.repositories, ("api",))
+
+    def test_integration_failure_rejects_invalid_responsibility_sets(self):
+        snapshot = passing_snapshot()
+        for label, repositories in (
+            ("empty", ()),
+            ("duplicate", ("api", "api")),
+            ("unknown", ("api", "notifications")),
+        ):
+            with self.subTest(label=label):
+                decision = decide_parent_action(
+                    self.manifest,
+                    replace(
+                        snapshot,
+                        integration_qa={
+                            "web-api": GateEvidence(
+                                candidate_shas=snapshot.candidate_shas,
+                                result="fail",
+                                responsible_repositories=repositories,
+                            )
+                        },
+                    ),
+                )
+
+                self.assertEqual(decision.kind, DecisionKind.BLOCK)
+                self.assertEqual(decision.repositories, ())
 
     def test_non_applicable_integration_qa_evidence_is_malformed(self):
         snapshot = passing_snapshot(affected=("api",))

@@ -60,7 +60,8 @@ class EventraParityFixtureTests(unittest.TestCase):
             stage_ordinal=0,
             merge_plan=(),
             merge_state="pending",
-            attempt=0,
+            repair_round=0,
+            automatic_repairs_used=0,
             last_action="dispatch",
         )
         self.assertEqual(
@@ -89,6 +90,11 @@ class EventraParityFixtureTests(unittest.TestCase):
     def test_topology_commands_and_policy_match_eventra_contract(self):
         manifest = self.manifest
         self.assertEqual(set(manifest.repositories), {"frontend", "backend"})
+        self.assertEqual(manifest.instance.runtime_id, "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(manifest.instance.daemon_id, "22222222-2222-4222-8222-222222222222")
+        self.assertEqual(manifest.control.github, "example/eventra-delivery-control")
+        self.assertEqual(manifest.repositories["frontend"].github, "example/Eventra")
+        self.assertEqual(manifest.repositories["backend"].github, "example/Eventra-Backend")
         self.assertEqual(manifest.repositories["frontend"].depends_on, ("backend",))
         self.assertEqual(manifest.merge_order, ("backend", "frontend"))
         self.assertEqual(manifest.integration_suites[0].start_order, ("backend", "frontend"))

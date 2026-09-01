@@ -40,6 +40,26 @@ def no_secrets(name: str) -> str:
     raise AssertionError(f"unexpected secret lookup for {name}")
 
 
+def structured_skill_state(
+    identifier: str,
+    name: str,
+    source_url: str,
+) -> SkillState:
+    """Build the complete Multica 0.4.36 observed origin without production helpers."""
+
+    parts = source_url.split("/")
+    state = SkillState(identifier, name, source_url)
+    for field, value in (
+        ("origin_type", "github"),
+        ("owner", parts[3]),
+        ("repo", parts[4]),
+        ("ref", parts[6]),
+        ("path", "/".join(parts[7:])),
+    ):
+        object.__setattr__(state, field, value)
+    return state
+
+
 class FakeGitHub:
     def __init__(self, manifest):
         repositories = (manifest.control.github,) + tuple(
@@ -178,7 +198,11 @@ class StatefulMultica:
         if self._mutate("skill.import"):
             identifier = self._id("skill")
             name = url.rstrip("/").rsplit("/", 1)[-1]
-            self.skills[identifier] = SkillState(identifier, name, url)
+            self.skills[identifier] = structured_skill_state(
+                identifier,
+                name,
+                url,
+            )
         return MutationResult("ignored-acknowledgement")
 
     def list_projects(self) -> tuple[ProjectState, ...]:
@@ -759,6 +783,73 @@ class ProvisionerTests(unittest.TestCase):
             ),
         )
 
+    def test_generated_roles_preserve_coordinator_only_fan_in_authority(self):
+        result = self.apply()
+        agent_ids = result.lock.resource_ids["agent"]
+
+        def instructions(agent_key: str) -> str:
+            return self.multica.agents[agent_ids[agent_key]].instructions
+
+        lead = instructions("delivery-lead")
+        self.assertIn("every current Gate Stage child", lead)
+        self.assertIn("terminal", lead)
+        self.assertIn("sole fan-in", lead)
+        self.assertIn("canonical FailureBundle producer", lead)
+        self.assertIn("without reconstruction", lead)
+        self.assertIn("sole Stage and child execution actor", lead)
+        self.assertIn("Exactly two repair rounds are automatic", lead)
+        self.assertIn("Round 3 requires a member-authored authorization", lead)
+        self.assertIn("exact current FailureBundle and digest", lead)
+        self.assertIn("exactly the next round", lead)
+        self.assertIn("consumed once", lead)
+        self.assertIn("different bundle or later round", lead)
+
+        for role in ("independent-reviewer", "integration-qa"):
+            with self.subTest(role=role):
+                verdict = instructions(role)
+                self.assertIn("structured verdict evidence", verdict)
+                self.assertIn("do not create a failurebundle", verdict.lower())
+                self.assertIn("dispatch repair", verdict.lower())
+
+        integration_qa = instructions("integration-qa")
+        self.assertIn("phase `qa`", integration_qa)
+        self.assertIn("exactly one repository candidate", integration_qa)
+        self.assertIn("phase `integration_qa`", integration_qa)
+        self.assertIn("suite's complete candidate map", integration_qa)
+
+        for role in ("api-engineer", "notifications-engineer", "web-engineer"):
+            with self.subTest(role=role):
+                engineer = instructions(role)
+                self.assertIn("current active implementation or repair child", engineer)
+                self.assertIn("every assigned failure-partition reference", engineer)
+
+        watcher = instructions("workflow-watcher")
+        self.assertIn("cannot create a FailureBundle", watcher)
+        self.assertIn("cannot dispatch repair", watcher)
+
+    def test_provisioned_workflow_watcher_contract_is_v2_control_project_only(self):
+        result = self.apply()
+        watcher_id = result.lock.resource_ids["agent"]["workflow-watcher"]
+        watcher = self.multica.agents[watcher_id].instructions
+
+        required_contract = (
+            "Only version-2 workflows are recoverable",
+            "Version-1 workflows are migration-block signals only",
+            "never rerun version-1 work",
+            "must not write metadata, status, Stage, or action history",
+            "first watched Project is the unique parent/control Project",
+            "Later watched Projects contain repository children only",
+            "ignore parent Issues in later watched Projects",
+            "at most one approved rerun of an existing current assignment",
+            "cannot create a FailureBundle",
+            "cannot dispatch repair",
+            "never implements",
+            "merges, or deploys",
+        )
+        for clause in required_contract:
+            with self.subTest(clause=clause):
+                self.assertIn(clause, watcher)
+
     def test_actions_follow_the_fixed_phase_order(self):
         result = self.provisioner.reconcile(
             self.manifest, FrameworkLock.empty(), apply=False, secret_lookup=no_secrets
@@ -799,6 +890,102 @@ class ProvisionerTests(unittest.TestCase):
                 secret_lookup=self.secrets,
             )
         self.assertFalse(self.multica.was_mutated)
+
+    def test_resolved_commit_skill_origin_reconciles_without_mutation_or_duplicate(self):
+        initial = self.apply()
+        target_id = initial.lock.resource_ids["skill"]["using-superpowers"]
+        commit = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
+        self.multica.skills[target_id] = structured_skill_state(
+            target_id,
+            "using-superpowers",
+            "https://github.com/openai/superpowers/tree/"
+            f"{commit}/skills/using-superpowers",
+        )
+        mutations_before = tuple(self.multica.mutations)
+
+        result = self.apply(initial.lock)
+
+        self.assertEqual(result.actions, ())
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(tuple(self.multica.mutations), mutations_before)
+        self.assertEqual(
+            [
+                skill.id
+                for skill in self.multica.skills.values()
+                if skill.name == "using-superpowers"
+            ],
+            [target_id],
+        )
+
+    def test_skill_origin_requires_consistent_structured_github_identity(self):
+        desired_url = self.manifest.skill_registry["using-superpowers"].url
+        cases = (
+            ("origin_type", "http"),
+            ("owner", "attacker"),
+            ("repo", "lookalike"),
+            ("path", "skills/lookalike"),
+            ("ref", "other-branch"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                multica = StatefulMultica(self.manifest)
+                state = structured_skill_state(
+                    "skill-target",
+                    "using-superpowers",
+                    desired_url,
+                )
+                object.__setattr__(state, field, value)
+                multica.skills[state.id] = state
+
+                with self.assertRaisesRegex(
+                    ProvisionError,
+                    "same-name/different-origin",
+                ):
+                    Provisioner(multica, FakeGitHub(self.manifest)).reconcile(
+                        self.manifest,
+                        FrameworkLock.empty(),
+                        apply=False,
+                        secret_lookup=no_secrets,
+                    )
+
+                self.assertFalse(multica.was_mutated)
+
+    def test_skill_origin_rejects_noncanonical_or_different_urls(self):
+        upper_commit = "B36E0829C6D0140E93CFEF2CA599B1B07D4A7797"
+        cases = (
+            "http://github.com/openai/superpowers/tree/main/skills/using-superpowers",
+            "https://github.com:443/openai/superpowers/tree/main/skills/using-superpowers",
+            "https://user@github.com/openai/superpowers/tree/main/skills/using-superpowers",
+            "https://github.com/openai/superpowers/tree/main/skills/../using-superpowers",
+            "https://github.com/openai/superpowers/tree/main//skills/using-superpowers",
+            "https://github.com/openai/superpowers/tree/main/skills/using-superpowers?ref=main",
+            "https://github.com/openai/superpowers/tree/main/skills/using-superpowers#fragment",
+            f"https://github.com/openai/superpowers/tree/{upper_commit}/skills/using-superpowers",
+            "https://github.com/openai/superpowers/tree/other/skills/using-superpowers",
+            "https://github.com/attacker/superpowers/tree/main/skills/using-superpowers",
+        )
+        for source_url in cases:
+            with self.subTest(source_url=source_url):
+                multica = StatefulMultica(self.manifest)
+                state = structured_skill_state(
+                    "skill-target",
+                    "using-superpowers",
+                    source_url,
+                )
+                multica.skills[state.id] = state
+
+                with self.assertRaisesRegex(
+                    ProvisionError,
+                    "same-name/different-origin|approved public origin",
+                ):
+                    Provisioner(multica, FakeGitHub(self.manifest)).reconcile(
+                        self.manifest,
+                        FrameworkLock.empty(),
+                        apply=False,
+                        secret_lookup=no_secrets,
+                    )
+
+                self.assertFalse(multica.was_mutated)
 
     def test_duplicate_target_project_is_fatal_before_mutation(self):
         for identifier in ("project-a", "project-b"):
@@ -1156,8 +1343,8 @@ class ProvisionerTests(unittest.TestCase):
             "engine downgrade": {"engine_version": "0.9.0"},
             "schema upgrade": {"manifest_schema_version": 2},
             "schema downgrade": {"manifest_schema_version": 0},
-            "metadata upgrade": {"workflow_metadata_version": 2},
-            "metadata downgrade": {"workflow_metadata_version": 0},
+            "metadata legacy": {"workflow_metadata_version": 1},
+            "metadata unsupported": {"workflow_metadata_version": 3},
             "CLI upgrade": {"supported_multica_cli": ">=0.5,<0.6"},
             "CLI downgrade": {"supported_multica_cli": ">=0.3,<0.4"},
         }
@@ -1167,6 +1354,17 @@ class ProvisionerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProvisionError, "lock version mismatch"):
                     self.apply(replace(initial.lock, **changes))
                 self.assertEqual(len(self.multica.mutations), mutations_before)
+
+    def test_initialized_version_one_lock_requires_migration_while_version_two_converges(self):
+        initial = self.apply()
+        mutations_before = len(self.multica.mutations)
+
+        with self.assertRaisesRegex(ProvisionError, "lock version mismatch; explicit migration required"):
+            self.apply(replace(initial.lock, workflow_metadata_version=1))
+
+        self.assertEqual(len(self.multica.mutations), mutations_before)
+        result = self.apply(replace(initial.lock, workflow_metadata_version=2))
+        self.assertEqual(result.actions, ())
 
     def test_locked_identity_swaps_after_planning_fail_before_any_mutation(self):
         cases = (
@@ -1312,7 +1510,7 @@ class ProvisionerTests(unittest.TestCase):
             __version__,
             __version__,
             1,
-            1,
+            2,
             ">=0.4,<0.5",
             "",
             MappingProxyType(

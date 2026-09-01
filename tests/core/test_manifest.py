@@ -299,3 +299,24 @@ resource_ids: {}
             with self.subTest(error=error):
                 with self.assertRaisesRegex(ManifestError, error):
                     load_manifest_text(malformed)
+
+    def test_skill_urls_require_canonical_github_tree_identity(self):
+        source = FIXTURE.read_text(encoding="utf-8")
+        approved = (
+            "https://github.com/openai/superpowers/tree/main/"
+            "skills/using-superpowers"
+        )
+        malformed = (
+            "http://github.com/openai/superpowers/tree/main/skills/using-superpowers",
+            "https://github.com:443/openai/superpowers/tree/main/skills/using-superpowers",
+            "https://user@github.com/openai/superpowers/tree/main/skills/using-superpowers",
+            "https://github.com/openai/superpowers/main/skills/using-superpowers",
+            "https://github.com/openai/superpowers/tree/main/skills/../using-superpowers",
+            "https://github.com/openai/superpowers/tree/main//skills/using-superpowers",
+            "https://github.com/openai/superpowers/tree/main/skills/using-superpowers?ref=main",
+            "https://github.com/openai/superpowers/tree/main/skills/using-superpowers#fragment",
+        )
+        for url in malformed:
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(ManifestError, "public|GitHub|Skill"):
+                    load_manifest_text(source.replace(approved, url, 1))

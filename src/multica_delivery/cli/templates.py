@@ -29,7 +29,7 @@ _FIXED_ROLE_NAMES = {
 _LOCK_BYTES = b"""skill_version: ''
 engine_version: ''
 manifest_schema_version: 1
-workflow_metadata_version: 1
+workflow_metadata_version: 2
 supported_multica_cli: ''
 manifest_digest: ''
 resource_ids: {}

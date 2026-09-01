@@ -9,7 +9,6 @@ import re
 import shlex
 from types import MappingProxyType
 from typing import Any, Mapping
-from urllib.parse import urlparse
 
 import yaml
 
@@ -24,6 +23,7 @@ from .model import (
     SecretEnvSpec,
     ServiceSpec,
     SkillSource,
+    parse_github_skill_url,
 )
 
 
@@ -129,32 +129,23 @@ def _local_path(value: Any, field: str) -> Path:
 
 def _public_skill_url(value: Any, field: str) -> str:
     url = _string(value, field)
-    parsed = urlparse(url)
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "github.com"
-        or parsed.query
-        or parsed.fragment
-        or len([part for part in parsed.path.split("/") if part]) < 2
-    ):
+    try:
+        parse_github_skill_url(url)
+    except ValueError:
         raise ManifestError(f"{field} must be a public https://github.com URL")
-    skill_repository_slug(url)
     return url
 
 
 def skill_repository_slug(url: str) -> str:
     """Return the authoritative GitHub repository named by a validated Skill URL."""
-    parsed = urlparse(url)
-    parts = [part for part in parsed.path.split("/") if part]
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "github.com"
-        or parsed.query
-        or parsed.fragment
-        or len(parts) < 2
-    ):
+    try:
+        parsed = parse_github_skill_url(url)
+    except ValueError:
         raise ManifestError("Skill URL must identify a GitHub repository")
-    return _github_slug(f"{parts[0]}/{parts[1]}", "Skill repository")
+    return _github_slug(
+        f"{parsed['owner']}/{parsed['repo']}",
+        "Skill repository",
+    )
 
 
 def _topological_order(repositories: Mapping[str, RepositorySpec]) -> tuple[str, ...]:

@@ -7,7 +7,6 @@ import hashlib
 import json
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
-from urllib.parse import urlparse
 
 from multica_delivery import __version__
 
@@ -17,6 +16,8 @@ from .model import (
     DeliveryManifest,
     FrameworkLock,
     RepositorySpec,
+    github_skill_origin_matches,
+    parse_github_skill_url,
     validate_policy_authority,
 )
 from ..adapters.multica_client import (
@@ -39,7 +40,7 @@ from ..adapters.redaction import (
 
 SKILL_VERSION = __version__
 ENGINE_VERSION = __version__
-WORKFLOW_METADATA_VERSION = 1
+WORKFLOW_METADATA_VERSION = 2
 SUPPORTED_MULTICA_CLI = ">=0.4,<0.5"
 WORKTREE_CAPABILITY = "local-worktree-v1"
 
@@ -426,16 +427,11 @@ class Provisioner:
         if manifest.policy.watcher_cron != "*/30 * * * *":
             raise ProvisionError("Watcher requires the approved 30-minute schedule")
         for key, source in manifest.skill_registry.items():
-            parsed = urlparse(source.url)
-            if (
-                not source.approved
-                or parsed.scheme != "https"
-                or parsed.hostname != "github.com"
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.query
-                or parsed.fragment
-            ):
+            try:
+                parsed = parse_github_skill_url(source.url)
+            except (TypeError, ValueError):
+                parsed = None
+            if not source.approved or parsed is None:
                 raise ProvisionError(f"skill {key!r} is not an approved public origin")
 
         display = manifest.instance.display_name
@@ -461,7 +457,18 @@ class Provisioner:
                 "delivery-lead",
                 f"{display} Delivery Lead",
                 f"Coordinates manifest-scoped delivery for {display}.",
-                "Coordinate parent delivery work across only the manifest Projects and repositories.",
+                (
+                    "Coordinate parent delivery work across only the manifest Projects and "
+                    "repositories. Wait for every current Gate Stage child to become terminal "
+                    "before evaluating verdicts. Core/plan-parent is the sole fan-in, canonical "
+                    "FailureBundle producer, and decision authority. Validate its canonical "
+                    "output and use the exact returned FailureBundle and digest without "
+                    "reconstruction. Delivery Lead is the sole Stage and child execution actor."
+                    " Exactly two repair rounds are automatic. Round 3 requires a member-authored "
+                    "authorization bound to the exact current FailureBundle and digest. It "
+                    "authorizes exactly the next round, is consumed once, and cannot authorize "
+                    "a different bundle or later round."
+                ),
                 bindings["delivery-lead"],
                 environment["delivery-lead"],
             ),
@@ -469,7 +476,11 @@ class Provisioner:
                 "independent-reviewer",
                 f"{display} Independent Reviewer",
                 f"Reviews exact candidate commits for {display}.",
-                "Independently review exact candidate SHAs and record evidence without implementation authority.",
+                (
+                    "Independently review exact candidate SHAs and finish with structured "
+                    "verdict evidence only. Do not implement or direct an Engineer. Do not "
+                    "create a FailureBundle or dispatch repair."
+                ),
                 bindings["independent-reviewer"],
                 environment["independent-reviewer"],
             ),
@@ -477,7 +488,14 @@ class Provisioner:
                 "integration-qa",
                 f"{display} Integration QA",
                 f"Verifies declared integration suites for {display}.",
-                "Run only manifest-declared repository and integration verification against exact candidate SHAs.",
+                (
+                    "Run only manifest-declared verification against exact candidate SHAs and "
+                    "finish with structured verdict evidence only. For a repository child, use "
+                    "phase `qa` and exactly one repository candidate. For an integration-suite "
+                    "child, use phase `integration_qa` and the suite's complete candidate map. "
+                    "Never mix the two child types or their candidate scopes. Do not repair or "
+                    "direct an Engineer. Do not create a FailureBundle or dispatch repair."
+                ),
                 bindings["integration-qa"],
                 environment["integration-qa"],
             ),
@@ -486,8 +504,15 @@ class Provisioner:
                 f"{display} Workflow Watcher",
                 f"Performs bounded stalled-work recovery for {display}.",
                 (
-                    "Reread workflow state and perform at most one approved recovery "
-                    "action; never implement, merge, or deploy."
+                    "Only version-2 workflows are recoverable. Version-1 workflows are "
+                    "migration-block signals only: report the block, never rerun version-1 "
+                    "work, and must not write metadata, status, Stage, or action history. The "
+                    "first watched Project is the unique parent/control Project. Later watched "
+                    "Projects contain repository children only; ignore parent Issues in later "
+                    "watched Projects. Reread exact workflow state and perform at most one "
+                    "approved rerun of an existing current assignment. The Watcher cannot "
+                    "create a FailureBundle, cannot dispatch repair, and never implements, "
+                    "creates children, changes a repair attempt, merges, or deploys."
                 ),
                 bindings["workflow-watcher"],
                 environment["workflow-watcher"],
@@ -500,7 +525,11 @@ class Provisioner:
                 repository.description or f"Owns implementation for {repository.github}.",
                 (
                     f"Implement only repository {repository.github} in Project "
-                    f"{repository.project_title} at {repository.local_path}."
+                    f"{repository.project_title} at {repository.local_path}, and only for a "
+                    "current active implementation or repair child. A repair requires the "
+                    "exact immutable FailureBundle, an existing managed PR, and every assigned "
+                    "failure-partition reference; unresolved references require a non-PASS "
+                    "repair verdict."
                 ),
                 bindings[f"{key}-engineer"],
                 environment[f"{key}-engineer"],
@@ -513,7 +542,12 @@ class Provisioner:
             tuple(sorted(manifest.skill_registry)),
             f"{display} Delivery Squad",
             f"Manifest-scoped delivery team for {display}.",
-            "Coordinate implementation, independent review, and integration QA; deployment is forbidden.",
+            (
+                "Coordinate version-2 Stage barriers. Core/plan-parent owns complete gate "
+                "fan-in and canonical FailureBundle decisions; Delivery Lead alone executes "
+                "Stages and children. Reviewer and QA return verdict evidence only, Engineers "
+                "act only from current children, and deployment is forbidden."
+            ),
             f"{display} Workflow Watcher",
             "Run-only bounded recovery for active manifest-scoped parent delivery Issues.",
             f"{manifest.instance.key} stalled-work recovery",
@@ -583,7 +617,10 @@ class Provisioner:
                 label="skill",
                 allow_rename=False,
             )
-            if state is not None and state.source_url != manifest.skill_registry[key].url:
+            if state is not None and not self._skill_origin_matches(
+                manifest.skill_registry[key].url,
+                state,
+            ):
                 raise ProvisionError(f"skill {key!r} has a same-name/different-origin conflict")
             skills[key] = state
 
@@ -1113,8 +1150,22 @@ class Provisioner:
                     ),
                 )
                 observed = snapshot.skills[key]
-            if observed is None or observed.source_url != source:
+            if observed is None or not self._skill_origin_matches(source, observed):
                 raise ProvisionError(f"skill reconciliation failed for {key}")
+
+    @staticmethod
+    def _skill_origin_matches(desired_url: str, observed: SkillState) -> bool:
+        return github_skill_origin_matches(
+            desired_url,
+            {
+                "type": observed.origin_type,
+                "owner": observed.owner,
+                "repo": observed.repo,
+                "ref": observed.ref,
+                "path": observed.path,
+                "source_url": observed.source_url,
+            },
+        )
 
     def _apply_projects(
         self,

@@ -114,7 +114,7 @@ class WheelTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            self.assertIn("0.1.0", version.stdout)
+            self.assertIn("0.2.0", version.stdout)
             self.assertEqual(schema.stdout, "")
 
     def test_installed_console_runs_confirmed_full_lifecycle_with_fake_boundaries(self):

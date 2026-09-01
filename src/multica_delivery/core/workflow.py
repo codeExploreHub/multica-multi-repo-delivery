@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 import hashlib
+import json
 import re
 from types import MappingProxyType
 from typing import Protocol
@@ -35,13 +37,21 @@ from ..adapters.exact_sha import (
     ExactShaVerification,
     LocalExactShaCommandRunner,
 )
-from .metadata import MetadataError, ParentMetadata, canonical_json
+from .metadata import (
+    LegacyParentMetadataV1,
+    MetadataError,
+    ParentMetadata,
+    RepairAuthorization,
+    _canonical_comment_url,
+    canonical_json,
+)
 from .model import DeliveryManifest, validate_policy_authority
 from ..adapters.processes import OwnedProcess, ProcessManager, ProcessOwnershipError, ProcessRun
 from .topology import TopologyError, merge_order
 
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _STABLE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
 _ISSUE_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9]*-[1-9][0-9]*\Z")
 _SMOKE_OBSERVATION_ID = re.compile(r"smoke:[0-9a-f]{64}\Z")
@@ -68,6 +78,7 @@ _FUTURE_CHILD_RELATIONSHIP = "workflow child relationship is ahead of parent met
 _UNINITIALIZED_PARENT_STATE = "parent has no initialized workflow metadata"
 _WRONG_PARENT_STATE = "authoritative parent read returned the wrong parent"
 _OUTSIDE_PROJECT_STATE = "parent is outside the configured instance projects"
+_LEGACY_PARENT_STATE = "version one parent requires explicit metadata migration"
 _SMOKE_PERSISTENCE_AUTHORITY = object()
 
 
@@ -86,6 +97,10 @@ def _stable(value: object, field_name: str, *, empty: bool = False) -> str:
 
 def _valid_sha(value: object) -> bool:
     return type(value) is str and _SHA.fullmatch(value) is not None
+
+
+def _valid_digest(value: object) -> bool:
+    return type(value) is str and _DIGEST.fullmatch(value) is not None
 
 
 def _exact_stable(value: object, *, empty: bool = False) -> bool:
@@ -116,12 +131,36 @@ def _exact_mapping(
     )
 
 
+def _frozen_candidate_shas(value: object, field_name: str) -> Mapping[str, str]:
+    if not isinstance(value, Mapping):
+        raise WorkflowError(f"{field_name} is malformed")
+    candidates = dict(value)
+    if not candidates or any(
+        not _exact_stable(repository) or not _valid_sha(candidate_sha)
+        for repository, candidate_sha in candidates.items()
+    ):
+        raise WorkflowError(f"{field_name} is malformed")
+    return MappingProxyType(dict(sorted(candidates.items())))
+
+
+def _exact_repository_tuple(value: object, field_name: str, *, nonempty: bool = False) -> tuple[str, ...]:
+    if (
+        type(value) is not tuple
+        or (nonempty and not value)
+        or any(not _exact_stable(repository) for repository in value)
+        or len(set(value)) != len(value)
+    ):
+        raise WorkflowError(f"{field_name} is malformed")
+    return tuple(sorted(value))
+
+
 def _phase_completion_schema_problem(
     completion: object,
     *,
-    max_attempt: int,
+    manifest: DeliveryManifest,
 ) -> str | None:
     try:
+        max_attempt = manifest.policy.max_repair_attempts + 1
         if type(completion) is not PhaseCompletion:
             return "phase completion is malformed"
         if (
@@ -138,19 +177,17 @@ def _phase_completion_schema_problem(
             or not _canonical_uuid(completion.evidence_comment_uuid)
             or not _exact_stable(completion.suite_key, empty=True)
             or not _exact_mapping(completion.candidate_shas, _valid_sha)
+            or type(completion.responsible_repositories) is not tuple
+            or any(not _exact_stable(repository) for repository in completion.responsible_repositories)
+            or len(set(completion.responsible_repositories)) != len(completion.responsible_repositories)
+            or type(completion.failure_bundle_digest) is not str
+            or (completion.failure_bundle_digest and not _valid_digest(completion.failure_bundle_digest))
         ):
             return "phase completion is malformed"
 
-        evidence_url = urlsplit(completion.evidence_comment_url)
-        if (
-            type(completion.evidence_comment_url) is not str
-            or evidence_url.scheme != "https"
-            or not evidence_url.netloc
-            or evidence_url.username is not None
-            or evidence_url.password is not None
-            or evidence_url.query
-            or evidence_url.fragment
-            or not evidence_url.path
+        if not _canonical_comment_url(
+            completion.evidence_comment_url,
+            completion.evidence_comment_uuid,
         ):
             return "phase completion evidence is malformed"
 
@@ -183,6 +220,33 @@ def _phase_completion_schema_problem(
                 return "phase completion integration identity is malformed"
         elif completion.suite_key or completion.candidate_shas:
             return "phase completion repository identity is malformed"
+
+        gate_phase = completion.phase in {"review", "qa", "integration_qa"}
+        if completion.result == "pass" and gate_phase and completion.responsible_repositories:
+            return "PASS gate completion cannot name responsible repositories"
+        if completion.result != "pass" and gate_phase and not completion.responsible_repositories:
+            return "non-PASS gate completion requires responsible repositories"
+        if completion.phase in {"review", "qa"} and (
+            completion.responsible_repositories
+            and completion.responsible_repositories != (completion.repository_key,)
+        ):
+            return "repository gate completion can only name its repository"
+        if completion.phase == "integration_qa" and completion.responsible_repositories:
+            suite = next(
+                (item for item in manifest.integration_suites if item.key == completion.suite_key),
+                None,
+            )
+            if suite is None:
+                return "phase completion integration identity is malformed"
+            if not set(completion.responsible_repositories) <= set(suite.repositories):
+                return "integration QA completion responsible repositories are outside its suite"
+        if completion.phase in {"implementation", "repair"} and completion.responsible_repositories:
+            return "implementation and repair completions cannot name responsible repositories"
+        if completion.phase == "repair":
+            if not _valid_digest(completion.failure_bundle_digest):
+                return "repair completion requires a failure bundle digest"
+        elif completion.failure_bundle_digest:
+            return "non-repair completion cannot contain a failure bundle digest"
     except BaseException:
         return "phase completion is malformed"
     return None
@@ -234,6 +298,201 @@ class PullRequestTarget:
 
 
 @dataclass(frozen=True)
+class FailureEvidenceRef:
+    child_identifier: str
+    phase: str
+    result: str
+    stage_ordinal: int
+    repair_round: int
+    candidate_shas: Mapping[str, str]
+    responsible_repositories: tuple[str, ...]
+    evidence_comment_uuid: str
+    evidence_comment_url: str
+    suite_key: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            not _exact_stable(self.child_identifier)
+            or type(self.phase) is not str
+            or self.phase not in {"review", "qa", "integration_qa"}
+            or type(self.result) is not str
+            or self.result not in _PHASE_RESULTS - {"pass"}
+            or type(self.stage_ordinal) is not int
+            or self.stage_ordinal < 0
+            or type(self.repair_round) is not int
+            or self.repair_round < 0
+            or not _canonical_uuid(self.evidence_comment_uuid)
+            or not _canonical_comment_url(
+                self.evidence_comment_url,
+                self.evidence_comment_uuid,
+            )
+            or not _exact_stable(self.suite_key, empty=True)
+            or (self.phase == "integration_qa") != bool(self.suite_key)
+        ):
+            raise WorkflowError("failure evidence is malformed")
+        candidates = _frozen_candidate_shas(self.candidate_shas, "failure candidate SHA map")
+        owners = _exact_repository_tuple(
+            self.responsible_repositories,
+            "failure responsible repositories",
+            nonempty=True,
+        )
+        object.__setattr__(self, "candidate_shas", candidates)
+        object.__setattr__(self, "responsible_repositories", owners)
+
+    def to_canonical_dict(self):
+        return {
+            "candidate_shas": dict(self.candidate_shas),
+            "child_identifier": self.child_identifier,
+            "evidence_comment_url": self.evidence_comment_url,
+            "evidence_comment_uuid": self.evidence_comment_uuid,
+            "phase": self.phase,
+            "repair_round": self.repair_round,
+            "responsible_repositories": list(self.responsible_repositories),
+            "result": self.result,
+            "stage_ordinal": self.stage_ordinal,
+            "suite_key": self.suite_key,
+        }
+
+
+def _ordered_failures(failures: tuple[FailureEvidenceRef, ...]) -> tuple[FailureEvidenceRef, ...]:
+    return tuple(sorted(
+        failures,
+        key=lambda item: (
+            item.responsible_repositories,
+            item.phase,
+            item.suite_key,
+            item.child_identifier,
+            item.evidence_comment_uuid,
+        ),
+    ))
+
+
+def _failure_bundle_digest(
+    parent_identifier: str,
+    workflow_version: int,
+    source_stage_ordinal: int,
+    repair_round: int,
+    candidate_shas: Mapping[str, str],
+    failures: tuple[FailureEvidenceRef, ...],
+) -> str:
+    payload = {
+        "candidate_shas": dict(sorted(candidate_shas.items())),
+        "failures": [failure.to_canonical_dict() for failure in failures],
+        "parent_identifier": parent_identifier,
+        "repair_round": repair_round,
+        "source_stage_ordinal": source_stage_ordinal,
+        "workflow_version": workflow_version,
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _failure_uuid_partition(
+    failures: tuple[FailureEvidenceRef, ...],
+) -> tuple[str, ...]:
+    return tuple(sorted(failure.evidence_comment_uuid for failure in failures))
+
+
+@dataclass(frozen=True)
+class FailureBundle:
+    parent_identifier: str
+    workflow_version: int
+    source_stage_ordinal: int
+    repair_round: int
+    candidate_shas: Mapping[str, str]
+    failures: tuple[FailureEvidenceRef, ...]
+    digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.parent_identifier) is not str
+            or _ISSUE_IDENTIFIER.fullmatch(self.parent_identifier) is None
+            or type(self.workflow_version) is not int
+            or self.workflow_version != 2
+            or type(self.source_stage_ordinal) is not int
+            or self.source_stage_ordinal < 0
+            or type(self.repair_round) is not int
+            or self.repair_round < 1
+            or type(self.failures) is not tuple
+            or not self.failures
+            or any(type(failure) is not FailureEvidenceRef for failure in self.failures)
+        ):
+            raise WorkflowError("failure bundle is malformed")
+        candidates = _frozen_candidate_shas(self.candidate_shas, "failure bundle candidate SHA map")
+        failures = _ordered_failures(self.failures)
+        if (
+            len({failure.evidence_comment_uuid for failure in failures}) != len(failures)
+            or any(
+                failure.stage_ordinal != self.source_stage_ordinal
+                or failure.repair_round != self.repair_round - 1
+                or dict(failure.candidate_shas) != dict(candidates)
+                for failure in failures
+            )
+        ):
+            raise WorkflowError("failure bundle evidence is malformed")
+        digest = _failure_bundle_digest(
+            self.parent_identifier,
+            self.workflow_version,
+            self.source_stage_ordinal,
+            self.repair_round,
+            candidates,
+            failures,
+        )
+        if not _valid_digest(self.digest) or self.digest != digest:
+            raise WorkflowError("failure bundle digest is malformed")
+        object.__setattr__(self, "candidate_shas", candidates)
+        object.__setattr__(self, "failures", failures)
+
+    @classmethod
+    def build(
+        cls,
+        parent_identifier,
+        workflow_version,
+        source_stage_ordinal,
+        repair_round,
+        candidate_shas,
+        failures,
+    ):
+        if type(failures) is not tuple or any(
+            type(failure) is not FailureEvidenceRef for failure in failures
+        ):
+            raise WorkflowError("failure bundle failures are malformed")
+        ordered = _ordered_failures(failures)
+        candidates = _frozen_candidate_shas(candidate_shas, "failure bundle candidate SHA map")
+        digest = _failure_bundle_digest(
+            parent_identifier,
+            workflow_version,
+            source_stage_ordinal,
+            repair_round,
+            candidates,
+            ordered,
+        )
+        return cls(
+            parent_identifier,
+            workflow_version,
+            source_stage_ordinal,
+            repair_round,
+            candidates,
+            ordered,
+            digest,
+        )
+
+    def for_repository(self, repository_key):
+        return tuple(sorted(
+            (
+                failure
+                for failure in self.failures
+                if repository_key in failure.responsible_repositories
+            ),
+            key=lambda failure: (
+                {"review": 0, "qa": 1, "integration_qa": 2}[failure.phase],
+                failure.suite_key,
+                failure.child_identifier,
+                failure.evidence_comment_uuid,
+            ),
+        ))
+
+
+@dataclass(frozen=True)
 class WorkflowChild:
     identifier: str
     target_key: str
@@ -247,6 +506,12 @@ class WorkflowChild:
     active: bool
     evidence_comment_uuid: str = ""
     creation_candidate_shas: Mapping[str, str] = field(default_factory=dict)
+    phase_result: str = ""
+    evidence_comment_url: str = ""
+    responsible_repositories: tuple[str, ...] = ()
+    failure_bundle_digest: str = ""
+    failure_evidence_uuids: tuple[str, ...] = ()
+    authorizing_comment_uuid: str = ""
 
     def __post_init__(self) -> None:
         _stable(self.identifier, "child identifier")
@@ -282,6 +547,33 @@ class WorkflowChild:
             "creation_candidate_shas",
             MappingProxyType(dict(sorted(candidates.items()))),
         )
+        if (
+            type(self.phase_result) is not str
+            or self.phase_result not in _PHASE_RESULTS | {""}
+            or (
+                self.evidence_comment_url
+                and not _canonical_comment_url(
+                    self.evidence_comment_url,
+                    self.evidence_comment_uuid,
+                )
+            )
+            or (self.failure_bundle_digest and not _valid_digest(self.failure_bundle_digest))
+            or type(self.failure_evidence_uuids) is not tuple
+            or any(not _canonical_uuid(item) for item in self.failure_evidence_uuids)
+            or len(set(self.failure_evidence_uuids)) != len(self.failure_evidence_uuids)
+            or not _canonical_uuid(self.authorizing_comment_uuid, empty=True)
+        ):
+            raise WorkflowError("child failure evidence is malformed")
+        owners = _exact_repository_tuple(
+            self.responsible_repositories,
+            "child responsible repositories",
+        )
+        object.__setattr__(self, "responsible_repositories", owners)
+        object.__setattr__(
+            self,
+            "failure_evidence_uuids",
+            tuple(sorted(self.failure_evidence_uuids)),
+        )
 
 
 @dataclass(frozen=True)
@@ -294,6 +586,9 @@ class ChildRequest:
     attempt: int
     candidate_shas: Mapping[str, str]
     pull_request: PullRequestTarget | None = None
+    failure_bundle: FailureBundle | None = None
+    failure_refs: tuple[FailureEvidenceRef, ...] = ()
+    authorizing_comment_uuid: str = ""
 
     def __post_init__(self) -> None:
         _stable(self.target_key, "child target")
@@ -310,6 +605,31 @@ class ChildRequest:
         object.__setattr__(self, "candidate_shas", MappingProxyType(dict(sorted(candidates.items()))))
         if self.phase == "repair" and self.pull_request is None:
             raise WorkflowError("repair must target an existing pull request")
+        if self.phase != "repair":
+            if (
+                self.failure_bundle is not None
+                or type(self.failure_refs) is not tuple
+                or self.failure_refs != ()
+                or self.authorizing_comment_uuid
+            ):
+                raise WorkflowError("only repair requests can contain failure evidence")
+            return
+        if (
+            type(self.failure_bundle) is not FailureBundle
+            or type(self.failure_refs) is not tuple
+            or not self.failure_refs
+            or any(type(failure) is not FailureEvidenceRef for failure in self.failure_refs)
+        ):
+            raise WorkflowError("repair requires a complete failure bundle partition")
+        expected = self.failure_bundle.for_repository(self.repository_key)
+        if (
+            self.failure_refs != expected
+            or dict(self.candidate_shas) != dict(self.failure_bundle.candidate_shas)
+            or self.stage_ordinal != self.failure_bundle.source_stage_ordinal + 1
+            or self.attempt != self.failure_bundle.repair_round
+            or not _canonical_uuid(self.authorizing_comment_uuid, empty=True)
+        ):
+            raise WorkflowError("repair failure bundle partition is malformed")
 
 
 @dataclass(frozen=True)
@@ -325,10 +645,20 @@ class PhaseCompletion:
     evidence_comment_url: str
     suite_key: str = ""
     candidate_shas: Mapping[str, str] = field(default_factory=dict)
+    responsible_repositories: tuple[str, ...] = ()
+    failure_bundle_digest: str = ""
 
     def __post_init__(self) -> None:
         candidates = dict(self.candidate_shas)
         object.__setattr__(self, "candidate_shas", MappingProxyType(dict(sorted(candidates.items()))))
+        object.__setattr__(
+            self,
+            "responsible_repositories",
+            _exact_repository_tuple(
+                self.responsible_repositories,
+                "phase completion responsible repositories",
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -336,7 +666,7 @@ class WorkflowState:
     parent_identifier: str
     parent_status: str
     project_key: str
-    metadata: ParentMetadata | None
+    metadata: ParentMetadata | LegacyParentMetadataV1 | None
     snapshot: ParentSnapshot
     children: tuple[WorkflowChild, ...] = ()
     pull_requests: Mapping[str, PullRequestTarget] = field(default_factory=dict)
@@ -347,7 +677,10 @@ class WorkflowState:
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, ParentSnapshot):
             raise WorkflowError("workflow state snapshot is malformed")
-        if self.metadata is not None and not isinstance(self.metadata, ParentMetadata):
+        if self.metadata is not None and not isinstance(
+            self.metadata,
+            (ParentMetadata, LegacyParentMetadataV1),
+        ):
             raise WorkflowError("workflow state metadata is malformed")
         if not isinstance(self.children, tuple) or any(
             not isinstance(child, WorkflowChild) for child in self.children
@@ -484,6 +817,64 @@ class StatusTransition:
             raise WorkflowError("status transition action key is malformed")
 
 
+@dataclass(frozen=True)
+class AuthorizingComment:
+    comment_uuid: str
+    comment_url: str
+    author_type: str
+    content: str
+
+    def __post_init__(self) -> None:
+        if (
+            not _canonical_uuid(self.comment_uuid)
+            or not _canonical_comment_url(self.comment_url, self.comment_uuid)
+            or not _exact_stable(self.author_type)
+            or type(self.content) is not str
+        ):
+            raise WorkflowError("authorizing comment is malformed")
+
+
+def _repair_authorization_comment_matches(
+    comment: object,
+    *,
+    comment_uuid: str,
+    bundle_digest: str,
+    granted_round: int,
+    authorization: RepairAuthorization | None = None,
+) -> bool:
+    if (
+        type(comment) is not AuthorizingComment
+        or comment.comment_uuid != comment_uuid
+        or comment.author_type != "member"
+        or not _canonical_comment_url(comment.comment_url, comment_uuid)
+        or not _valid_digest(bundle_digest)
+        or type(granted_round) is not int
+        or granted_round < 1
+        or (
+            authorization is not None
+            and (
+                authorization.comment_uuid != comment_uuid
+                or authorization.comment_url != comment.comment_url
+                or authorization.bundle_digest != bundle_digest
+                or authorization.granted_round != granted_round
+            )
+        )
+    ):
+        return False
+    try:
+        content = json.loads(comment.content)
+    except (AttributeError, json.JSONDecodeError, TypeError):
+        return False
+    return (
+        type(content) is dict
+        and set(content) == {"bundle_digest", "granted_round"}
+        and content.get("bundle_digest") == bundle_digest
+        and type(content.get("granted_round")) is int
+        and content["granted_round"] == granted_round
+        and comment.content == canonical_json(content)
+    )
+
+
 class ScopeResolver(Protocol):
     def resolve(self, parent_identifier: str) -> ScopeResolution: ...
 
@@ -501,6 +892,12 @@ class WorkflowSnapshotReader(Protocol):
         parent_identifier: str,
         evidence_comment_uuid: str,
     ) -> PhaseCompletion | None: ...
+
+    def read_authorizing_comment(
+        self,
+        parent_identifier: str,
+        comment_uuid: str,
+    ) -> AuthorizingComment: ...
 
     def list_active_parents(
         self,
@@ -597,10 +994,12 @@ class WorkflowExecutor(Protocol):
         self,
         parent_identifier: str,
         child_identifier: str,
-        metadata: ParentMetadata,
+        expected_parent_metadata: ParentMetadata,
         *,
         action_key: str,
-    ) -> None: ...
+    ) -> None:
+        """Wake the child without persisting or changing parent authority."""
+        ...
 
 
 class GitHubMergeClient(Protocol):
@@ -924,6 +1323,8 @@ def coordinator_action_key(
     affected_repositories: frozenset[str],
     candidate_shas: Mapping[str, str],
     contract_hashes: Mapping[str, str],
+    failure_bundle_digest: str = "",
+    authorizing_comment_uuid: str = "",
 ) -> str:
     """Hash every frozen coordinator input into one stable idempotency key."""
 
@@ -958,6 +1359,12 @@ def coordinator_action_key(
         for key, value in contract_values.items()
     ):
         raise WorkflowError("contract hash map is malformed")
+    if not isinstance(failure_bundle_digest, str) or (
+        failure_bundle_digest and not _valid_digest(failure_bundle_digest)
+    ):
+        raise WorkflowError("failure bundle digest is malformed")
+    if not _canonical_uuid(authorizing_comment_uuid, empty=True):
+        raise WorkflowError("authorizing comment UUID is malformed")
     action_kind = stage_kind.split(":", 1)[0]
     prefix = {
         "implementation": "dispatch",
@@ -972,8 +1379,7 @@ def coordinator_action_key(
         "smoke": "smoke",
         "recovery": "recovery",
     }.get(action_kind, "resume")
-    payload = canonical_json(
-        {
+    payload_values = {
             "affected_repositories": sorted(affected_repositories),
             "attempt": attempt,
             "candidate_shas": dict(sorted(candidate_values.items())),
@@ -984,7 +1390,11 @@ def coordinator_action_key(
             "stage_ordinal": stage_ordinal,
             "workflow_version": workflow_version,
         }
-    )
+    if failure_bundle_digest:
+        payload_values["failure_bundle_digest"] = failure_bundle_digest
+    if authorizing_comment_uuid:
+        payload_values["authorizing_comment_uuid"] = authorizing_comment_uuid
+    payload = canonical_json(payload_values)
     return f"{prefix}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
 
 
@@ -1000,7 +1410,7 @@ class GenericWorkflow:
         github: GitHubMergeClient | None = None,
         smoke_executor: SmokeExecutor | None = None,
         scope_resolver: ScopeResolver | None = None,
-        workflow_version: int = 1,
+        workflow_version: int = 2,
         supported_workflow_versions: frozenset[int] | None = None,
     ) -> None:
         if not isinstance(manifest, DeliveryManifest):
@@ -1085,6 +1495,26 @@ class GenericWorkflow:
                 continue
         return None
 
+    def _parent_fan_in_still_current(
+        self,
+        state: WorkflowState,
+    ) -> WorkflowResult | None:
+        """Fail closed if external evidence reads raced a parent-state change."""
+
+        try:
+            observed = self.snapshot_reader.read(state.parent_identifier)
+        except Exception:
+            return self._zero_mutation_block(
+                state,
+                "parent could not be authoritatively reread after evidence fan-in",
+            )
+        if type(observed) is not WorkflowState or observed != state:
+            return self._zero_mutation_block(
+                state,
+                "parent changed during authoritative evidence fan-in",
+            )
+        return None
+
     def _action_key(
         self,
         state: WorkflowState,
@@ -1095,15 +1525,26 @@ class GenericWorkflow:
         candidate_shas: Mapping[str, str] | None = None,
         affected: frozenset[str] | None = None,
         contract_hashes: Mapping[str, str] | None = None,
+        failure_bundle_digest: str = "",
+        authorizing_comment_uuid: str = "",
     ) -> str:
         metadata = state.metadata
+        metadata_attempt = (
+            0
+            if metadata is None
+            else (
+                metadata.attempt
+                if type(metadata) is LegacyParentMetadataV1
+                else metadata.repair_round
+            )
+        )
         return coordinator_action_key(
             workflow_version=self.workflow_version if metadata is None else metadata.workflow_version,
             instance_key=self.manifest.instance.key,
             parent_identifier=state.parent_identifier,
             stage_kind=stage_kind,
             stage_ordinal=stage_ordinal,
-            attempt=(0 if metadata is None else metadata.attempt) if attempt is None else attempt,
+            attempt=metadata_attempt if attempt is None else attempt,
             affected_repositories=(
                 frozenset(state.snapshot.affected_repositories)
                 if affected is None
@@ -1113,6 +1554,8 @@ class GenericWorkflow:
             contract_hashes=(
                 {} if metadata is None else metadata.contract_hashes
             ) if contract_hashes is None else contract_hashes,
+            failure_bundle_digest=failure_bundle_digest,
+            authorizing_comment_uuid=authorizing_comment_uuid,
         )
 
     def _exact_state_schema_problem(self, state: object) -> str | None:
@@ -1257,7 +1700,7 @@ class GenericWorkflow:
                     for smoke_read in snapshot.smoke_reads
                 )
                 or type(snapshot.attempt) is not int
-                or not 0 <= snapshot.attempt <= self.manifest.policy.max_repair_attempts
+                or not 0 <= snapshot.attempt <= self.manifest.policy.max_repair_attempts + 1
                 or type(snapshot.stalled) is not bool
                 or (
                     snapshot.stalled_repository is not None
@@ -1282,6 +1725,8 @@ class GenericWorkflow:
 
             metadata = state.metadata
             if metadata is not None:
+                if type(metadata) is LegacyParentMetadataV1:
+                    return _LEGACY_PARENT_STATE
                 if (
                     type(metadata) is not ParentMetadata
                     or type(metadata.workflow_version) is not int
@@ -1304,7 +1749,14 @@ class GenericWorkflow:
                     or type(metadata.merge_plan) is not tuple
                     or any(not _exact_stable(item) for item in metadata.merge_plan)
                     or type(metadata.merge_state) is not str
-                    or type(metadata.attempt) is not int
+                    or type(metadata.repair_round) is not int
+                    or type(metadata.automatic_repairs_used) is not int
+                    or metadata.automatic_repairs_used
+                    != min(
+                        metadata.repair_round,
+                        self.manifest.policy.max_repair_attempts,
+                    )
+                    or metadata.repair_round > self.manifest.policy.max_repair_attempts + 1
                     or type(metadata.last_action) is not str
                 ):
                     return malformed
@@ -1334,7 +1786,9 @@ class GenericWorkflow:
                     stage_ordinal=metadata.stage_ordinal,
                     merge_plan=metadata.merge_plan,
                     merge_state=metadata.merge_state,
-                    attempt=metadata.attempt,
+                    repair_round=metadata.repair_round,
+                    automatic_repairs_used=metadata.automatic_repairs_used,
+                    repair_authorization=metadata.repair_authorization,
                     last_action=metadata.last_action,
                 )
                 if (
@@ -1382,7 +1836,17 @@ class GenericWorkflow:
                     or child.status not in _CHILD_STATUSES
                     or type(child.action_key) is not str
                     or _ACTION_KEY.fullmatch(child.action_key) is None
-                    or child.action_key not in state.applied_action_keys
+                    or (
+                        child.action_key not in state.applied_action_keys
+                        and not (
+                            type(metadata) is ParentMetadata
+                            and child.active
+                            and child.status in _ACTIVE_CHILD_STATUSES
+                            and child.stage_ordinal == metadata.stage_ordinal
+                            and child.attempt == metadata.repair_round
+                            and child.action_key == metadata.last_action
+                        )
+                    )
                     or type(child.active) is not bool
                     or not _canonical_uuid(child.evidence_comment_uuid, empty=True)
                     or type(child.creation_candidate_shas)
@@ -1392,6 +1856,41 @@ class GenericWorkflow:
                         _valid_sha,
                     )
                     or set(child.creation_candidate_shas) - affected
+                    or type(child.phase_result) is not str
+                    or child.phase_result not in _PHASE_RESULTS | {""}
+                    or type(child.evidence_comment_url) is not str
+                    or (
+                        child.evidence_comment_url
+                        and not _canonical_comment_url(
+                            child.evidence_comment_url,
+                            child.evidence_comment_uuid,
+                        )
+                    )
+                    or type(child.responsible_repositories) is not tuple
+                    or any(
+                        not _exact_stable(repository)
+                        for repository in child.responsible_repositories
+                    )
+                    or len(set(child.responsible_repositories))
+                    != len(child.responsible_repositories)
+                    or type(child.failure_bundle_digest) is not str
+                    or (
+                        child.failure_bundle_digest
+                        and not _valid_digest(child.failure_bundle_digest)
+                    )
+                    or type(child.failure_evidence_uuids) is not tuple
+                    or any(
+                        not _canonical_uuid(evidence_uuid)
+                        for evidence_uuid in child.failure_evidence_uuids
+                    )
+                    or len(set(child.failure_evidence_uuids))
+                    != len(child.failure_evidence_uuids)
+                    or child.failure_evidence_uuids
+                    != tuple(sorted(child.failure_evidence_uuids))
+                    or not _canonical_uuid(
+                        child.authorizing_comment_uuid,
+                        empty=True,
+                    )
                 ):
                     return malformed
                 identifiers.add(child.identifier)
@@ -1405,15 +1904,61 @@ class GenericWorkflow:
                 }[child.phase]
                 if not child.action_key.startswith(expected_prefix):
                     return malformed
+                if child.phase == "repair":
+                    if (
+                        not child.failure_bundle_digest
+                        or not child.failure_evidence_uuids
+                        or child.responsible_repositories
+                        or bool(child.authorizing_comment_uuid)
+                        != (
+                            child.attempt
+                            > self.manifest.policy.max_repair_attempts
+                        )
+                    ):
+                        return malformed
+                elif (
+                    child.failure_bundle_digest
+                    or child.failure_evidence_uuids
+                    or child.authorizing_comment_uuid
+                ):
+                    return malformed
+                completion_fields = (
+                    bool(child.evidence_comment_uuid),
+                    bool(child.phase_result),
+                    bool(child.evidence_comment_url),
+                )
+                if any(completion_fields) and not all(completion_fields):
+                    return malformed
+                if child.phase in {"review", "qa", "integration_qa"}:
+                    if child.phase_result == "pass" and child.responsible_repositories:
+                        return malformed
+                    if (
+                        child.phase_result in {"fail", "blocked"}
+                        and not child.responsible_repositories
+                    ):
+                        return malformed
+                elif child.responsible_repositories:
+                    return malformed
                 if child.phase == "integration_qa":
                     suite = applicable_suites.get(child.suite_key)
                     if (
                         suite is None
                         or child.target_key != child.suite_key
                         or child.repository_key != suite.command_repository
+                        or not set(child.responsible_repositories)
+                        <= set(suite.repositories)
                     ):
                         return malformed
-                elif child.target_key != child.repository_key or child.suite_key:
+                elif (
+                    child.target_key != child.repository_key
+                    or child.suite_key
+                    or (
+                        child.phase in {"review", "qa"}
+                        and child.phase_result in {"fail", "blocked"}
+                        and child.responsible_repositories
+                        != (child.repository_key,)
+                    )
+                ):
                     return malformed
 
             if any(
@@ -1455,7 +2000,7 @@ class GenericWorkflow:
         metadata = state.metadata
         if (
             type(metadata) is not ParentMetadata
-            or metadata.metadata_version != 1
+            or metadata.metadata_version != 2
             or metadata.workflow_version not in self.supported_workflow_versions
             or metadata.instance_key != self.manifest.instance.key
         ):
@@ -1464,13 +2009,16 @@ class GenericWorkflow:
             return "parent affected repository metadata disagrees with its snapshot"
         if dict(metadata.candidate_shas) != dict(state.snapshot.candidate_shas):
             return "parent candidate SHA metadata disagrees with its snapshot"
-        if metadata.merge_state != state.snapshot.merge_state or metadata.attempt != state.snapshot.attempt:
+        if (
+            metadata.merge_state != state.snapshot.merge_state
+            or metadata.repair_round != state.snapshot.attempt
+        ):
             return "parent transition metadata disagrees with its snapshot"
         if any(
             child.stage_ordinal > metadata.stage_ordinal
             or (
                 child.stage_ordinal == metadata.stage_ordinal
-                and child.attempt > metadata.attempt
+                and child.attempt > metadata.repair_round
             )
             for child in state.children
         ):
@@ -1492,7 +2040,11 @@ class GenericWorkflow:
         if problem is None or (
             future_child_only
             and problem
-            not in {_FUTURE_CHILD_RELATIONSHIP, "parent state schema is unsupported"}
+            not in {
+                _FUTURE_CHILD_RELATIONSHIP,
+                _LEGACY_PARENT_STATE,
+                "parent state schema is unsupported",
+            }
         ):
             return None
         merge_state = (
@@ -1510,6 +2062,93 @@ class GenericWorkflow:
             mutation_count=0,
         )
 
+    def _completed_legacy_replay(
+        self,
+        state: object,
+        parent_identifier: str,
+    ) -> WorkflowResult | None:
+        if (
+            type(state) is not WorkflowState
+            or state.parent_status != "done"
+            or type(state.metadata) is not LegacyParentMetadataV1
+        ):
+            return None
+        metadata = state.metadata
+        try:
+            reconstructed = LegacyParentMetadataV1(
+                workflow_version=metadata.workflow_version,
+                metadata_version=metadata.metadata_version,
+                instance_key=metadata.instance_key,
+                affected_repositories=metadata.affected_repositories,
+                repository_dag=dict(metadata.repository_dag),
+                candidate_shas=dict(metadata.candidate_shas),
+                contract_hashes=dict(metadata.contract_hashes),
+                stage_ordinal=metadata.stage_ordinal,
+                merge_plan=metadata.merge_plan,
+                merge_state=metadata.merge_state,
+                attempt=metadata.attempt,
+                last_action=metadata.last_action,
+            )
+            synthetic = ParentMetadata(
+                workflow_version=2,
+                metadata_version=2,
+                instance_key=metadata.instance_key,
+                affected_repositories=metadata.affected_repositories,
+                repository_dag=dict(metadata.repository_dag),
+                candidate_shas=dict(metadata.candidate_shas),
+                contract_hashes=dict(metadata.contract_hashes),
+                stage_ordinal=metadata.stage_ordinal,
+                merge_plan=metadata.merge_plan,
+                merge_state=metadata.merge_state,
+                repair_round=metadata.attempt,
+                automatic_repairs_used=metadata.attempt,
+                last_action=metadata.last_action,
+            )
+            schema_problem = self._exact_state_schema_problem(
+                replace(state, metadata=synthetic)
+            )
+        except (MetadataError, TypeError, ValueError):
+            schema_problem = "parent state schema is unsupported"
+            reconstructed = None
+        if (
+            reconstructed != metadata
+            or schema_problem is not None
+            or state.parent_identifier != parent_identifier
+            or state.project_key != self.manifest.instance.control_project
+            or metadata.instance_key != self.manifest.instance.key
+            or tuple(metadata.affected_repositories)
+            != tuple(state.snapshot.affected_repositories)
+            or dict(metadata.candidate_shas)
+            != dict(state.snapshot.candidate_shas)
+            or metadata.merge_state != state.snapshot.merge_state
+            or metadata.attempt != state.snapshot.attempt
+        ):
+            return WorkflowResult(
+                parent_identifier,
+                "blocked",
+                "block",
+                "completed version one parent is not authoritative",
+                mutation_count=0,
+            )
+        completed = decide_parent_action(self.manifest, state.snapshot)
+        key = self._action_key(state, "complete", metadata.stage_ordinal)
+        if (
+            completed.kind is not DecisionKind.COMPLETE
+            or metadata.last_action != key
+            or key not in state.applied_action_keys
+        ):
+            return self._uncertain(
+                state,
+                "completed version one parent lacks its exact completion transition",
+                action_key=key,
+            )
+        return self._result(
+            state,
+            "noop",
+            "version one parent completion remains authoritative and immutable",
+            action_key=key,
+        )
+
     @staticmethod
     def _current_stage_is_active(state: WorkflowState) -> bool:
         if state.metadata is None:
@@ -1518,7 +2157,7 @@ class GenericWorkflow:
             child
             for child in state.children
             if child.stage_ordinal == state.metadata.stage_ordinal
-            and child.attempt == state.metadata.attempt
+            and child.attempt == state.metadata.repair_round
         )
         return state.active_work or any(
             child.active or child.status not in _TERMINAL_CHILD_STATUSES
@@ -1534,6 +2173,448 @@ class GenericWorkflow:
             "current Stage still has active work",
         )
 
+    @staticmethod
+    def _candidate_heads_match(state: WorkflowState) -> bool:
+        return set(state.pull_requests) <= set(state.snapshot.pull_requests) and all(
+            state.snapshot.candidate_shas.get(repository) == pull_request.head_sha
+            for repository, pull_request in state.snapshot.pull_requests.items()
+        )
+
+    def _authoritative_source_gate_failure_bundle(
+        self,
+        state: WorkflowState,
+        *,
+        source_stage: int,
+        source_attempt: int,
+        repair_round: int,
+        source: Mapping[str, str],
+        allow_all_pass: bool = False,
+    ) -> FailureBundle | tuple[()] | None:
+        """Rebuild one immutable failure bundle from exact source Gate authority."""
+
+        if state.metadata is None:
+            return None
+        affected = frozenset(state.snapshot.affected_repositories)
+        applicable_suites = {
+            suite.key: suite
+            for suite in self.manifest.integration_suites
+            if set(suite.repositories) <= affected
+        }
+        gates = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == source_stage
+            and child.attempt == source_attempt
+        )
+        expected_identities = {
+            (phase, repository, "")
+            for repository in affected
+            for phase in ("review", "qa")
+        }
+        expected_identities.update(
+            ("integration_qa", suite_key, suite_key)
+            for suite_key in applicable_suites
+        )
+        identities = tuple(
+            (child.phase, child.target_key, child.suite_key)
+            for child in gates
+        )
+        if (
+            source_stage < 0
+            or not gates
+            or len(identities) != len(set(identities))
+            or set(identities) != expected_identities
+        ):
+            return None
+        expected_creation_action = self._action_key(
+            state,
+            "gates",
+            source_stage,
+            attempt=source_attempt,
+            candidate_shas=source,
+        )
+        if (
+            expected_creation_action not in state.applied_action_keys
+            or any(child.action_key != expected_creation_action for child in gates)
+        ):
+            return None
+
+        failures: list[FailureEvidenceRef] = []
+        evidence_uuids: set[str] = set()
+        for child in gates:
+            if (
+                child.status != "done"
+                or child.active
+                or child.phase_result not in _PHASE_RESULTS
+                or dict(child.creation_candidate_shas) != dict(source)
+                or not _canonical_uuid(child.evidence_comment_uuid)
+                or not _canonical_comment_url(
+                    child.evidence_comment_url,
+                    child.evidence_comment_uuid,
+                )
+                or child.evidence_comment_uuid in evidence_uuids
+            ):
+                return None
+            expected_completion_action = self._action_key(
+                state,
+                f"{child.phase}:{child.target_key}",
+                source_stage,
+                attempt=source_attempt,
+                candidate_shas=source,
+            )
+            if (
+                expected_completion_action == expected_creation_action
+                or expected_completion_action not in state.applied_action_keys
+            ):
+                return None
+            pull_request = state.pull_requests.get(child.repository_key)
+            if pull_request is None:
+                return None
+            try:
+                observed_completions = tuple(
+                    self.snapshot_reader.read_phase_completion(
+                        state.parent_identifier,
+                        child.evidence_comment_uuid,
+                    )
+                    for _ in range(2)
+                )
+            except Exception:
+                return None
+            if (
+                observed_completions[0] != observed_completions[1]
+                or type(observed_completions[0]) is not PhaseCompletion
+                or observed_completions[0].pull_request_url
+                not in {"", pull_request.url}
+            ):
+                return None
+            observed_completion = observed_completions[0]
+            expected_completion = PhaseCompletion(
+                parent_identifier=state.parent_identifier,
+                repository_key=child.repository_key,
+                phase=child.phase,
+                result=child.phase_result,
+                attempt=source_attempt,
+                candidate_sha=source[child.repository_key],
+                pull_request_url=observed_completion.pull_request_url,
+                evidence_comment_uuid=child.evidence_comment_uuid,
+                evidence_comment_url=child.evidence_comment_url,
+                suite_key=child.suite_key,
+                candidate_shas=(source if child.phase == "integration_qa" else {}),
+                responsible_repositories=child.responsible_repositories,
+            )
+            if (
+                _phase_completion_schema_problem(
+                    expected_completion,
+                    manifest=self.manifest,
+                )
+                is not None
+            ):
+                return None
+            if observed_completion != expected_completion:
+                return None
+            evidence_uuids.add(child.evidence_comment_uuid)
+            if child.phase in {"review", "qa"}:
+                expected_owners = (
+                    (child.repository_key,)
+                    if child.phase_result != "pass"
+                    else ()
+                )
+                if (
+                    child.target_key != child.repository_key
+                    or child.repository_key not in affected
+                    or child.suite_key
+                    or child.responsible_repositories != expected_owners
+                ):
+                    return None
+            else:
+                suite = applicable_suites.get(child.suite_key)
+                if (
+                    suite is None
+                    or child.target_key != suite.key
+                    or child.repository_key != suite.command_repository
+                    or (
+                        child.phase_result == "pass"
+                        and child.responsible_repositories
+                    )
+                    or (
+                        child.phase_result != "pass"
+                        and (
+                            not child.responsible_repositories
+                            or not set(child.responsible_repositories)
+                            <= set(suite.repositories)
+                        )
+                    )
+                ):
+                    return None
+            if child.phase_result != "pass":
+                failures.append(
+                    FailureEvidenceRef(
+                        child_identifier=child.identifier,
+                        phase=child.phase,
+                        result=child.phase_result,
+                        stage_ordinal=source_stage,
+                        repair_round=source_attempt,
+                        candidate_shas=source,
+                        responsible_repositories=child.responsible_repositories,
+                        evidence_comment_uuid=child.evidence_comment_uuid,
+                        evidence_comment_url=child.evidence_comment_url,
+                        suite_key=child.suite_key,
+                    )
+                )
+        if not failures:
+            return () if allow_all_pass else None
+        try:
+            return FailureBundle.build(
+                state.parent_identifier,
+                state.metadata.workflow_version,
+                source_stage,
+                repair_round,
+                source,
+                tuple(failures),
+            )
+        except (TypeError, ValueError, WorkflowError):
+            return None
+
+    def _current_gate_authority_problem(self, state: WorkflowState) -> str | None:
+        """Require an exact authoritative all-PASS current Gate chain."""
+
+        if state.metadata is None:
+            return "current Gate authority is unavailable"
+        observed = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=state.metadata.stage_ordinal,
+            source_attempt=state.snapshot.attempt,
+            repair_round=state.snapshot.attempt + 1,
+            source=state.snapshot.candidate_shas,
+            allow_all_pass=True,
+        )
+        if observed != ():
+            return "current Gate authority is incomplete or conflicting"
+        return None
+
+    def _current_repair_failure_bundle(
+        self,
+        state: WorkflowState,
+        current: tuple[WorkflowChild, ...],
+        source: Mapping[str, str],
+    ) -> FailureBundle | None:
+        """Rebuild the immutable current Repair owner set from its source Gates."""
+
+        if state.metadata is None or not current:
+            return None
+        return self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=state.metadata.stage_ordinal - 1,
+            source_attempt=state.metadata.repair_round - 1,
+            repair_round=state.metadata.repair_round,
+            source=source,
+        )
+
+    def _current_repair_head_problem(
+        self,
+        state: WorkflowState,
+        completion: PhaseCompletion | None = None,
+    ) -> tuple[bool, str | None]:
+        """Validate current Repair Stage heads without adopting active-owner motion."""
+
+        if state.metadata is None:
+            return False, None
+        current = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == state.metadata.stage_ordinal
+            and child.attempt == state.metadata.repair_round
+        )
+        if not current or not any(child.phase == "repair" for child in current):
+            return False, None
+        problem = "current Repair Stage head or membership evidence is conflicting"
+        if any(child.phase != "repair" for child in current):
+            return True, problem
+        source = dict(current[0].creation_candidate_shas)
+        affected = set(state.snapshot.affected_repositories)
+        if (
+            not source
+            or set(source) != affected
+            or set(state.snapshot.candidate_shas) != affected
+            or set(state.snapshot.pull_requests) != affected
+            or set(state.pull_requests) != affected
+        ):
+            return True, problem
+        expected_action = self._action_key(
+            state,
+            "repair",
+            state.metadata.stage_ordinal,
+            attempt=state.metadata.repair_round,
+            candidate_shas=source,
+            failure_bundle_digest=current[0].failure_bundle_digest,
+            authorizing_comment_uuid=current[0].authorizing_comment_uuid,
+        )
+        bundle = self._current_repair_failure_bundle(state, current, source)
+        owners = Counter(child.repository_key for child in current)
+        expected_owners = (
+            frozenset(
+                repository
+                for failure in bundle.failures
+                for repository in failure.responsible_repositories
+            )
+            if bundle is not None
+            else frozenset()
+        )
+        if (
+            bundle is None
+            or bundle.digest != current[0].failure_bundle_digest
+            or any(count != 1 for count in owners.values())
+            or set(owners) != expected_owners
+            or any(
+                child.target_key != child.repository_key
+                or child.suite_key
+                or dict(child.creation_candidate_shas) != source
+                or child.action_key != expected_action
+                or child.failure_bundle_digest != current[0].failure_bundle_digest
+                or child.authorizing_comment_uuid
+                != current[0].authorizing_comment_uuid
+                or child.failure_evidence_uuids
+                != tuple(sorted(
+                    failure.evidence_comment_uuid
+                    for failure in bundle.for_repository(child.repository_key)
+                ))
+                for child in current
+            )
+            or expected_action not in state.applied_action_keys
+        ):
+            return True, problem
+
+        for repository in affected:
+            candidate = state.snapshot.candidate_shas[repository]
+            pull_request = state.snapshot.pull_requests[repository]
+            child = next(
+                (item for item in current if item.repository_key == repository),
+                None,
+            )
+            if child is None:
+                evidence = state.snapshot.children.get(repository)
+                if (
+                    candidate != source[repository]
+                    or pull_request.head_sha != source[repository]
+                    or evidence is None
+                    or evidence.result != "pass"
+                    or evidence.candidate_sha != source[repository]
+                ):
+                    return True, problem
+                continue
+            evidence = state.snapshot.children.get(repository)
+            if child.status in _ACTIVE_CHILD_STATUSES and child.active:
+                if (
+                    candidate != source[repository]
+                    or evidence is None
+                    or evidence.result != "pending"
+                    or evidence.candidate_sha not in {"", source[repository]}
+                ):
+                    return True, problem
+                if completion is not None and completion.repository_key == repository:
+                    if completion.phase != "repair":
+                        return True, problem
+                    if completion.result == "pass":
+                        if (
+                            completion.candidate_sha == source[repository]
+                            or completion.candidate_sha != pull_request.head_sha
+                        ):
+                            return True, problem
+                    elif (
+                        completion.candidate_sha != source[repository]
+                        or pull_request.head_sha != source[repository]
+                    ):
+                        return True, problem
+                continue
+            if (
+                child.status != "done"
+                or child.active
+                or child.phase_result != "pass"
+                or evidence is None
+                or evidence.result != "pass"
+                or evidence.candidate_sha != candidate
+                or candidate == source[repository]
+                or pull_request.head_sha != candidate
+            ):
+                return True, problem
+        return True, None
+
+    def _terminal_repair_wave_authority_problem(
+        self,
+        state: WorkflowState,
+        *,
+        stage_ordinal: int | None = None,
+        attempt: int | None = None,
+    ) -> WorkflowResult | None:
+        """Require a stable authoritative whole-wave barrier before fresh Gates."""
+
+        if state.metadata is None:
+            return self._zero_mutation_block(
+                state,
+                "terminal Repair Stage authority is unavailable",
+            )
+        repair_stage = (
+            state.metadata.stage_ordinal
+            if stage_ordinal is None
+            else stage_ordinal
+        )
+        repair_attempt = (
+            state.metadata.repair_round
+            if attempt is None
+            else attempt
+        )
+        current = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == repair_stage
+        )
+        repositories = tuple(child.repository_key for child in current)
+        if (
+            not current
+            or {child.attempt for child in current} != {repair_attempt}
+            or any(
+                child.phase != "repair"
+                or child.status != "done"
+                or child.active
+                or child.phase_result != "pass"
+                for child in current
+            )
+            or len(repositories) != len(set(repositories))
+        ):
+            return self._zero_mutation_block(
+                state,
+                "terminal Repair Stage membership is incomplete or conflicting",
+            )
+        observed = self._authoritative_repair_wave_completion_actions(
+            state,
+            current[0],
+        )
+        if observed is None or set(observed) != set(repositories):
+            return self._zero_mutation_block(
+                state,
+                "terminal Repair Stage completion authority is incomplete or conflicting",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        refreshed = self._authoritative_repair_wave_completion_actions(
+            state,
+            current[0],
+        )
+        if refreshed != observed:
+            return self._zero_mutation_block(
+                state,
+                "terminal Repair Stage completion authority changed after parent fan-in",
+            )
+        return self._parent_fan_in_still_current(state)
+
+    def _parent_decision(self, state: WorkflowState) -> ParentDecision:
+        snapshot = state.snapshot
+        automatic_limit = self.manifest.policy.max_repair_attempts
+        if snapshot.attempt > automatic_limit:
+            snapshot = replace(snapshot, attempt=automatic_limit)
+        return decide_parent_action(self.manifest, snapshot)
+
     def _metadata(
         self,
         state: WorkflowState,
@@ -1544,6 +2625,8 @@ class GenericWorkflow:
         candidate_shas: Mapping[str, str] | None = None,
         merge_plan: tuple[str, ...] | None = None,
         merge_state: str | None = None,
+        automatic_repair: bool | None = None,
+        consume_repair_authorization: bool = False,
     ) -> ParentMetadata:
         if state.metadata is None:
             raise WorkflowError("parent has no initialized workflow metadata")
@@ -1551,7 +2634,15 @@ class GenericWorkflow:
         if stage_ordinal is not None:
             values["stage_ordinal"] = stage_ordinal
         if attempt is not None:
-            values["attempt"] = attempt
+            values["repair_round"] = attempt
+            if automatic_repair is True:
+                values["automatic_repairs_used"] = (
+                    state.metadata.automatic_repairs_used + 1
+                )
+            elif automatic_repair is not False:
+                raise WorkflowError("repair authority must classify a new round")
+        if consume_repair_authorization:
+            values["repair_authorization"] = None
         if candidate_shas is not None:
             values["candidate_shas"] = candidate_shas
         if merge_plan is not None:
@@ -1963,7 +3054,7 @@ class GenericWorkflow:
         try:
             metadata = ParentMetadata(
                 workflow_version=self.workflow_version,
-                metadata_version=1,
+                metadata_version=2,
                 instance_key=self.manifest.instance.key,
                 affected_repositories=tuple(
                     repository for repository in self.manifest.merge_order if repository in selected
@@ -1974,7 +3065,8 @@ class GenericWorkflow:
                 stage_ordinal=0,
                 merge_plan=(),
                 merge_state="pending",
-                attempt=0,
+                repair_round=0,
+                automatic_repairs_used=0,
                 last_action=key,
             )
             self.executor.initialize_parent(parent_identifier, metadata, action_key=key)
@@ -2049,6 +3141,284 @@ class GenericWorkflow:
                 )
         return tuple(requests)
 
+    def _complete_gate_requests(
+        self,
+        state: WorkflowState,
+        ordinal: int,
+    ) -> tuple[ChildRequest, ...]:
+        affected = frozenset(state.snapshot.affected_repositories)
+        requests: list[ChildRequest] = []
+        for repository in self._ordered(affected):
+            for phase in ("review", "qa"):
+                requests.append(
+                    ChildRequest(
+                        repository,
+                        repository,
+                        "",
+                        phase,
+                        ordinal,
+                        state.snapshot.attempt,
+                        state.snapshot.candidate_shas,
+                        state.pull_requests.get(repository),
+                    )
+                )
+        for suite in self.manifest.integration_suites:
+            if set(suite.repositories) <= affected:
+                requests.append(
+                    ChildRequest(
+                        suite.key,
+                        suite.command_repository,
+                        suite.key,
+                        "integration_qa",
+                        ordinal,
+                        state.snapshot.attempt,
+                        state.snapshot.candidate_shas,
+                    )
+                )
+        return tuple(requests)
+
+    def _failure_bundle(
+        self,
+        state: WorkflowState,
+        decision: ParentDecision,
+    ) -> FailureBundle:
+        if state.metadata is None or decision.next_attempt is None:
+            raise WorkflowError("repair bundle lacks its parent transition identity")
+        current = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == state.metadata.stage_ordinal
+            and child.attempt == state.snapshot.attempt
+        )
+        if not current:
+            raise WorkflowError("repair bundle lacks a complete source Stage")
+        affected = frozenset(state.snapshot.affected_repositories)
+        applicable_suites = {
+            suite.key: frozenset(suite.repositories)
+            for suite in self.manifest.integration_suites
+            if set(suite.repositories) <= affected
+        }
+        current_identities = tuple(
+            (child.phase, child.target_key, child.suite_key)
+            for child in current
+        )
+        expected_identities = {
+            (phase, repository, "")
+            for repository in affected
+            for phase in ("review", "qa")
+        }
+        expected_identities.update(
+            ("integration_qa", suite_key, suite_key)
+            for suite_key in applicable_suites
+        )
+        if (
+            len(set(current_identities)) != len(current_identities)
+            or set(current_identities) != expected_identities
+        ):
+            raise WorkflowError(
+                "repair bundle source Stage gate membership is incomplete or conflicting"
+            )
+        authoritative_bundle = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=state.metadata.stage_ordinal,
+            source_attempt=state.snapshot.attempt,
+            repair_round=decision.next_attempt,
+            source=state.snapshot.candidate_shas,
+        )
+        if authoritative_bundle is None:
+            raise WorkflowError(
+                "repair bundle source Gate authority is incomplete or conflicting"
+            )
+        expected_nonpass = {
+            (phase, repository, "")
+            for phase, evidence_by_repository in (
+                ("review", state.snapshot.reviews),
+                ("qa", state.snapshot.qa),
+            )
+            for repository, evidence in evidence_by_repository.items()
+            if evidence.result in {"fail", "blocked"}
+        }
+        expected_nonpass.update(
+            ("integration_qa", suite_key, suite_key)
+            for suite_key, evidence in state.snapshot.integration_qa.items()
+            if evidence.result in {"fail", "blocked"}
+        )
+        if not expected_nonpass <= set(current_identities):
+            raise WorkflowError(
+                "repair bundle lacks a current child for terminal non-PASS gate evidence"
+            )
+        failures: list[FailureEvidenceRef] = []
+        evidence_uuids: set[str] = set()
+        for child in current:
+            if (
+                child.phase not in {"review", "qa", "integration_qa"}
+                or child.active
+                or child.status not in _TERMINAL_CHILD_STATUSES
+                or dict(child.creation_candidate_shas)
+                != dict(state.snapshot.candidate_shas)
+                or child.phase_result not in _PHASE_RESULTS
+                or not _canonical_uuid(child.evidence_comment_uuid)
+                or not _canonical_comment_url(
+                    child.evidence_comment_url,
+                    child.evidence_comment_uuid,
+                )
+                or child.evidence_comment_uuid in evidence_uuids
+            ):
+                raise WorkflowError("repair bundle source Stage evidence is incomplete")
+            evidence_uuids.add(child.evidence_comment_uuid)
+
+            if child.phase in {"review", "qa"}:
+                evidence_by_repository = (
+                    state.snapshot.reviews if child.phase == "review" else state.snapshot.qa
+                )
+                evidence = evidence_by_repository.get(child.repository_key)
+                expected_owners = (child.repository_key,) if child.phase_result != "pass" else ()
+                if (
+                    evidence is None
+                    or evidence.candidate_sha
+                    != state.snapshot.candidate_shas.get(child.repository_key)
+                    or evidence.result != child.phase_result
+                    or child.target_key != child.repository_key
+                    or child.suite_key
+                    or child.responsible_repositories != expected_owners
+                ):
+                    raise WorkflowError("repair bundle repository evidence is inconsistent")
+            else:
+                suite_repositories = applicable_suites.get(child.suite_key)
+                evidence = state.snapshot.integration_qa.get(child.suite_key)
+                if (
+                    suite_repositories is None
+                    or evidence is None
+                    or dict(evidence.candidate_shas)
+                    != dict(state.snapshot.candidate_shas)
+                    or evidence.result != child.phase_result
+                    or (
+                        child.phase_result == "pass"
+                        and child.responsible_repositories
+                    )
+                    or (
+                        child.phase_result != "pass"
+                        and (
+                            not child.responsible_repositories
+                            or not set(child.responsible_repositories)
+                            <= suite_repositories
+                        )
+                    )
+                ):
+                    raise WorkflowError("repair bundle integration evidence is inconsistent")
+
+            if child.phase_result != "pass":
+                failures.append(
+                    FailureEvidenceRef(
+                        child_identifier=child.identifier,
+                        phase=child.phase,
+                        result=child.phase_result,
+                        stage_ordinal=child.stage_ordinal,
+                        repair_round=child.attempt,
+                        candidate_shas=child.creation_candidate_shas,
+                        responsible_repositories=child.responsible_repositories,
+                        evidence_comment_uuid=child.evidence_comment_uuid,
+                        evidence_comment_url=child.evidence_comment_url,
+                        suite_key=child.suite_key,
+                    )
+                )
+        owners = frozenset(
+            repository
+            for failure in failures
+            for repository in failure.responsible_repositories
+        )
+        if not failures or owners != frozenset(decision.repositories):
+            raise WorkflowError("repair decision disagrees with complete failure ownership")
+        snapshot_bundle = FailureBundle.build(
+            state.parent_identifier,
+            state.metadata.workflow_version,
+            state.metadata.stage_ordinal,
+            decision.next_attempt,
+            state.snapshot.candidate_shas,
+            tuple(failures),
+        )
+        if snapshot_bundle != authoritative_bundle:
+            raise WorkflowError(
+                "repair bundle aggregate evidence conflicts with source Gate authority"
+            )
+        return authoritative_bundle
+
+    def _repair_authority(
+        self,
+        state: WorkflowState,
+        bundle: FailureBundle,
+    ) -> tuple[int, bool]:
+        if state.metadata is None:
+            raise WorkflowError("repair authority lacks parent metadata")
+        metadata = state.metadata
+        next_round = metadata.repair_round + 1
+        automatic_limit = self.manifest.policy.max_repair_attempts
+        if bundle.repair_round != next_round:
+            raise WorkflowError("repair authority does not match the failure bundle round")
+        if next_round <= automatic_limit:
+            if metadata.automatic_repairs_used != metadata.repair_round:
+                raise WorkflowError("automatic repair accounting is not contiguous")
+            return next_round, True
+        if (
+            next_round != automatic_limit + 1
+            or metadata.repair_round != automatic_limit
+            or metadata.automatic_repairs_used != automatic_limit
+        ):
+            raise WorkflowError("only one member-authorized repair round is allowed")
+        authorization = metadata.repair_authorization
+        if (
+            authorization is None
+            or authorization.bundle_digest != bundle.digest
+            or authorization.granted_round != next_round
+            or any(
+                child.authorizing_comment_uuid == authorization.comment_uuid
+                for child in state.children
+            )
+        ):
+            raise WorkflowError("repair authorization is absent, stale, or already consumed")
+        try:
+            comment = self.snapshot_reader.read_authorizing_comment(
+                state.parent_identifier,
+                authorization.comment_uuid,
+            )
+        except Exception as error:
+            raise WorkflowError("repair authorization comment could not be reread") from error
+        if not _repair_authorization_comment_matches(
+            comment,
+            comment_uuid=authorization.comment_uuid,
+            bundle_digest=bundle.digest,
+            granted_round=next_round,
+            authorization=authorization,
+        ):
+            raise WorkflowError("repair authorization comment is not authoritative")
+        return next_round, False
+
+    @staticmethod
+    def _repair_requests(
+        state: WorkflowState,
+        decision: ParentDecision,
+        bundle: FailureBundle,
+        ordinal: int,
+        authorizing_comment_uuid: str = "",
+    ) -> tuple[ChildRequest, ...]:
+        assert decision.next_attempt is not None
+        return tuple(
+            ChildRequest(
+                target_key=repository,
+                repository_key=repository,
+                suite_key="",
+                phase="repair",
+                stage_ordinal=ordinal,
+                attempt=decision.next_attempt,
+                candidate_shas=state.snapshot.candidate_shas,
+                pull_request=state.pull_requests[repository],
+                failure_bundle=bundle,
+                failure_refs=bundle.for_repository(repository),
+                authorizing_comment_uuid=authorizing_comment_uuid,
+            )
+            for repository in decision.repositories
+        )
+
     @staticmethod
     def _has_successor(state: WorkflowState, requests: tuple[ChildRequest, ...]) -> bool:
         wanted = {
@@ -2058,6 +3428,687 @@ class GenericWorkflow:
         return any(
             (child.target_key, child.phase, child.attempt) in wanted
             for child in state.children
+        )
+
+    @staticmethod
+    def _successor_request_identity(
+        request: ChildRequest,
+        action_key: str,
+    ) -> tuple[object, ...]:
+        return (
+            request.target_key,
+            request.repository_key,
+            request.suite_key,
+            request.phase,
+            request.stage_ordinal,
+            request.attempt,
+            action_key,
+            tuple(request.candidate_shas.items()),
+            "" if request.failure_bundle is None else request.failure_bundle.digest,
+            _failure_uuid_partition(request.failure_refs),
+            request.authorizing_comment_uuid,
+        )
+
+    @staticmethod
+    def _successor_child_identity(child: WorkflowChild) -> tuple[object, ...]:
+        return (
+            child.target_key,
+            child.repository_key,
+            child.suite_key,
+            child.phase,
+            child.stage_ordinal,
+            child.attempt,
+            child.action_key,
+            tuple(child.creation_candidate_shas.items()),
+            child.failure_bundle_digest,
+            child.failure_evidence_uuids,
+            child.authorizing_comment_uuid,
+        )
+
+    def _authoritative_terminal_successor_actions(
+        self,
+        state: WorkflowState,
+        current: tuple[WorkflowChild, ...],
+        source_candidates: Mapping[str, str],
+        creation_action: str,
+    ) -> frozenset[str] | None:
+        """Validate exact completion authority for a partial successor prefix."""
+
+        actions: set[str] = set()
+        evidence_uuids: set[str] = set()
+        completed_implementations: dict[
+            str,
+            tuple[WorkflowChild, str],
+        ] = {}
+        applicable_suites = {
+            suite.key: suite
+            for suite in self.manifest.integration_suites
+            if set(suite.repositories)
+            <= set(state.snapshot.affected_repositories)
+        }
+        for child in current:
+            if child.active and child.status in _ACTIVE_CHILD_STATUSES:
+                if (
+                    child.evidence_comment_uuid
+                    or child.phase_result
+                    or child.evidence_comment_url
+                    or child.responsible_repositories
+                ):
+                    return None
+                continue
+            if (
+                child.status != "done"
+                or child.active
+                or child.phase_result not in _PHASE_RESULTS
+                or not _canonical_uuid(child.evidence_comment_uuid)
+                or not _canonical_comment_url(
+                    child.evidence_comment_url,
+                    child.evidence_comment_uuid,
+                )
+                or child.evidence_comment_uuid in evidence_uuids
+            ):
+                return None
+            evidence_uuids.add(child.evidence_comment_uuid)
+            pull_request = state.pull_requests.get(child.repository_key)
+            if pull_request is None:
+                return None
+            try:
+                reads = tuple(
+                    self.snapshot_reader.read_phase_completion(
+                        state.parent_identifier,
+                        child.evidence_comment_uuid,
+                    )
+                    for _ in range(2)
+                )
+            except Exception:
+                return None
+            if (
+                reads[0] != reads[1]
+                or type(reads[0]) is not PhaseCompletion
+                or reads[0].pull_request_url not in {"", pull_request.url}
+            ):
+                return None
+            observed = reads[0]
+            if child.phase == "implementation":
+                aggregate = state.snapshot.children.get(child.repository_key)
+                if (
+                    child.target_key != child.repository_key
+                    or child.suite_key
+                    or child.responsible_repositories
+                    or aggregate is None
+                    or aggregate.result != child.phase_result
+                ):
+                    return None
+                candidate_sha = aggregate.candidate_sha
+                completion_candidates: Mapping[str, str] = {}
+            elif child.phase in {"review", "qa"}:
+                aggregate = (
+                    state.snapshot.reviews.get(child.repository_key)
+                    if child.phase == "review"
+                    else state.snapshot.qa.get(child.repository_key)
+                )
+                expected_owners = (
+                    (child.repository_key,)
+                    if child.phase_result != "pass"
+                    else ()
+                )
+                if (
+                    child.target_key != child.repository_key
+                    or child.suite_key
+                    or child.repository_key not in source_candidates
+                    or child.responsible_repositories != expected_owners
+                    or aggregate
+                    != RepositoryEvidence(
+                        source_candidates[child.repository_key],
+                        child.phase_result,
+                    )
+                ):
+                    return None
+                candidate_sha = source_candidates[child.repository_key]
+                completion_candidates = {}
+            elif child.phase == "integration_qa":
+                suite = applicable_suites.get(child.suite_key)
+                aggregate = state.snapshot.integration_qa.get(child.suite_key)
+                if (
+                    suite is None
+                    or child.target_key != suite.key
+                    or child.repository_key != suite.command_repository
+                    or child.repository_key not in source_candidates
+                    or (
+                        child.phase_result == "pass"
+                        and child.responsible_repositories
+                    )
+                    or (
+                        child.phase_result != "pass"
+                        and (
+                            not child.responsible_repositories
+                            or not set(child.responsible_repositories)
+                            <= set(suite.repositories)
+                        )
+                    )
+                    or aggregate
+                    != GateEvidence(
+                        source_candidates,
+                        child.phase_result,
+                        child.responsible_repositories,
+                    )
+                ):
+                    return None
+                candidate_sha = source_candidates[child.repository_key]
+                completion_candidates = source_candidates
+            else:
+                return None
+            expected = PhaseCompletion(
+                parent_identifier=state.parent_identifier,
+                repository_key=child.repository_key,
+                phase=child.phase,
+                result=child.phase_result,
+                attempt=child.attempt,
+                candidate_sha=candidate_sha,
+                pull_request_url=observed.pull_request_url,
+                evidence_comment_uuid=child.evidence_comment_uuid,
+                evidence_comment_url=child.evidence_comment_url,
+                suite_key=child.suite_key,
+                candidate_shas=completion_candidates,
+                responsible_repositories=child.responsible_repositories,
+            )
+            if (
+                _phase_completion_schema_problem(
+                    expected,
+                    manifest=self.manifest,
+                )
+                is not None
+                or observed != expected
+            ):
+                return None
+            if child.phase == "implementation":
+                completed_implementations[child.repository_key] = (
+                    child,
+                    candidate_sha,
+                )
+                continue
+            action_candidates = (
+                completion_candidates
+                if child.phase == "integration_qa"
+                else {
+                    **source_candidates,
+                    child.repository_key: candidate_sha,
+                }
+            )
+            completion_action = self._action_key(
+                state,
+                f"{child.phase}:{child.target_key}",
+                child.stage_ordinal,
+                attempt=child.attempt,
+                candidate_shas=action_candidates,
+            )
+            if (
+                completion_action == creation_action
+                or completion_action not in state.applied_action_keys
+            ):
+                return None
+            actions.add(completion_action)
+        if completed_implementations:
+            implementation_actions = self._completed_candidate_action_chain(
+                state,
+                source_candidates,
+                completed_implementations,
+            )
+            if implementation_actions is None:
+                return None
+            actions.update(implementation_actions.values())
+        return frozenset(actions)
+
+    def _nonrepair_successor_heads_still_current(
+        self,
+        state: WorkflowState,
+        expected_candidates: Mapping[str, str],
+    ) -> WorkflowResult | None:
+        """Recheck every immutable non-Repair reservation head around the parent."""
+
+        repositories = set(expected_candidates)
+        if (
+            not repositories <= set(state.snapshot.pull_requests)
+            or not repositories <= set(state.pull_requests)
+            or not repositories <= set(state.snapshot.affected_repositories)
+            or any(
+                state.snapshot.pull_requests[repository].head_sha
+                != expected_candidates[repository]
+                or state.snapshot.pull_requests[repository].state != "open"
+                for repository in repositories
+            )
+        ):
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor pull-request evidence conflicts with its reservation",
+            )
+
+        def read_heads() -> tuple[tuple[object, ...], ...] | None:
+            observed: list[tuple[object, ...]] = []
+            try:
+                for repository in sorted(repositories):
+                    target = state.pull_requests[repository]
+                    specification = self.manifest.repositories[repository]
+                    expected_url = (
+                        f"https://github.com/{specification.github}/pull/{target.number}"
+                    )
+                    pull_request = self.github.get_pull_request(
+                        specification.github,
+                        target.number,
+                    )
+                    if (
+                        type(pull_request) is not PullRequestInfo
+                        or target.repository_key != repository
+                        or target.url != expected_url
+                        or pull_request.repository != specification.github
+                        or pull_request.number != target.number
+                        or pull_request.state != "open"
+                        or pull_request.head_sha != expected_candidates[repository]
+                        or pull_request.base_ref != specification.default_branch
+                        or pull_request.merged_at is not None
+                        or pull_request.merge_commit_sha is not None
+                    ):
+                        return None
+                    observed.append(
+                        (
+                            pull_request.repository,
+                            pull_request.number,
+                            pull_request.state,
+                            pull_request.head_sha,
+                            pull_request.base_ref,
+                            pull_request.merged_at,
+                            pull_request.merge_commit_sha,
+                        )
+                    )
+            except Exception:
+                return None
+            return tuple(observed)
+
+        first = read_heads()
+        if first is None:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor pull-request head authority is unavailable",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        second = read_heads()
+        if second is None or second != first:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor pull-request heads changed during fan-in",
+            )
+        return self._parent_fan_in_still_current(state)
+
+    def _reconcile_nonrepair_successor(
+        self,
+        state: WorkflowState,
+    ) -> WorkflowResult | None:
+        metadata = state.metadata
+        if type(metadata) is not ParentMetadata:
+            return None
+        current = tuple(
+            child
+            for child in state.children
+            if (
+                child.stage_ordinal == metadata.stage_ordinal
+                and child.attempt == metadata.repair_round
+            )
+            or (
+                child.active
+                and child.status in _ACTIVE_CHILD_STATUSES
+                and child.action_key == metadata.last_action
+            )
+        )
+        if not current or all(child.phase == "repair" for child in current):
+            return None
+        if any(child.phase == "repair" for child in current):
+            return self._zero_mutation_block(
+                state,
+                "current successor reservation mixes repair and non-repair children",
+            )
+        phases = frozenset(child.phase for child in current)
+        if (
+            phases <= {"review", "qa", "integration_qa"}
+            and not metadata.last_action.startswith(("stage:", "review:", "qa:"))
+        ):
+            return None
+        creation_candidate_maps = {
+            tuple(child.creation_candidate_shas.items())
+            for child in current
+        }
+        if len(creation_candidate_maps) != 1:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor reservation has conflicting creation candidates",
+            )
+        source_candidates = dict(next(iter(creation_candidate_maps)))
+        request_state = replace(
+            state,
+            snapshot=replace(
+                state.snapshot,
+                candidate_shas=source_candidates,
+            ),
+        )
+        if phases <= {"review", "qa", "integration_qa"}:
+            if source_candidates != dict(state.snapshot.candidate_shas):
+                return self._zero_mutation_block(
+                    state,
+                    "Gate successor reservation creation candidates changed",
+                )
+            stage_kind = "gates"
+            requests = self._complete_gate_requests(
+                request_state,
+                metadata.stage_ordinal,
+            )
+        elif phases == {"implementation"}:
+            current_repositories = {
+                child.repository_key
+                for child in current
+                if child.stage_ordinal == metadata.stage_ordinal
+            }
+            baseline_snapshot = replace(
+                request_state.snapshot,
+                children={
+                    repository: evidence
+                    for repository, evidence in state.snapshot.children.items()
+                    if repository not in current_repositories
+                },
+            )
+            baseline = decide_parent_action(self.manifest, baseline_snapshot)
+            if (
+                baseline.kind is not DecisionKind.DISPATCH
+                or baseline.dispatch_kind is not DispatchKind.IMPLEMENTATION
+            ):
+                return self._zero_mutation_block(
+                    state,
+                    "implementation successor reservation cannot reconstruct its dependency wave",
+                )
+            stage_kind = "implementation"
+            requests = self._implementation_requests(
+                request_state,
+                baseline.repositories,
+                metadata.stage_ordinal,
+            )
+        else:
+            return self._zero_mutation_block(
+                state,
+                "current non-repair successor reservation has mixed phase kinds",
+            )
+        action_key = self._action_key(
+            state,
+            stage_kind,
+            metadata.stage_ordinal,
+            attempt=metadata.repair_round,
+            candidate_shas=source_candidates,
+        )
+        terminal_actions = self._authoritative_terminal_successor_actions(
+            state,
+            current,
+            source_candidates,
+            action_key,
+        )
+        if terminal_actions is None:
+            return self._zero_mutation_block(
+                state,
+                "partial successor terminal evidence is missing or conflicting",
+            )
+        if terminal_actions:
+            if (
+                action_key not in state.applied_action_keys
+                or metadata.last_action not in terminal_actions
+            ):
+                return self._zero_mutation_block(
+                    state,
+                    "partial successor terminal action provenance is conflicting",
+                )
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+            refreshed_actions = self._authoritative_terminal_successor_actions(
+                state,
+                current,
+                source_candidates,
+                action_key,
+            )
+            if refreshed_actions != terminal_actions:
+                return self._zero_mutation_block(
+                    state,
+                    "partial successor terminal evidence changed after parent fan-in",
+                )
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+        elif metadata.last_action != action_key:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor reservation has the wrong creation action",
+            )
+        expected_head_candidates = dict(source_candidates)
+        if phases == {"implementation"}:
+            for child in current:
+                if child.status == "done" and not child.active:
+                    aggregate = state.snapshot.children.get(
+                        child.repository_key
+                    )
+                    if aggregate is None:
+                        return self._zero_mutation_block(
+                            state,
+                            "terminal implementation output is not authoritative",
+                        )
+                    expected_head_candidates[child.repository_key] = (
+                        aggregate.candidate_sha
+                    )
+        wanted = Counter(
+            self._successor_request_identity(request, action_key)
+            for request in requests
+        )
+        observed = Counter(
+            self._successor_child_identity(child)
+            for child in current
+        )
+        if not wanted or observed - wanted:
+            return self._zero_mutation_block(
+                state,
+                "non-repair successor reservation conflicts with its exact intended membership",
+            )
+        if (
+            (
+                observed != wanted
+                or action_key not in state.applied_action_keys
+            )
+            and phases <= {"review", "qa", "integration_qa"}
+        ):
+            predecessor = tuple(
+                child
+                for child in state.children
+                if child.stage_ordinal == metadata.stage_ordinal - 1
+            )
+            predecessor_phases = {child.phase for child in predecessor}
+            expected_predecessor_phase = (
+                "implementation"
+                if metadata.repair_round == 0
+                else "repair"
+            )
+            if (
+                not predecessor
+                or {child.attempt for child in predecessor}
+                != {metadata.repair_round}
+                or predecessor_phases != {expected_predecessor_phase}
+            ):
+                return self._zero_mutation_block(
+                    state,
+                    "Gate successor has the wrong predecessor Stage",
+                )
+            if expected_predecessor_phase == "repair":
+                repair_problem = self._terminal_repair_wave_authority_problem(
+                    state,
+                    stage_ordinal=metadata.stage_ordinal - 1,
+                    attempt=metadata.repair_round,
+                )
+                if repair_problem is not None:
+                    return repair_problem
+            else:
+                predecessor_candidates = {
+                    tuple(child.creation_candidate_shas.items())
+                    for child in predecessor
+                }
+                repositories = tuple(
+                    child.repository_key for child in predecessor
+                )
+                if (
+                    len(predecessor_candidates) != 1
+                    or len(repositories) != len(set(repositories))
+                    or any(
+                        child.status != "done"
+                        or child.active
+                        or child.phase_result != "pass"
+                        for child in predecessor
+                    )
+                ):
+                    return self._zero_mutation_block(
+                        state,
+                        "Gate successor Implementation predecessor is conflicting",
+                    )
+                implementation_candidates = dict(
+                    next(iter(predecessor_candidates))
+                )
+                implementation_action = self._action_key(
+                    state,
+                    "implementation",
+                    metadata.stage_ordinal - 1,
+                    attempt=metadata.repair_round,
+                    candidate_shas=implementation_candidates,
+                )
+                observed_predecessor_actions = (
+                    self._authoritative_terminal_successor_actions(
+                        state,
+                        predecessor,
+                        implementation_candidates,
+                        implementation_action,
+                    )
+                )
+                if (
+                    implementation_action not in state.applied_action_keys
+                    or any(
+                        child.action_key != implementation_action
+                        for child in predecessor
+                    )
+                    or observed_predecessor_actions is None
+                    or len(observed_predecessor_actions) != len(predecessor)
+                ):
+                    return self._zero_mutation_block(
+                        state,
+                        "Gate successor Implementation predecessor lacks authority",
+                    )
+                fan_in_problem = self._parent_fan_in_still_current(state)
+                if fan_in_problem is not None:
+                    return fan_in_problem
+                refreshed_predecessor_actions = (
+                    self._authoritative_terminal_successor_actions(
+                        state,
+                        predecessor,
+                        implementation_candidates,
+                        implementation_action,
+                    )
+                )
+                if refreshed_predecessor_actions != observed_predecessor_actions:
+                    return self._zero_mutation_block(
+                        state,
+                        "Gate successor Implementation predecessor changed during fan-in",
+                    )
+                fan_in_problem = self._parent_fan_in_still_current(state)
+                if fan_in_problem is not None:
+                    return fan_in_problem
+        if observed == wanted and action_key in state.applied_action_keys:
+            if terminal_actions:
+                head_problem = self._nonrepair_successor_heads_still_current(
+                    state,
+                    expected_head_candidates,
+                )
+                if head_problem is not None:
+                    return head_problem
+                return None
+            head_problem = self._nonrepair_successor_heads_still_current(
+                state,
+                source_candidates,
+            )
+            if head_problem is not None:
+                return head_problem
+            return self._result(
+                state,
+                "noop",
+                "complete non-repair successor reservation is already active",
+                action_key=action_key,
+            )
+        head_problem = self._nonrepair_successor_heads_still_current(
+            state,
+            expected_head_candidates,
+        )
+        if head_problem is not None:
+            return head_problem
+        missing = wanted - observed
+        missing_counts = Counter(missing)
+        missing_requests: list[ChildRequest] = []
+        for request in requests:
+            identity = self._successor_request_identity(request, action_key)
+            if missing_counts[identity]:
+                missing_requests.append(request)
+                missing_counts[identity] -= 1
+        try:
+            self.executor.create_children(
+                state.parent_identifier,
+                tuple(missing_requests),
+                metadata,
+                action_key=action_key,
+            )
+        except Exception:
+            pass
+
+        def exact_successor(current_state: object) -> bool:
+            if (
+                type(current_state) is not WorkflowState
+                or current_state.parent_identifier != state.parent_identifier
+                or current_state.metadata != metadata
+                or action_key not in current_state.applied_action_keys
+            ):
+                return False
+            exact_current = tuple(
+                child
+                for child in current_state.children
+                if (
+                    child.stage_ordinal == metadata.stage_ordinal
+                    and child.attempt == metadata.repair_round
+                )
+                or child.action_key == action_key
+            )
+            return Counter(
+                self._successor_child_identity(child)
+                for child in exact_current
+            ) == wanted
+
+        observed_state = self._reconcile_parent(
+            state.parent_identifier,
+            exact_successor,
+        )
+        if observed_state is None:
+            return self._uncertain(
+                state,
+                "non-repair successor reservation is not yet complete",
+                action_key=action_key,
+                mutation_count=1,
+            )
+        return self._result(
+            observed_state,
+            "dispatch",
+            "non-repair successor reservation converged",
+            created=tuple(
+                (request.target_key, request.phase)
+                for request in missing_requests
+            ),
+            action_key=action_key,
+            mutation_count=1,
         )
 
     def _dispatch(
@@ -2070,6 +4121,9 @@ class GenericWorkflow:
         if state.metadata is None:
             return self._block(state, "parent has no initialized workflow metadata")
         ordinal = state.metadata.stage_ordinal + 1
+        bundle: FailureBundle | None = None
+        automatic_repair: bool | None = None
+        authorizing_comment_uuid = ""
         if repair:
             if decision.next_attempt is None:
                 return self._block(state, "repair decision lacks the next attempt")
@@ -2091,22 +4145,72 @@ class GenericWorkflow:
                         state,
                         "repair pull request target is outside the manifest repository",
                     )
-            requests = tuple(
-                ChildRequest(
-                    repository,
-                    repository,
-                    "",
-                    "repair",
+            try:
+                bundle = self._failure_bundle(state, decision)
+                authority_round, automatic_repair = self._repair_authority(state, bundle)
+                if authority_round != decision.next_attempt:
+                    raise WorkflowError("repair decision disagrees with its authority")
+                if not automatic_repair:
+                    assert state.metadata.repair_authorization is not None
+                    authorizing_comment_uuid = (
+                        state.metadata.repair_authorization.comment_uuid
+                    )
+                requests = self._repair_requests(
+                    state,
+                    decision,
+                    bundle,
                     ordinal,
-                    decision.next_attempt,
-                    state.snapshot.candidate_shas,
-                    state.pull_requests[repository],
+                    authorizing_comment_uuid,
                 )
-                for repository in decision.repositories
-            )
+            except (MetadataError, WorkflowError, TypeError, ValueError):
+                return self._zero_mutation_block(
+                    state,
+                    "complete failure evidence or repair authority could not be validated",
+                )
             stage_kind = "repair"
             attempt = decision.next_attempt
             next_action = "repair"
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+            refreshed_bundle = self._authoritative_source_gate_failure_bundle(
+                state,
+                source_stage=state.metadata.stage_ordinal,
+                source_attempt=state.snapshot.attempt,
+                repair_round=decision.next_attempt,
+                source=state.snapshot.candidate_shas,
+            )
+            if refreshed_bundle != bundle:
+                return self._zero_mutation_block(
+                    state,
+                    "repair source Gate evidence changed after parent fan-in",
+                )
+            if automatic_repair is False:
+                authorization = state.metadata.repair_authorization
+                try:
+                    comment = self.snapshot_reader.read_authorizing_comment(
+                        state.parent_identifier,
+                        authorizing_comment_uuid,
+                    )
+                except Exception:
+                    return self._zero_mutation_block(
+                        state,
+                        "repair authorization changed after parent fan-in",
+                    )
+                if authorization is None or not _repair_authorization_comment_matches(
+                    comment,
+                    comment_uuid=authorizing_comment_uuid,
+                    bundle_digest=bundle.digest,
+                    granted_round=decision.next_attempt,
+                    authorization=authorization,
+                ):
+                    return self._zero_mutation_block(
+                        state,
+                        "repair authorization changed after parent fan-in",
+                    )
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
         else:
             if decision.dispatch_kind is DispatchKind.GATES:
                 requests = self._gate_requests(state, ordinal)
@@ -2124,21 +4228,82 @@ class GenericWorkflow:
             next_action = "dispatch"
         if not requests:
             return self._result(state, "noop", "requested successor already exists")
-        if self._has_successor(state, requests):
-            return self._result(state, "noop", "an intended successor already exists")
         key = self._action_key(
             state,
             stage_kind,
             ordinal,
             attempt=attempt,
+            failure_bundle_digest="" if bundle is None else bundle.digest,
+            authorizing_comment_uuid=authorizing_comment_uuid,
         )
+
+        wanted = Counter(
+            self._successor_request_identity(request, key)
+            for request in requests
+        )
+
+        def relevant_repair_children(
+            workflow_state: WorkflowState,
+        ) -> tuple[WorkflowChild, ...]:
+            return tuple(
+                child
+                for child in workflow_state.children
+                if child.phase == "repair"
+                and child.attempt == decision.next_attempt
+            )
+
+        if repair:
+            observed_successors = Counter(
+                self._successor_child_identity(child)
+                for child in relevant_repair_children(state)
+            )
+            if observed_successors:
+                if (
+                    observed_successors == wanted
+                    and key in state.applied_action_keys
+                ):
+                    return self._result(state, "noop", "repair bundle successors already exist")
+                return self._zero_mutation_block(
+                    state,
+                    "repair successor bundle identity conflicts with the complete failure bundle",
+                )
+        else:
+            observed_successors = Counter(
+                self._successor_child_identity(child)
+                for child in state.children
+                if child.stage_ordinal == ordinal
+                and child.attempt == attempt
+                and child.phase != "repair"
+            )
+            if observed_successors:
+                if (
+                    observed_successors == wanted
+                    and key in state.applied_action_keys
+                ):
+                    return self._result(
+                        state,
+                        "noop",
+                        "non-repair successors already exist",
+                        action_key=key,
+                    )
+                return self._zero_mutation_block(
+                    state,
+                    "non-repair successor identity conflicts with its intended membership",
+                )
+            if self._has_successor(state, requests):
+                return self._zero_mutation_block(
+                    state,
+                    "historical successor collides with the exact current plan",
+                )
         if key in state.applied_action_keys:
             return self._result(state, "noop", "coordinator action already exists", action_key=key)
         metadata = self._metadata(
             state,
             action_key=key,
             stage_ordinal=ordinal,
-            attempt=attempt,
+            attempt=attempt if repair else None,
+            automatic_repair=automatic_repair,
+            consume_repair_authorization=(repair and automatic_repair is False),
         )
         try:
             self.executor.create_children(
@@ -2150,41 +4315,33 @@ class GenericWorkflow:
         except Exception:
             # Reconcile because the effect may have committed before failing.
             pass
-        wanted = {
-            (
-                request.target_key,
-                request.repository_key,
-                request.suite_key,
-                request.phase,
-                request.stage_ordinal,
-                request.attempt,
-                key,
-                tuple(request.candidate_shas.items()),
+
+        def successor_creation_matches(current: object) -> bool:
+            if (
+                not isinstance(current, WorkflowState)
+                or current.parent_identifier != state.parent_identifier
+                or current.metadata != metadata
+                or key not in current.applied_action_keys
+            ):
+                return False
+            if repair:
+                observed_successors = Counter(
+                    self._successor_child_identity(child)
+                    for child in relevant_repair_children(current)
+                )
+                return observed_successors == wanted
+            observed_children = Counter(
+                self._successor_child_identity(child)
+                for child in current.children
+                if child.stage_ordinal == ordinal
+                and child.attempt == attempt
+                and child.phase != "repair"
             )
-            for request in requests
-        }
+            return observed_children == wanted
+
         observed = self._reconcile_parent(
             state.parent_identifier,
-            lambda current: (
-                isinstance(current, WorkflowState)
-                and current.parent_identifier == state.parent_identifier
-                and current.metadata == metadata
-                and key in current.applied_action_keys
-                and wanted
-                <= {
-                    (
-                        child.target_key,
-                        child.repository_key,
-                        child.suite_key,
-                        child.phase,
-                        child.stage_ordinal,
-                        child.attempt,
-                        child.action_key,
-                        tuple(child.creation_candidate_shas.items()),
-                    )
-                    for child in current.children
-                }
-            ),
+            successor_creation_matches,
         )
         if observed is None:
             return self._uncertain(
@@ -2203,17 +4360,337 @@ class GenericWorkflow:
             mutation_count=1,
         )
 
+    def _reconcile_repair_successor(
+        self,
+        state: WorkflowState,
+    ) -> WorkflowResult | None:
+        """Complete one exact partially-created current Repair reservation."""
+
+        metadata = state.metadata
+        if type(metadata) is not ParentMetadata or metadata.repair_round < 1:
+            return None
+        stage_children = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == metadata.stage_ordinal
+        )
+        problem = "partial Repair successor reservation is conflicting"
+        repair_children = tuple(
+            child for child in stage_children if child.phase == "repair"
+        )
+        if not repair_children:
+            if any(
+                child.phase == "repair"
+                and child.attempt == metadata.repair_round
+                for child in state.children
+            ):
+                return self._zero_mutation_block(state, problem)
+            return None
+        if (
+            any(child.phase != "repair" for child in stage_children)
+            or any(child.attempt != metadata.repair_round for child in stage_children)
+            or any(
+                child.phase == "repair"
+                and child.attempt == metadata.repair_round
+                and child.stage_ordinal != metadata.stage_ordinal
+                for child in state.children
+            )
+        ):
+            return self._zero_mutation_block(state, problem)
+
+        first = repair_children[0]
+        source = dict(first.creation_candidate_shas)
+        affected = set(state.snapshot.affected_repositories)
+        if (
+            not source
+            or set(source) != affected
+            or set(state.snapshot.candidate_shas) != affected
+            or set(state.snapshot.pull_requests) != affected
+            or set(state.pull_requests) != affected
+        ):
+            return self._zero_mutation_block(state, problem)
+        bundle = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=metadata.stage_ordinal - 1,
+            source_attempt=metadata.repair_round - 1,
+            repair_round=metadata.repair_round,
+            source=source,
+        )
+        if type(bundle) is not FailureBundle:
+            return self._zero_mutation_block(state, problem)
+        owners = frozenset(
+            repository
+            for failure in bundle.failures
+            for repository in failure.responsible_repositories
+        )
+        authorization_uuid = first.authorizing_comment_uuid
+        creation_action = self._action_key(
+            state,
+            "repair",
+            metadata.stage_ordinal,
+            attempt=metadata.repair_round,
+            candidate_shas=source,
+            failure_bundle_digest=bundle.digest,
+            authorizing_comment_uuid=authorization_uuid,
+        )
+        if (
+            not owners
+            or any(
+                child.action_key != creation_action
+                or child.creation_candidate_shas != first.creation_candidate_shas
+                or child.failure_bundle_digest != bundle.digest
+                or child.authorizing_comment_uuid != authorization_uuid
+                or child.failure_evidence_uuids
+                != _failure_uuid_partition(
+                    bundle.for_repository(child.repository_key)
+                )
+                or child.repository_key not in owners
+                or child.target_key != child.repository_key
+                or child.suite_key
+                for child in repair_children
+            )
+        ):
+            return self._zero_mutation_block(state, problem)
+        observed = Counter(child.repository_key for child in repair_children)
+        if any(count != 1 for count in observed.values()) or not set(observed) <= owners:
+            return self._zero_mutation_block(state, problem)
+        if set(observed) == owners and creation_action in state.applied_action_keys:
+            # A complete reservation belongs to the normal current-Repair
+            # validator and terminal fan-in barrier.  This recovery path only
+            # owns committed prefixes or an unrecorded creation action.
+            return None
+
+        expected_candidates = dict(source)
+        for repository in affected:
+            child = next(
+                (
+                    item
+                    for item in repair_children
+                    if item.repository_key == repository
+                ),
+                None,
+            )
+            aggregate = state.snapshot.children.get(repository)
+            pull_request = state.snapshot.pull_requests[repository]
+            if child is None:
+                if (
+                    repository in owners
+                    and (
+                        state.snapshot.candidate_shas[repository]
+                        != source[repository]
+                        or pull_request.head_sha != source[repository]
+                        or aggregate is None
+                        or aggregate.result != "pass"
+                        or aggregate.candidate_sha != source[repository]
+                    )
+                ):
+                    return self._zero_mutation_block(state, problem)
+                if repository not in owners and (
+                    state.snapshot.candidate_shas[repository]
+                    != source[repository]
+                    or pull_request.head_sha != source[repository]
+                ):
+                    return self._zero_mutation_block(state, problem)
+                continue
+            if child.active and child.status in _ACTIVE_CHILD_STATUSES:
+                if (
+                    state.snapshot.candidate_shas[repository]
+                    != source[repository]
+                    or aggregate is None
+                    or aggregate.result != "pending"
+                    or aggregate.candidate_sha not in {"", source[repository]}
+                ):
+                    return self._zero_mutation_block(state, problem)
+                continue
+            if (
+                child.status != "done"
+                or child.active
+                or child.phase_result != "pass"
+                or aggregate is None
+                or aggregate.result != "pass"
+                or aggregate.candidate_sha
+                != state.snapshot.candidate_shas[repository]
+                or state.snapshot.candidate_shas[repository] == source[repository]
+                or pull_request.head_sha
+                != state.snapshot.candidate_shas[repository]
+            ):
+                return self._zero_mutation_block(state, problem)
+            expected_candidates[repository] = state.snapshot.candidate_shas[repository]
+        if dict(state.snapshot.candidate_shas) != expected_candidates:
+            return self._zero_mutation_block(state, problem)
+
+        def read_authorization() -> AuthorizingComment | None | object:
+            if metadata.repair_round <= self.manifest.policy.max_repair_attempts:
+                return None if not authorization_uuid else object()
+            if not authorization_uuid:
+                return object()
+            try:
+                comment = self.snapshot_reader.read_authorizing_comment(
+                    state.parent_identifier,
+                    authorization_uuid,
+                )
+            except Exception:
+                return object()
+            return (
+                comment
+                if _repair_authorization_comment_matches(
+                    comment,
+                    comment_uuid=authorization_uuid,
+                    bundle_digest=bundle.digest,
+                    granted_round=metadata.repair_round,
+                )
+                else object()
+            )
+
+        wave_authority = self._authoritative_repair_wave_completion_actions(
+            state,
+            first,
+            allow_incomplete_wave=True,
+        )
+        authorization = read_authorization()
+        if (
+            wave_authority is None
+            or type(authorization) is object
+            or not self._last_action_explains_wave(
+                state,
+                repair_children,
+                creation_action,
+                wave_authority,
+            )
+        ):
+            return self._zero_mutation_block(state, problem)
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        refreshed_bundle = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=metadata.stage_ordinal - 1,
+            source_attempt=metadata.repair_round - 1,
+            repair_round=metadata.repair_round,
+            source=source,
+        )
+        refreshed_wave_authority = (
+            self._authoritative_repair_wave_completion_actions(
+                state,
+                first,
+                allow_incomplete_wave=True,
+            )
+        )
+        if (
+            refreshed_bundle != bundle
+            or refreshed_wave_authority != wave_authority
+            or not self._last_action_explains_wave(
+                state,
+                repair_children,
+                creation_action,
+                refreshed_wave_authority,
+            )
+            or read_authorization() != authorization
+        ):
+            return self._zero_mutation_block(state, problem)
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        if not self._last_action_explains_wave(
+            state,
+            repair_children,
+            creation_action,
+            refreshed_wave_authority,
+        ):
+            return self._zero_mutation_block(state, problem)
+
+        requests = tuple(
+            ChildRequest(
+                target_key=repository,
+                repository_key=repository,
+                suite_key="",
+                phase="repair",
+                stage_ordinal=metadata.stage_ordinal,
+                attempt=metadata.repair_round,
+                candidate_shas=source,
+                pull_request=state.pull_requests[repository],
+                failure_bundle=bundle,
+                failure_refs=bundle.for_repository(repository),
+                authorizing_comment_uuid=authorization_uuid,
+            )
+            for repository in metadata.affected_repositories
+            if repository in owners
+        )
+        wanted = Counter(
+            self._successor_request_identity(request, creation_action)
+            for request in requests
+        )
+        observed_identities = Counter(
+            self._successor_child_identity(child) for child in repair_children
+        )
+        if observed_identities - wanted:
+            return self._zero_mutation_block(state, problem)
+        missing = tuple(
+            request
+            for request in requests
+            if self._successor_request_identity(request, creation_action)
+            not in observed_identities
+        )
+        if not missing and creation_action in state.applied_action_keys:
+            return None
+        try:
+            self.executor.create_children(
+                state.parent_identifier,
+                missing,
+                metadata,
+                action_key=creation_action,
+            )
+        except Exception:
+            pass
+
+        def reservation_complete(current: WorkflowState) -> bool:
+            return (
+                current.parent_identifier == state.parent_identifier
+                and current.metadata == metadata
+                and creation_action in current.applied_action_keys
+                and Counter(
+                    self._successor_child_identity(child)
+                    for child in current.children
+                    if child.stage_ordinal == metadata.stage_ordinal
+                    and child.attempt == metadata.repair_round
+                )
+                == wanted
+            )
+
+        current = self._reconcile_parent(
+            state.parent_identifier,
+            reservation_complete,
+        )
+        if current is None:
+            return self._uncertain(
+                state,
+                "Repair successor reservation is not yet authoritatively complete",
+                action_key=creation_action,
+                mutation_count=1,
+            )
+        return self._result(
+            current,
+            "repair",
+            "completed the exact partial Repair successor reservation",
+            created=tuple((request.target_key, request.phase) for request in missing),
+            action_key=creation_action,
+            mutation_count=1,
+        )
+
     def resume_parent(self, parent_identifier: str) -> WorkflowResult:
         try:
             state = self.snapshot_reader.read(parent_identifier)
         except Exception:
             return WorkflowResult(parent_identifier, "blocked", "block", "parent could not be read")
+        legacy_completion = self._completed_legacy_replay(state, parent_identifier)
+        if legacy_completion is not None:
+            return legacy_completion
         problem_result = self._state_problem_result(state, parent_identifier)
         if problem_result is not None:
             return problem_result
         if state.parent_status == "done":
             assert state.metadata is not None
-            completed = decide_parent_action(self.manifest, state.snapshot)
+            completed = self._parent_decision(state)
             key = self._action_key(state, "complete", state.metadata.stage_ordinal)
             if (
                 completed.kind is not DecisionKind.COMPLETE
@@ -2235,7 +4712,72 @@ class GenericWorkflow:
             return self._result(state, "noop", "parent is not active")
         if state.human_wait:
             return self._result(state, "wait", "parent is waiting for a human")
-        decision = decide_parent_action(self.manifest, state.snapshot)
+        nonrepair_successor = self._reconcile_nonrepair_successor(state)
+        if nonrepair_successor is not None:
+            return nonrepair_successor
+        repair_successor = self._reconcile_repair_successor(state)
+        if repair_successor is not None:
+            return repair_successor
+        repair_stage, repair_head_problem = self._current_repair_head_problem(state)
+        if repair_head_problem is not None:
+            return self._zero_mutation_block(state, repair_head_problem)
+        if not repair_stage and not self._candidate_heads_match(state):
+            return self._zero_mutation_block(
+                state,
+                "out-of-band pull-request head change",
+            )
+        if repair_stage:
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+        assert state.metadata is not None
+        automatic_limit = self.manifest.policy.max_repair_attempts
+        if state.metadata.repair_round == automatic_limit + 1:
+            current_children = tuple(
+                child
+                for child in state.children
+                if child.stage_ordinal == state.metadata.stage_ordinal
+                and child.attempt == state.metadata.repair_round
+            )
+            if (
+                current_children
+                and all(
+                    child.phase == "repair"
+                    and child.status in _ACTIVE_CHILD_STATUSES
+                    and child.active
+                    and child.authorizing_comment_uuid
+                    and child.action_key == state.metadata.last_action
+                    for child in current_children
+                )
+                and state.metadata.last_action in state.applied_action_keys
+            ):
+                return self._result(
+                    state,
+                    "noop",
+                    "member-authorized repair successors already exist",
+                    action_key=state.metadata.last_action,
+                )
+        decision = self._parent_decision(state)
+        if (
+            decision.kind is DecisionKind.BLOCK
+            and decision.reason.endswith("automatic repair attempt limit exhausted")
+        ):
+            if state.metadata.repair_round != automatic_limit:
+                return self._zero_mutation_block(
+                    state,
+                    "member-authorized repair round is already consumed",
+                )
+            prior = replace(state.snapshot, attempt=automatic_limit - 1)
+            repair_decision = decide_parent_action(self.manifest, prior)
+            if repair_decision.kind is not DecisionKind.REPAIR:
+                return self._zero_mutation_block(
+                    state,
+                    "automatic repair exhaustion could not be reconstructed",
+                )
+            decision = replace(
+                repair_decision,
+                next_attempt=automatic_limit + 1,
+            )
         if decision.kind in {
             DecisionKind.DISPATCH,
             DecisionKind.REPAIR,
@@ -2249,10 +4791,27 @@ class GenericWorkflow:
         if decision.kind is DecisionKind.DISPATCH:
             if state.snapshot.stalled:
                 return self._result(state, "wait", "stalled work is reserved for bounded recovery")
+            if decision.dispatch_kind is DispatchKind.GATES and repair_stage:
+                repair_authority_problem = (
+                    self._terminal_repair_wave_authority_problem(state)
+                )
+                if repair_authority_problem is not None:
+                    return repair_authority_problem
             return self._dispatch(state, decision)
         if decision.kind is DecisionKind.REPAIR:
             return self._dispatch(state, decision, repair=True)
         if decision.kind is DecisionKind.MERGE:
+            gate_problem = self._current_gate_authority_problem(state)
+            if gate_problem is not None:
+                return self._zero_mutation_block(state, gate_problem)
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+            if self._current_gate_authority_problem(state) is not None:
+                return self._zero_mutation_block(
+                    state,
+                    "current Gate authority changed during merge fan-in",
+                )
             return self.execute_merge_plan(parent_identifier)
         if decision.kind is DecisionKind.SMOKE:
             return self._result(state, "smoke", decision.reason)
@@ -2273,7 +4832,7 @@ class GenericWorkflow:
         fresh_problem = self._state_problem_result(fresh, parent_identifier)
         if fresh_problem is not None:
             return fresh_problem
-        if fresh != state or decide_parent_action(self.manifest, fresh.snapshot) != decision:
+        if fresh != state or self._parent_decision(fresh) != decision:
             return self._result(fresh, "noop", "parent changed before completion")
         assert fresh.metadata is not None
         key = self._action_key(fresh, "complete", fresh.metadata.stage_ordinal)
@@ -2324,6 +4883,298 @@ class GenericWorkflow:
             )
         return self._result(observed, "complete", decision.reason, action_key=key, mutation_count=1)
 
+    def _completed_candidate_action_chain(
+        self,
+        state: WorkflowState,
+        source_candidates: Mapping[str, str],
+        completed: Mapping[str, tuple[WorkflowChild, str]],
+    ) -> Mapping[str, str] | None:
+        """Find an applied incremental completion chain independent of child order."""
+
+        def visit(
+            candidates: dict[str, str],
+            remaining: frozenset[str],
+        ) -> dict[str, str] | None:
+            if not remaining:
+                return (
+                    {}
+                    if candidates == dict(state.snapshot.candidate_shas)
+                    else None
+                )
+            for repository in sorted(remaining):
+                child, candidate = completed[repository]
+                action_candidates = {**candidates, repository: candidate}
+                completion_action = self._action_key(
+                    state,
+                    f"{child.phase}:{child.target_key}",
+                    child.stage_ordinal,
+                    attempt=child.attempt,
+                    candidate_shas=action_candidates,
+                    failure_bundle_digest=(
+                        child.failure_bundle_digest
+                        if child.phase == "repair"
+                        else ""
+                    ),
+                    authorizing_comment_uuid=(
+                        child.authorizing_comment_uuid
+                        if child.phase == "repair"
+                        else ""
+                    ),
+                )
+                if (
+                    completion_action == child.action_key
+                    or completion_action not in state.applied_action_keys
+                ):
+                    continue
+                tail = visit(
+                    action_candidates,
+                    remaining - {repository},
+                )
+                if tail is not None:
+                    return {repository: completion_action, **tail}
+            return None
+
+        chain = visit(dict(source_candidates), frozenset(completed))
+        return None if chain is None else MappingProxyType(chain)
+
+    def _last_action_explains_wave(
+        self,
+        state: WorkflowState,
+        current: tuple[WorkflowChild, ...],
+        creation_action: str,
+        authority: Mapping[str, str] | frozenset[str] | None,
+    ) -> bool:
+        """Bind parent last_action to the exact authoritative current wave."""
+
+        metadata = state.metadata
+        if type(metadata) is not ParentMetadata or authority is None:
+            return False
+        if not authority:
+            return metadata.last_action == creation_action
+        phases = {child.phase for child in current}
+        if phases == {"repair"}:
+            if not isinstance(authority, Mapping):
+                return False
+            actions = tuple(authority.values())
+            return bool(actions) and metadata.last_action == actions[-1]
+        if phases == {"implementation"}:
+            completed: dict[str, tuple[WorkflowChild, str]] = {}
+            source_candidates = dict(current[0].creation_candidate_shas)
+            for child in current:
+                if child.active or child.status in _ACTIVE_CHILD_STATUSES:
+                    continue
+                aggregate = state.snapshot.children.get(child.repository_key)
+                if aggregate is None:
+                    return False
+                completed[child.repository_key] = (
+                    child,
+                    aggregate.candidate_sha,
+                )
+            actions = self._completed_candidate_action_chain(
+                state,
+                source_candidates,
+                completed,
+            )
+            if actions is None or frozenset(actions.values()) != authority:
+                return False
+            ordered = tuple(actions.values())
+            return bool(ordered) and metadata.last_action == ordered[-1]
+        if phases <= {"review", "qa", "integration_qa"}:
+            return (
+                isinstance(authority, frozenset)
+                and metadata.last_action in authority
+            )
+        return False
+
+    def _completed_sibling_candidate_changes(
+        self,
+        state: WorkflowState,
+        child: WorkflowChild,
+    ) -> Mapping[str, str]:
+        """Return candidate changes proven by completed siblings from one creation wave."""
+
+        eligible: dict[str, tuple[WorkflowChild, str]] = {}
+        for sibling in state.children:
+            if (
+                sibling.identifier == child.identifier
+                or sibling.repository_key == child.repository_key
+                or sibling.phase != child.phase
+                or sibling.stage_ordinal != child.stage_ordinal
+                or sibling.attempt != child.attempt
+                or sibling.action_key != child.action_key
+                or sibling.creation_candidate_shas != child.creation_candidate_shas
+                or sibling.failure_bundle_digest != child.failure_bundle_digest
+                or sibling.authorizing_comment_uuid != child.authorizing_comment_uuid
+                or sibling.active
+                or sibling.status not in _TERMINAL_CHILD_STATUSES
+                or sibling.phase_result != "pass"
+                or not _canonical_uuid(sibling.evidence_comment_uuid)
+                or not _canonical_comment_url(
+                    sibling.evidence_comment_url,
+                    sibling.evidence_comment_uuid,
+                )
+                or sibling.target_key != sibling.repository_key
+                or sibling.suite_key
+            ):
+                continue
+            repository = sibling.repository_key
+            evidence = state.snapshot.children.get(repository)
+            pull_request = state.snapshot.pull_requests.get(repository)
+            candidate = state.snapshot.candidate_shas.get(repository)
+            if (
+                evidence is None
+                or evidence.result != "pass"
+                or evidence.candidate_sha != candidate
+                or pull_request is None
+                or pull_request.head_sha != candidate
+            ):
+                continue
+            if child.creation_candidate_shas.get(repository) != candidate:
+                eligible[repository] = (sibling, candidate)
+
+        actions = self._completed_candidate_action_chain(
+            state,
+            child.creation_candidate_shas,
+            eligible,
+        )
+        if actions is None:
+            return MappingProxyType({})
+        return MappingProxyType(
+            {
+                repository: eligible[repository][1]
+                for repository in actions
+            }
+        )
+
+    def _creation_candidates_match(
+        self,
+        state: WorkflowState,
+        child: WorkflowChild,
+    ) -> bool:
+        creation = dict(child.creation_candidate_shas)
+        current = dict(state.snapshot.candidate_shas)
+        if child.phase not in {"implementation", "repair"}:
+            return creation == current
+        sibling_changes = dict(self._completed_sibling_candidate_changes(state, child))
+        expected = dict(creation)
+        expected.update(sibling_changes)
+        return expected == current
+
+    def _child_creation_provenance_problem(
+        self,
+        state: WorkflowState,
+        child: WorkflowChild,
+    ) -> str | None:
+        """Bind one child to its canonical current creation transition."""
+
+        creation_stage_kind = (
+            "gates"
+            if child.phase in {"review", "qa", "integration_qa"}
+            else child.phase
+        )
+        expected_creation_key = self._action_key(
+            state,
+            creation_stage_kind,
+            child.stage_ordinal,
+            attempt=child.attempt,
+            candidate_shas=child.creation_candidate_shas,
+            failure_bundle_digest=(
+                child.failure_bundle_digest
+                if child.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                child.authorizing_comment_uuid
+                if child.phase == "repair"
+                else ""
+            ),
+        )
+        if (
+            child.action_key != expected_creation_key
+            or expected_creation_key not in state.applied_action_keys
+            or not self._creation_candidates_match(state, child)
+        ):
+            return "phase child creation provenance is not current"
+        return None
+
+    def _watcher_child_creation_provenance_problem(
+        self,
+        state: WorkflowState,
+        child: WorkflowChild,
+    ) -> str | None:
+        problem = self._child_creation_provenance_problem(state, child)
+        if problem is not None or child.phase != "repair":
+            return problem
+        # The Repair validator expects an active current executor.  Reconstruct
+        # only that liveness bit for the exact stalled child; every immutable
+        # field and all sibling/source authority still come from the reread.
+        repair_authority_state = replace(
+            state,
+            children=tuple(
+                replace(item, active=True)
+                if item.identifier == child.identifier
+                else item
+                for item in state.children
+            ),
+            active_work=True,
+        )
+        repair_stage, repair_problem = self._current_repair_head_problem(
+            repair_authority_state
+        )
+        if not repair_stage or repair_problem is not None:
+            return repair_problem or "current Repair Stage provenance is unavailable"
+        if child.attempt <= self.manifest.policy.max_repair_attempts:
+            return (
+                None
+                if not child.authorizing_comment_uuid
+                else "automatic Repair child has unexpected authorization"
+            )
+        if not child.authorizing_comment_uuid:
+            return "member-authorized Repair child lacks authorization"
+        try:
+            comments = tuple(
+                self.snapshot_reader.read_authorizing_comment(
+                    state.parent_identifier,
+                    child.authorizing_comment_uuid,
+                )
+                for _ in range(2)
+            )
+        except Exception:
+            return "member-authorized Repair comment is unavailable"
+        if (
+            comments[0] != comments[1]
+            or not _repair_authorization_comment_matches(
+                comments[0],
+                comment_uuid=child.authorizing_comment_uuid,
+                bundle_digest=child.failure_bundle_digest,
+                granted_round=child.attempt,
+            )
+        ):
+            return "member-authorized Repair comment is not authoritative"
+        return None
+
+    @staticmethod
+    def _rerun_child_immutable_provenance(
+        child: WorkflowChild,
+    ) -> tuple[object, ...]:
+        return (
+            child.target_key,
+            child.repository_key,
+            child.suite_key,
+            child.phase,
+            child.stage_ordinal,
+            child.attempt,
+            child.action_key,
+            child.evidence_comment_uuid,
+            tuple(child.creation_candidate_shas.items()),
+            child.phase_result,
+            child.evidence_comment_url,
+            child.responsible_repositories,
+            child.failure_bundle_digest,
+            child.failure_evidence_uuids,
+            child.authorizing_comment_uuid,
+        )
+
     def _completion_problem(
         self,
         state: WorkflowState,
@@ -2331,7 +5182,7 @@ class GenericWorkflow:
     ) -> tuple[str | None, WorkflowChild | None]:
         schema_problem = _phase_completion_schema_problem(
             completion,
-            max_attempt=self.manifest.policy.max_repair_attempts,
+            manifest=self.manifest,
         )
         if schema_problem is not None:
             return schema_problem, None
@@ -2342,7 +5193,7 @@ class GenericWorkflow:
         if (
             not isinstance(completion.attempt, int)
             or isinstance(completion.attempt, bool)
-            or not 0 <= completion.attempt <= self.manifest.policy.max_repair_attempts
+            or not 0 <= completion.attempt <= self.manifest.policy.max_repair_attempts + 1
             or completion.attempt != state.snapshot.attempt
         ):
             return "phase completion attempt is not current", None
@@ -2354,13 +5205,12 @@ class GenericWorkflow:
             observed_uuid = str(uuid.UUID(completion.evidence_comment_uuid))
         except (ValueError, AttributeError, TypeError):
             return "phase completion evidence UUID is malformed", None
-        evidence_url = urlsplit(completion.evidence_comment_url)
         if (
             observed_uuid != completion.evidence_comment_uuid
-            or evidence_url.scheme != "https"
-            or not evidence_url.netloc
-            or evidence_url.username is not None
-            or evidence_url.password is not None
+            or not _canonical_comment_url(
+                completion.evidence_comment_url,
+                completion.evidence_comment_uuid,
+            )
         ):
             return "phase completion evidence is malformed", None
         repository = self.manifest.repositories[completion.repository_key]
@@ -2435,7 +5285,399 @@ class GenericWorkflow:
         )
         if len(matching) != 1:
             return "phase completion does not resolve one active authoritative current-stage child", None
-        return None, matching[0]
+        if (
+            completion.phase == "repair"
+            and matching[0].failure_bundle_digest != completion.failure_bundle_digest
+        ):
+            return "repair completion failure bundle digest does not match assigned child", None
+        child = matching[0]
+        if self._child_creation_provenance_problem(state, child) is not None:
+            return "phase completion child creation provenance is not current", None
+        return None, child
+
+    def _recover_persisted_phase_transition(
+        self,
+        state: WorkflowState,
+        completion: PhaseCompletion,
+    ) -> WorkflowResult:
+        """Finish one exact current child transition whose evidence already exists."""
+
+        if (
+            state.parent_status not in _ACTIVE_PARENT_STATUSES
+            or state.metadata is None
+            or state.snapshot.merged_shas
+            or state.snapshot.merge_state
+            not in {"pending", "not_ready", "ready", "blocked"}
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence is not attached to an active pre-merge parent",
+            )
+        if set(state.pull_requests) - set(state.snapshot.pull_requests):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence lacks managed pull-request head authority",
+            )
+        repair_stage, repair_head_problem = self._current_repair_head_problem(
+            state,
+            completion,
+        )
+        if repair_head_problem is not None:
+            return self._zero_mutation_block(state, repair_head_problem)
+        mismatched_heads = {
+            repository
+            for repository, pull_request in state.snapshot.pull_requests.items()
+            if state.snapshot.candidate_shas.get(repository) != pull_request.head_sha
+        }
+        if not repair_stage and mismatched_heads and (
+            completion.phase not in {"implementation", "repair"}
+            or completion.result != "pass"
+            or mismatched_heads != {completion.repository_key}
+            or state.snapshot.pull_requests[completion.repository_key].head_sha
+            != completion.candidate_sha
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence conflicts with current pull-request heads",
+            )
+        if (
+            completion.phase in {"implementation", "repair"}
+            and completion.result != "pass"
+            and state.snapshot.candidate_shas.get(completion.repository_key)
+            != completion.candidate_sha
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted non-PASS evidence cannot replace a candidate SHA",
+            )
+        completion_problem, child = self._completion_problem(state, completion)
+        if completion_problem is not None or child is None:
+            return self._zero_mutation_block(
+                state,
+                completion_problem
+                or "persisted phase evidence lacks one exact active current child",
+            )
+
+        wave = tuple(
+            item
+            for item in state.children
+            if item.stage_ordinal == child.stage_ordinal
+            and item.attempt == child.attempt
+        )
+        if completion.phase == "repair":
+            if any(item.phase != "repair" for item in wave):
+                return self._zero_mutation_block(
+                    state,
+                    "persisted Repair evidence has conflicting current-wave membership",
+                )
+
+            def read_wave_authority() -> object:
+                return self._authoritative_repair_wave_completion_actions(
+                    state,
+                    child,
+                )
+
+        else:
+            expected_phases = (
+                {"review", "qa", "integration_qa"}
+                if completion.phase in {"review", "qa", "integration_qa"}
+                else {"implementation"}
+            )
+            if (
+                not wave
+                or any(
+                    item.phase not in expected_phases
+                    or item.action_key != child.action_key
+                    or item.creation_candidate_shas
+                    != child.creation_candidate_shas
+                    for item in wave
+                )
+            ):
+                return self._zero_mutation_block(
+                    state,
+                    "persisted phase evidence has conflicting current-wave provenance",
+                )
+
+            def read_wave_authority() -> object:
+                return self._authoritative_terminal_successor_actions(
+                    state,
+                    wave,
+                    child.creation_candidate_shas,
+                    child.action_key,
+                )
+
+        def read_authorization() -> AuthorizingComment | None | object:
+            if completion.phase != "repair":
+                return None
+            if child.attempt <= self.manifest.policy.max_repair_attempts:
+                return None if not child.authorizing_comment_uuid else object()
+            if not child.authorizing_comment_uuid:
+                return object()
+            try:
+                observed = self.snapshot_reader.read_authorizing_comment(
+                    state.parent_identifier,
+                    child.authorizing_comment_uuid,
+                )
+            except Exception:
+                return object()
+            return (
+                observed
+                if _repair_authorization_comment_matches(
+                    observed,
+                    comment_uuid=child.authorizing_comment_uuid,
+                    bundle_digest=child.failure_bundle_digest,
+                    granted_round=child.attempt,
+                )
+                else object()
+            )
+
+        wave_authority = read_wave_authority()
+        authorization = read_authorization()
+        if (
+            wave_authority is None
+            or type(authorization) is object
+            or not self._last_action_explains_wave(
+                state,
+                wave,
+                child.action_key,
+                wave_authority,
+            )
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence lacks stable wave or authorization authority",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        refreshed_wave_authority = read_wave_authority()
+        if (
+            refreshed_wave_authority != wave_authority
+            or not self._last_action_explains_wave(
+                state,
+                wave,
+                child.action_key,
+                refreshed_wave_authority,
+            )
+            or read_authorization() != authorization
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase wave authority changed after parent fan-in",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        if not self._last_action_explains_wave(
+            state,
+            wave,
+            child.action_key,
+            refreshed_wave_authority,
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase parent action is not explained by its wave",
+            )
+
+        try:
+            evidence = tuple(
+                self.snapshot_reader.read_phase_completion(
+                    state.parent_identifier,
+                    completion.evidence_comment_uuid,
+                )
+                for _ in range(2)
+            )
+        except Exception:
+            return self._uncertain(
+                state,
+                "persisted phase evidence could not be revalidated before transition",
+            )
+        if evidence != (completion, completion):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence changed before child transition",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        if not self._last_action_explains_wave(
+            state,
+            wave,
+            child.action_key,
+            refreshed_wave_authority,
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase parent action changed before child transition",
+            )
+
+        previous_candidate_sha = state.snapshot.candidate_shas.get(
+            completion.repository_key
+        )
+        candidate_shas = dict(state.snapshot.candidate_shas)
+        if (
+            completion.phase in {"implementation", "repair"}
+            and completion.result == "pass"
+        ):
+            candidate_shas[completion.repository_key] = completion.candidate_sha
+        action_candidates = (
+            completion.candidate_shas
+            if completion.phase == "integration_qa"
+            else {
+                **state.snapshot.candidate_shas,
+                completion.repository_key: completion.candidate_sha,
+            }
+        )
+        key = self._action_key(
+            state,
+            f"{completion.phase}:{child.target_key}",
+            child.stage_ordinal,
+            attempt=completion.attempt,
+            candidate_shas=action_candidates,
+            failure_bundle_digest=(
+                completion.failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                child.authorizing_comment_uuid
+                if completion.phase == "repair"
+                else ""
+            ),
+        )
+        metadata = self._metadata(
+            state,
+            action_key=key,
+            candidate_shas=candidate_shas,
+            merge_plan=(
+                ()
+                if candidate_shas != dict(state.snapshot.candidate_shas)
+                else state.metadata.merge_plan
+            ),
+            merge_state=(
+                "pending"
+                if candidate_shas != dict(state.snapshot.candidate_shas)
+                else state.metadata.merge_state
+            ),
+        )
+        try:
+            self.executor.mark_child_done(
+                state.parent_identifier,
+                completion,
+                metadata,
+                action_key=key,
+            )
+        except Exception:
+            pass
+        done_state = self._reconcile_parent(
+            state.parent_identifier,
+            lambda current: (
+                isinstance(current, WorkflowState)
+                and current.parent_identifier == state.parent_identifier
+                and current.metadata == metadata
+                and dict(current.snapshot.candidate_shas) == candidate_shas
+                and key in current.applied_action_keys
+                and len(
+                    tuple(
+                        item
+                        for item in current.children
+                        if item.evidence_comment_uuid
+                        == completion.evidence_comment_uuid
+                        and item.status == "done"
+                        and not item.active
+                    )
+                )
+                == 1
+            ),
+        )
+        if done_state is None:
+            return self._uncertain(
+                state,
+                "persisted phase child transition is not yet authoritative",
+                action_key=key,
+                mutation_count=1,
+            )
+        try:
+            final_evidence = tuple(
+                self.snapshot_reader.read_phase_completion(
+                    state.parent_identifier,
+                    completion.evidence_comment_uuid,
+                )
+                for _ in range(2)
+            )
+        except Exception:
+            return self._uncertain(
+                done_state,
+                "persisted phase evidence is unavailable after child transition",
+                action_key=key,
+                mutation_count=1,
+            )
+        if final_evidence != (completion, completion):
+            return self._block(
+                done_state,
+                "persisted phase evidence changed after child transition",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(done_state)
+        if fan_in_problem is not None:
+            return replace(
+                fan_in_problem,
+                completed_child_status="done",
+                mutation_count=1,
+            )
+
+        replacement = (
+            completion.phase in {"implementation", "repair"}
+            and completion.result == "pass"
+            and previous_candidate_sha is not None
+            and previous_candidate_sha != completion.candidate_sha
+        )
+        if replacement:
+            previous_target = state.pull_requests.get(completion.repository_key)
+            current_target = done_state.pull_requests.get(completion.repository_key)
+            pull_request = done_state.snapshot.pull_requests.get(
+                completion.repository_key
+            )
+            if (
+                dict(done_state.snapshot.candidate_shas) != candidate_shas
+                or done_state.snapshot.reviews
+                or done_state.snapshot.qa
+                or done_state.snapshot.integration_qa
+                or done_state.snapshot.smoke_reads
+                or pull_request is None
+                or pull_request.head_sha != completion.candidate_sha
+                or (
+                    completion.phase == "repair"
+                    and (previous_target is None or current_target != previous_target)
+                )
+            ):
+                blocked = self._block(
+                    done_state,
+                    "replacement SHA did not authoritatively invalidate every gate",
+                )
+                return replace(blocked, completed_child_status="done")
+        unfinished = tuple(
+            item
+            for item in done_state.children
+            if item.identifier != child.identifier
+            and item.stage_ordinal == child.stage_ordinal
+            and item.attempt == child.attempt
+            and item.status not in _TERMINAL_CHILD_STATUSES
+        )
+        if unfinished:
+            return self._result(
+                done_state,
+                "wait",
+                "current Stage still has non-terminal sibling work",
+                completed_child_status="done",
+                action_key=key,
+                mutation_count=1,
+            )
+        resumed = self.resume_parent(state.parent_identifier)
+        return replace(
+            resumed,
+            completed_child_status="done",
+            mutation_count=resumed.mutation_count + 1,
+        )
 
     @staticmethod
     def _zero_mutation_block(
@@ -2481,7 +5723,7 @@ class GenericWorkflow:
                     "existing phase evidence could not be read authoritatively",
                 )
         if reads[0] != reads[1]:
-            return self._uncertain(
+            return self._zero_mutation_block(
                 state,
                 "existing phase evidence changed during authoritative read",
             )
@@ -2491,7 +5733,7 @@ class GenericWorkflow:
         if (
             _phase_completion_schema_problem(
                 persisted,
-                max_attempt=self.manifest.policy.max_repair_attempts,
+                manifest=self.manifest,
             )
             is not None
             or persisted != completion
@@ -2521,10 +5763,30 @@ class GenericWorkflow:
             and child.attempt == completion.attempt
             and child.action_key in state.applied_action_keys
         )
+        if not completed:
+            return self._recover_persisted_phase_transition(
+                state,
+                completion,
+            )
         if len(completed) != 1:
             return self._zero_mutation_block(
                 state,
                 "persisted phase evidence lacks one authoritative child transition",
+            )
+        if (
+            completed[0].phase_result != completion.result
+            or completed[0].evidence_comment_url != completion.evidence_comment_url
+            or completed[0].responsible_repositories
+            != completion.responsible_repositories
+            or (
+                completion.phase == "repair"
+                and completed[0].failure_bundle_digest
+                != completion.failure_bundle_digest
+            )
+        ):
+            return self._zero_mutation_block(
+                state,
+                "persisted phase evidence conflicts with the completed child",
             )
         candidate_identity = (
             dict(completion.candidate_shas) == dict(state.snapshot.candidate_shas)
@@ -2550,6 +5812,24 @@ class GenericWorkflow:
             completed[0].stage_ordinal,
             attempt=completed[0].attempt,
             candidate_shas=completed[0].creation_candidate_shas,
+            failure_bundle_digest=(
+                completed[0].failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                completed[0].authorizing_comment_uuid
+                if completion.phase == "repair"
+                else ""
+            ),
+        )
+        repair_completion_actions = (
+            self._authoritative_repair_wave_completion_actions(
+                state,
+                completed[0],
+            )
+            if completion.phase == "repair"
+            else None
         )
         unchanged_creation_candidates = all(
             repository == completion.repository_key
@@ -2560,7 +5840,11 @@ class GenericWorkflow:
             dict(completed[0].creation_candidate_shas)
             == dict(state.snapshot.candidate_shas)
             if completion.phase in {"review", "qa", "integration_qa"}
-            else unchanged_creation_candidates
+            else (
+                repair_completion_actions is not None
+                if completion.phase == "repair"
+                else unchanged_creation_candidates
+            )
         )
         if (
             completed[0].action_key != expected_creation_key
@@ -2571,35 +5855,224 @@ class GenericWorkflow:
                 state,
                 "persisted phase evidence lacks exact child creation provenance",
             )
-        action_candidates = (
-            completion.candidate_shas
-            if completion.phase == "integration_qa"
-            else {
-                **state.snapshot.candidate_shas,
-                completion.repository_key: completion.candidate_sha,
-            }
-        )
-        expected_completion_key = self._action_key(
-            state,
-            f"{completion.phase}:{completed[0].target_key}",
-            completed[0].stage_ordinal,
-            attempt=completion.attempt,
-            candidate_shas=action_candidates,
-        )
+        if completion.phase == "repair":
+            expected_completion_key = (
+                None
+                if repair_completion_actions is None
+                else repair_completion_actions.get(completion.repository_key)
+            )
+        else:
+            action_candidates = (
+                completion.candidate_shas
+                if completion.phase == "integration_qa"
+                else {
+                    **state.snapshot.candidate_shas,
+                    completion.repository_key: completion.candidate_sha,
+                }
+            )
+            expected_completion_key = self._action_key(
+                state,
+                f"{completion.phase}:{completed[0].target_key}",
+                completed[0].stage_ordinal,
+                attempt=completion.attempt,
+                candidate_shas=action_candidates,
+            )
         if (
-            expected_completion_key == completed[0].action_key
+            expected_completion_key is None
+            or expected_completion_key == completed[0].action_key
             or expected_completion_key not in state.applied_action_keys
         ):
             return self._zero_mutation_block(
                 state,
                 "persisted phase evidence lacks an authoritative completion action",
             )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        if completion.phase == "repair":
+            refreshed_repair_actions = (
+                self._authoritative_repair_wave_completion_actions(
+                    state,
+                    completed[0],
+                )
+            )
+            if refreshed_repair_actions != repair_completion_actions:
+                return self._zero_mutation_block(
+                    state,
+                    "repair replay provenance changed after parent fan-in",
+                )
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
         return self._result(
             state,
             "noop",
             "phase completion already exists",
             completed_child_status="done",
             action_key=expected_completion_key,
+        )
+
+    def _authoritative_repair_wave_completion_actions(
+        self,
+        state: WorkflowState,
+        replayed: WorkflowChild,
+        *,
+        allow_incomplete_wave: bool = False,
+    ) -> Mapping[str, str] | None:
+        """Prove one Repair wave's incremental completion-action chain."""
+
+        source_bundle = self._authoritative_source_gate_failure_bundle(
+            state,
+            source_stage=replayed.stage_ordinal - 1,
+            source_attempt=replayed.attempt - 1,
+            repair_round=replayed.attempt,
+            source=replayed.creation_candidate_shas,
+        )
+        if (
+            type(source_bundle) is not FailureBundle
+            or source_bundle.digest != replayed.failure_bundle_digest
+        ):
+            return None
+        if replayed.attempt <= self.manifest.policy.max_repair_attempts:
+            if replayed.authorizing_comment_uuid:
+                return None
+        else:
+            if not replayed.authorizing_comment_uuid:
+                return None
+            try:
+                comments = tuple(
+                    self.snapshot_reader.read_authorizing_comment(
+                        state.parent_identifier,
+                        replayed.authorizing_comment_uuid,
+                    )
+                    for _ in range(2)
+                )
+            except Exception:
+                return None
+            if (
+                comments[0] != comments[1]
+                or not _repair_authorization_comment_matches(
+                    comments[0],
+                    comment_uuid=replayed.authorizing_comment_uuid,
+                    bundle_digest=source_bundle.digest,
+                    granted_round=replayed.attempt,
+                )
+            ):
+                return None
+        expected_partitions = {
+            repository: _failure_uuid_partition(
+                source_bundle.for_repository(repository)
+            )
+            for repository in replayed.creation_candidate_shas
+            if source_bundle.for_repository(repository)
+        }
+
+        wave = tuple(
+            child
+            for child in state.children
+            if child.phase == "repair"
+            and child.stage_ordinal == replayed.stage_ordinal
+            and child.attempt == replayed.attempt
+        )
+        repositories = tuple(child.repository_key for child in wave)
+        if (
+            not wave
+            or len(repositories) != len(set(repositories))
+            or (
+                not set(repositories) <= set(expected_partitions)
+                if allow_incomplete_wave
+                else set(repositories) != set(expected_partitions)
+            )
+            or any(
+                child.action_key != replayed.action_key
+                or child.creation_candidate_shas
+                != replayed.creation_candidate_shas
+                or child.failure_bundle_digest
+                != replayed.failure_bundle_digest
+                or child.authorizing_comment_uuid
+                != replayed.authorizing_comment_uuid
+                or child.failure_evidence_uuids
+                != expected_partitions.get(child.repository_key)
+                or child.target_key != child.repository_key
+                or child.suite_key
+                for child in wave
+            )
+        ):
+            return None
+
+        completed: dict[str, tuple[WorkflowChild, str]] = {}
+        for child in wave:
+            if child.active or child.status in _ACTIVE_CHILD_STATUSES:
+                if not child.active or child.status not in _ACTIVE_CHILD_STATUSES:
+                    return None
+                continue
+            if (
+                child.status != "done"
+                or child.phase_result != "pass"
+                or not _canonical_uuid(child.evidence_comment_uuid)
+                or not _canonical_comment_url(
+                    child.evidence_comment_url,
+                    child.evidence_comment_uuid,
+                )
+            ):
+                return None
+            repository = child.repository_key
+            candidate = state.snapshot.candidate_shas.get(repository)
+            aggregate = state.snapshot.children.get(repository)
+            pull_request = state.snapshot.pull_requests.get(repository)
+            target = state.pull_requests.get(repository)
+            if (
+                candidate is None
+                or aggregate is None
+                or aggregate.result != "pass"
+                or aggregate.candidate_sha != candidate
+                or pull_request is None
+                or pull_request.head_sha != candidate
+                or target is None
+            ):
+                return None
+            try:
+                observations = tuple(
+                    self.snapshot_reader.read_phase_completion(
+                        state.parent_identifier,
+                        child.evidence_comment_uuid,
+                    )
+                    for _ in range(2)
+                )
+            except Exception:
+                return None
+            if (
+                observations[0] != observations[1]
+                or type(observations[0]) is not PhaseCompletion
+            ):
+                return None
+            observed = observations[0]
+            if (
+                observed.parent_identifier != state.parent_identifier
+                or observed.repository_key != repository
+                or observed.phase != "repair"
+                or observed.result != "pass"
+                or observed.attempt != child.attempt
+                or observed.candidate_sha != candidate
+                or observed.pull_request_url not in {"", target.url}
+                or observed.evidence_comment_uuid
+                != child.evidence_comment_uuid
+                or observed.evidence_comment_url
+                != child.evidence_comment_url
+                or observed.suite_key
+                or observed.candidate_shas
+                or observed.responsible_repositories
+                != child.responsible_repositories
+                or observed.failure_bundle_digest
+                != child.failure_bundle_digest
+            ):
+                return None
+            completed[repository] = (child, candidate)
+
+        return self._completed_candidate_action_chain(
+            state,
+            replayed.creation_candidate_shas,
+            completed,
         )
 
     def record_phase_completion(self, completion: PhaseCompletion) -> WorkflowResult:
@@ -2615,7 +6088,7 @@ class GenericWorkflow:
             pass
         completion_schema_problem = _phase_completion_schema_problem(
             completion,
-            max_attempt=self.manifest.policy.max_repair_attempts,
+            manifest=self.manifest,
         )
         if completion_schema_problem is not None:
             return WorkflowResult(
@@ -2646,17 +6119,92 @@ class GenericWorkflow:
                 state,
                 "new phase evidence is allowed only for an active pre-merge parent",
             )
+        missing_head_evidence = set(state.pull_requests) - set(
+            state.snapshot.pull_requests
+        )
+        if missing_head_evidence:
+            return self._zero_mutation_block(
+                state,
+                "managed pull request lacks authoritative head evidence",
+            )
+        repair_stage, repair_head_problem = self._current_repair_head_problem(
+            state,
+            completion,
+        )
+        if repair_head_problem is not None:
+            return self._zero_mutation_block(state, repair_head_problem)
+        mismatched_heads = {
+            repository
+            for repository, pull_request in state.snapshot.pull_requests.items()
+            if state.snapshot.candidate_shas.get(repository) != pull_request.head_sha
+        }
+        if not repair_stage and mismatched_heads and (
+            completion.phase not in {"implementation", "repair"}
+            or completion.result != "pass"
+            or mismatched_heads != {completion.repository_key}
+            or state.snapshot.pull_requests[completion.repository_key].head_sha
+            != completion.candidate_sha
+        ):
+            return self._zero_mutation_block(
+                state,
+                "out-of-band pull-request head change",
+            )
+        if (
+            completion.phase in {"implementation", "repair"}
+            and completion.result != "pass"
+            and completion.repository_key in state.snapshot.candidate_shas
+            and state.snapshot.candidate_shas[completion.repository_key]
+            != completion.candidate_sha
+        ):
+            return self._zero_mutation_block(
+                state,
+                "non-PASS completion cannot replace a candidate SHA",
+            )
         completion_problem, child = self._completion_problem(state, completion)
         if completion_problem is not None or child is None:
             return self._zero_mutation_block(
                 state,
                 completion_problem or "phase completion child is missing",
             )
+        def read_authorization() -> AuthorizingComment | None | object:
+            if completion.phase != "repair":
+                return None
+            if child.attempt <= self.manifest.policy.max_repair_attempts:
+                return None if not child.authorizing_comment_uuid else object()
+            if not child.authorizing_comment_uuid:
+                return object()
+            try:
+                comment = self.snapshot_reader.read_authorizing_comment(
+                    state.parent_identifier,
+                    child.authorizing_comment_uuid,
+                )
+            except Exception:
+                return object()
+            return (
+                comment
+                if _repair_authorization_comment_matches(
+                    comment,
+                    comment_uuid=child.authorizing_comment_uuid,
+                    bundle_digest=child.failure_bundle_digest,
+                    granted_round=child.attempt,
+                )
+                else object()
+            )
+
+        authorization = read_authorization()
+        if type(authorization) is object:
+            return self._zero_mutation_block(
+                state,
+                "phase completion repair authorization is not authoritative",
+            )
         previous_candidate_sha = state.snapshot.candidate_shas.get(
             completion.repository_key
         )
         candidate_shas = dict(state.snapshot.candidate_shas)
-        if completion.phase in {"implementation", "repair"}:
+        if (
+            completion.phase in {"implementation", "repair"}
+            and completion.result == "pass"
+        ):
             candidate_shas[completion.repository_key] = completion.candidate_sha
         action_candidates = (
             completion.candidate_shas
@@ -2672,6 +6220,16 @@ class GenericWorkflow:
             child.stage_ordinal,
             attempt=completion.attempt,
             candidate_shas=action_candidates,
+            failure_bundle_digest=(
+                completion.failure_bundle_digest
+                if completion.phase == "repair"
+                else ""
+            ),
+            authorizing_comment_uuid=(
+                child.authorizing_comment_uuid
+                if completion.phase == "repair"
+                else ""
+            ),
         )
         merge_plan = state.metadata.merge_plan if state.metadata is not None else ()
         merge_state = state.metadata.merge_state if state.metadata is not None else "pending"
@@ -2685,38 +6243,47 @@ class GenericWorkflow:
             merge_plan=merge_plan,
             merge_state=merge_state,
         )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
+        if read_authorization() != authorization:
+            return self._zero_mutation_block(
+                state,
+                "phase completion repair authorization changed after parent fan-in",
+            )
+        fan_in_problem = self._parent_fan_in_still_current(state)
+        if fan_in_problem is not None:
+            return fan_in_problem
         try:
             self.executor.write_phase_completion(completion, action_key=key)
         except Exception:
             # Reconcile because the effect may have committed before failing.
             pass
-        observed: PhaseCompletion | None = None
-        evidence_read_succeeded = False
+        observations: list[PhaseCompletion | None] = []
+        evidence_read_failed = False
         for _ in range(2):
             try:
-                candidate = self.snapshot_reader.read_phase_completion(
-                    parent_identifier,
-                    completion.evidence_comment_uuid,
+                observations.append(
+                    self.snapshot_reader.read_phase_completion(
+                        parent_identifier,
+                        completion.evidence_comment_uuid,
+                    )
                 )
             except Exception:
-                continue
-            evidence_read_succeeded = True
-            if candidate == completion:
-                observed = candidate
-                break
-        if observed is None:
-            if evidence_read_succeeded:
-                return WorkflowResult(
-                    parent_identifier,
-                    "blocked",
-                    "block",
-                    "phase completion evidence reread did not match",
-                    action_key=key,
-                    mutation_count=1,
-                )
+                evidence_read_failed = True
+        if evidence_read_failed:
             return self._uncertain(
                 state,
                 "phase completion evidence is not yet authoritatively observable",
+                action_key=key,
+                mutation_count=1,
+            )
+        if observations != [completion, completion]:
+            return WorkflowResult(
+                parent_identifier,
+                "blocked",
+                "block",
+                "phase completion evidence reread did not match",
                 action_key=key,
                 mutation_count=1,
             )
@@ -2747,6 +6314,49 @@ class GenericWorkflow:
                 action_key=key,
                 mutation_count=1,
             )
+        final_observations: list[PhaseCompletion | None] = []
+        try:
+            for _ in range(2):
+                final_observations.append(
+                    self.snapshot_reader.read_phase_completion(
+                        parent_identifier,
+                        completion.evidence_comment_uuid,
+                    )
+                )
+        except Exception:
+            return self._uncertain(
+                state,
+                "phase completion evidence changed after parent fan-in",
+                action_key=key,
+                mutation_count=1,
+            )
+        if final_observations != [completion, completion]:
+            return WorkflowResult(
+                parent_identifier,
+                "blocked",
+                "block",
+                "phase completion evidence changed after parent fan-in",
+                action_key=key,
+                mutation_count=1,
+            )
+        try:
+            final_parent = self.snapshot_reader.read(parent_identifier)
+        except Exception:
+            return self._uncertain(
+                state,
+                "parent metadata changed after phase evidence recheck",
+                action_key=key,
+                mutation_count=1,
+            )
+        if type(final_parent) is not WorkflowState or final_parent != state:
+            return WorkflowResult(
+                parent_identifier,
+                "blocked",
+                "block",
+                "parent metadata changed after phase evidence recheck",
+                action_key=key,
+                mutation_count=1,
+            )
         try:
             self.executor.mark_child_done(
                 parent_identifier,
@@ -2763,6 +6373,7 @@ class GenericWorkflow:
                 isinstance(current, WorkflowState)
                 and current.parent_identifier == parent_identifier
                 and current.metadata == metadata
+                and dict(current.snapshot.candidate_shas) == candidate_shas
                 and key in current.applied_action_keys
                 and len(
                     tuple(
@@ -2792,6 +6403,7 @@ class GenericWorkflow:
             return self._block(done_state, "phase child done status was not authoritative")
         replacement = (
             completion.phase in {"implementation", "repair"}
+            and completion.result == "pass"
             and previous_candidate_sha is not None
             and previous_candidate_sha != completion.candidate_sha
         )
@@ -2836,7 +6448,11 @@ class GenericWorkflow:
                 mutation_count=1,
             )
         resumed = self.resume_parent(parent_identifier)
-        return replace(resumed, completed_child_status="done")
+        return replace(
+            resumed,
+            completed_child_status="done",
+            mutation_count=resumed.mutation_count + 1,
+        )
 
     def _preflight(
         self,
@@ -2913,7 +6529,7 @@ class GenericWorkflow:
             instance_key=state.metadata.instance_key,
             repository_dag=MappingProxyType(dict(state.metadata.repository_dag)),
             contract_hashes=MappingProxyType(dict(state.metadata.contract_hashes)),
-            attempt=state.metadata.attempt,
+            attempt=state.metadata.repair_round,
         )
 
     def _merge_authority_matches(
@@ -3205,10 +6821,27 @@ class GenericWorkflow:
         )
         if problem_result is not None:
             return problem_result
+        if not self._candidate_heads_match(state):
+            return self._zero_mutation_block(
+                state,
+                "out-of-band pull-request head change",
+            )
         stage_wait = self._current_stage_wait(state)
         if stage_wait is not None:
             return stage_wait
-        entry_decision = decide_parent_action(self.manifest, state.snapshot)
+        entry_decision = self._parent_decision(state)
+        if entry_decision.kind is DecisionKind.MERGE:
+            gate_problem = self._current_gate_authority_problem(state)
+            if gate_problem is not None:
+                return self._zero_mutation_block(state, gate_problem)
+            fan_in_problem = self._parent_fan_in_still_current(state)
+            if fan_in_problem is not None:
+                return fan_in_problem
+            if self._current_gate_authority_problem(state) is not None:
+                return self._zero_mutation_block(
+                    state,
+                    "current Gate authority changed during merge fan-in",
+                )
         affected = frozenset(state.snapshot.affected_repositories)
         try:
             confirmed = tuple(repository for repository in self.manifest.merge_order if repository in affected)
@@ -3688,7 +7321,7 @@ class GenericWorkflow:
                 state,
                 "new smoke evidence requires the owned smoke execution authority",
             )
-        decision = decide_parent_action(self.manifest, state.snapshot)
+        decision = self._parent_decision(state)
         if decision.kind is not DecisionKind.SMOKE:
             return self._result(
                 state,
@@ -3761,7 +7394,7 @@ class GenericWorkflow:
         )
         if problem_result is not None:
             return problem_result
-        decision = decide_parent_action(self.manifest, state.snapshot)
+        decision = self._parent_decision(state)
         if decision.kind is DecisionKind.BLOCK:
             return self._result(state, "block", decision.reason)
         if decision.kind is not DecisionKind.SMOKE:
@@ -3937,7 +7570,12 @@ class GenericWorkflow:
         scope_problem = self._watch_scope_problem(initial, parent_identifier)
         if scope_problem is not None:
             return self._recovery_noop(parent_identifier, scope_problem)
-        decision = decide_parent_action(self.manifest, initial.snapshot)
+        if not self._candidate_heads_match(initial):
+            return self._zero_mutation_block(
+                initial,
+                "out-of-band pull-request head change",
+            )
+        decision = self._parent_decision(initial)
         if (
             decision.kind is DecisionKind.BLOCK
             and self._is_all_merged(initial.snapshot)
@@ -3946,7 +7584,7 @@ class GenericWorkflow:
         if initial.human_wait or initial.active_work or not initial.snapshot.stalled:
             return self._result(initial, "noop", "work is healthy or waiting for a human")
         if decision.kind is DecisionKind.BLOCK and initial.snapshot.recovery_count >= 1:
-            return self._block(initial, decision.reason, stage_kind="recovery-block")
+            return self._zero_mutation_block(initial, decision.reason)
         if (
             decision.kind is not DecisionKind.DISPATCH
             or decision.dispatch_kind is not DispatchKind.RECOVERY
@@ -3976,7 +7614,7 @@ class GenericWorkflow:
                 return False
             if (
                 child.stage_ordinal != initial.metadata.stage_ordinal
-                or child.attempt != initial.metadata.attempt
+                or child.attempt != initial.metadata.repair_round
                 or child.action_key not in initial.applied_action_keys
                 or child.repository_key != repository
             ):
@@ -3997,6 +7635,12 @@ class GenericWorkflow:
         )
         if len(candidates) != 1:
             return self._result(initial, "noop", "watcher cannot identify one existing stalled child")
+        creation_problem = self._watcher_child_creation_provenance_problem(
+            initial,
+            candidates[0],
+        )
+        if creation_problem is not None:
+            return self._zero_mutation_block(initial, creation_problem)
 
         try:
             fresh = self.snapshot_reader.read(parent_identifier)
@@ -4017,49 +7661,43 @@ class GenericWorkflow:
                 "workflow changed before recovery",
                 trusted_state=initial,
             )
+        if not self._candidate_heads_match(fresh):
+            return self._zero_mutation_block(
+                fresh,
+                "out-of-band pull-request head change",
+            )
         if (
             fresh != initial
             or fresh.human_wait
             or fresh.active_work
-            or decide_parent_action(self.manifest, fresh.snapshot) != decision
+            or self._parent_decision(fresh) != decision
         ):
             return self._result(fresh, "noop", "workflow changed before recovery")
+        creation_problem = self._watcher_child_creation_provenance_problem(
+            fresh,
+            candidates[0],
+        )
+        if creation_problem is not None:
+            return self._zero_mutation_block(fresh, creation_problem)
         assert fresh.metadata is not None
-        ordinal = fresh.metadata.stage_ordinal + 1
         key = self._action_key(
             fresh,
             "recovery",
-            ordinal,
+            fresh.metadata.stage_ordinal,
         )
         if key in fresh.applied_action_keys:
-            return self._result(fresh, "noop", "recovery action already exists", action_key=key)
-        metadata = self._metadata(
-            fresh,
-            action_key=key,
-            stage_ordinal=ordinal,
-        )
+            return self._zero_mutation_block(
+                fresh,
+                "watcher recovery action must not be parent-applied",
+            )
         before_children = fresh.children
         target_identifier = candidates[0].identifier
-
-        def child_identity(child: WorkflowChild) -> tuple[object, ...]:
-            return (
-                child.identifier,
-                child.target_key,
-                child.repository_key,
-                child.suite_key,
-                child.phase,
-                child.stage_ordinal,
-                child.attempt,
-                child.action_key,
-                child.evidence_comment_uuid,
-                tuple(child.creation_candidate_shas.items()),
-            )
 
         try:
             self.executor.rerun_child(
                 parent_identifier,
                 target_identifier,
-                metadata,
+                fresh.metadata,
                 action_key=key,
             )
         except Exception:
@@ -4071,10 +7709,10 @@ class GenericWorkflow:
             lambda current: (
                 isinstance(current, WorkflowState)
                 and current.parent_identifier == parent_identifier
-                and current.metadata == metadata
+                and current.metadata == fresh.metadata
                 and current.snapshot.recovery_count
                 == fresh.snapshot.recovery_count + 1
-                and key in current.applied_action_keys
+                and current.applied_action_keys == fresh.applied_action_keys
             ),
         )
         if observed is None:
@@ -4099,22 +7737,18 @@ class GenericWorkflow:
             same_target is not None
             and not before_target.active
             and same_target.active
+            and same_target.status in _ACTIVE_CHILD_STATUSES
+            and self._rerun_child_immutable_provenance(same_target)
+            == self._rerun_child_immutable_provenance(before_target)
         )
         replacement_targets = tuple(
             child
             for child in observed.children
             if child.identifier != target_identifier
-            and child.repository_key == before_target.repository_key
-            and child.target_key == before_target.target_key
-            and child.suite_key == before_target.suite_key
-            and child.phase == before_target.phase
-            and child.stage_ordinal == before_target.stage_ordinal
-            and child.attempt == before_target.attempt
-            and child.action_key == before_target.action_key
-            and child.creation_candidate_shas
-            == before_target.creation_candidate_shas
             and child.active
-            and child_identity(child) != child_identity(before_target)
+            and child.status in _ACTIVE_CHILD_STATUSES
+            and self._rerun_child_immutable_provenance(child)
+            == self._rerun_child_immutable_provenance(before_target)
         )
         target_has_new_run = target_reactivated or len(replacement_targets) == 1
         if target_reactivated:
@@ -4128,6 +7762,11 @@ class GenericWorkflow:
             }
         else:
             allowed_after_identifiers = set()
+        old_target_is_unchanged_or_reactivated = (
+            same_target is None
+            or same_target == before_target
+            or target_reactivated
+        )
         unchanged_other_children = all(
             after_by_id.get(identifier) == before
             for identifier, before in before_by_id.items()
@@ -4141,13 +7780,14 @@ class GenericWorkflow:
             or observed.snapshot.recovery_count != fresh.snapshot.recovery_count + 1
             or normalized_observed_snapshot != fresh.snapshot
             or not target_has_new_run
+            or not old_target_is_unchanged_or_reactivated
             or not observed.active_work
             or frozenset(after_by_id) not in allowed_after_identifiers
             or not unchanged_other_children
             or observed.pull_requests != fresh.pull_requests
-            or observed.metadata != metadata
+            or observed.metadata != fresh.metadata
             or observed.human_wait != fresh.human_wait
-            or observed.applied_action_keys != fresh.applied_action_keys | {key}
+            or observed.applied_action_keys != fresh.applied_action_keys
         ):
             return WorkflowResult(
                 parent_identifier,

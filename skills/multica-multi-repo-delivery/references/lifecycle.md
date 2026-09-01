@@ -29,3 +29,9 @@ multica-delivery --output json upgrade /absolute/delivery-control
 ```
 
 `doctor` does not repair. `upgrade` writes a migration plan; inspect and authorize its full hash, then use the normal `apply` command. A repeated newly planned apply should converge with `mutation_count: 0`.
+
+## Workflow metadata migration
+
+New scaffolds use workflow metadata version 2. The closed supported release edge is `0.1.0 -> 0.2.0`. Completed version-1 parents remain readable history; an active version-1 parent requires explicit migration before any new Stage, gate, repair, merge, or completion action.
+
+Run `upgrade` to create a migration plan. Inspect its ordered actions and complete 64-character hash, then authorize only that current unexpired hash through the normal `apply` command. Migration apply does not inherit authority from an earlier onboarding or delivery action.

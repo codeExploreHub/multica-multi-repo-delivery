@@ -66,4 +66,6 @@ Upgrade writes a migration plan. Review and apply it through the same full-hash 
 multica-delivery --output json upgrade /absolute/delivery-control
 ```
 
+For the supported `0.1.0 -> 0.2.0` edge, the plan lists the complete, secret-free live version-2 reconciliation first and a single `framework.version` action last. Apply reobserves that exact action sequence, converges the Agents, skills, Squad, projects, worktrees, and Watcher automation, verifies the resulting resource identities, and only then atomically writes the version-2 lock. If provisioning fails, drifts, or does not converge, the version-1 lock remains authoritative; create and approve a fresh upgrade plan before retrying. Do not manually edit the lock. Active version-1 parent Issues remain fail-closed and are not migrated by this command; completed version-1 history remains readable.
+
 Production manifests prohibit automatic merge. Deployment is always a separate, manually triggered external action. This package does not deploy in development either.
