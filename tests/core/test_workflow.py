@@ -362,6 +362,7 @@ class FakeWorkflowStore:
         self.change_candidate_after_first_progress = False
         self.add_pr_evidence_after_reservation = False
         self.duplicate_repair_child_on_create = False
+        self.foreign_repair_child_on_create = False
         self.replace_repair_digest_after_create = False
         self.repair_failure_uuid_corruption: str | None = None
         self.partial_create_limits: list[int] = []
@@ -991,6 +992,17 @@ class FakeWorkflowStore:
                     replace(
                         repairs[-1],
                         identifier=f"{repairs[-1].identifier}-DUPLICATE",
+                    )
+                )
+        if self.foreign_repair_child_on_create:
+            repairs = [child for child in workflow_children if child.phase == "repair"]
+            if repairs:
+                workflow_children.append(
+                    replace(
+                        repairs[-1],
+                        identifier=f"{repairs[-1].identifier}-FOREIGN-WEB",
+                        target_key="web",
+                        repository_key="web",
                     )
                 )
         if self.replace_repair_digest_after_create:
@@ -6530,6 +6542,72 @@ class GenericWorkflowTests(unittest.TestCase):
         )
         self.store.events.clear()
         return state, current
+
+    def test_repair_dispatch_rejects_every_same_attempt_foreign_successor(self):
+        cases = (
+            ("historical extra owner", (4,)),
+            ("future extra owner", (7,)),
+            ("duplicate extra owner", (4, 7)),
+        )
+        for label, stages in cases:
+            with self.subTest(label=label):
+                self.seed_authoritative_terminal_gate_failure()
+                state = self.store.states["PRO-101"]
+                foreign_action = "repair:" + "f" * 64
+                foreign = tuple(
+                    WorkflowChild(
+                        f"PRO-101-FOREIGN-WEB-{stage}",
+                        "web",
+                        "web",
+                        "",
+                        "repair",
+                        stage,
+                        1,
+                        "todo",
+                        foreign_action,
+                        True,
+                        creation_candidate_shas=state.snapshot.candidate_shas,
+                        failure_bundle_digest="f" * 64,
+                        failure_evidence_uuids=(
+                            "00000000-0000-4000-8000-000000000099",
+                        ),
+                    )
+                    for stage in stages
+                )
+                self.store.states["PRO-101"] = replace(
+                    state,
+                    children=(*state.children, *foreign),
+                    applied_action_keys=state.applied_action_keys | {foreign_action},
+                )
+                before = self.store.states["PRO-101"]
+                self.store.events.clear()
+
+                result = self.workflow.resume_parent("PRO-101")
+
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.mutation_count, 0)
+                self.assertEqual(self.store.states["PRO-101"], before)
+                self.assertFalse(
+                    any(event[0] == "create" for event in self.store.events)
+                )
+
+    def test_repair_post_create_reconcile_rejects_foreign_same_attempt_child(self):
+        self.seed_authoritative_terminal_gate_failure()
+        self.store.foreign_repair_child_on_create = True
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "uncertain", result.reason)
+        self.assertEqual(result.mutation_count, 1)
+        repairs = tuple(
+            child
+            for child in self.store.states["PRO-101"].children
+            if child.phase == "repair" and child.attempt == 1
+        )
+        self.assertEqual(
+            [(child.repository_key, child.stage_ordinal) for child in repairs],
+            [("api", 6), ("web", 6)],
+        )
 
     def test_parent_intake_dispatches_only_first_topological_wave(self):
         result = self.workflow.handle_parent_event(

@@ -4245,16 +4245,11 @@ class GenericWorkflow:
         def relevant_repair_children(
             workflow_state: WorkflowState,
         ) -> tuple[WorkflowChild, ...]:
-            repositories = frozenset(decision.repositories)
             return tuple(
                 child
                 for child in workflow_state.children
                 if child.phase == "repair"
                 and child.attempt == decision.next_attempt
-                and (
-                    child.target_key in repositories
-                    or child.repository_key in repositories
-                )
             )
 
         if repair:
